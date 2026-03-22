@@ -1,0 +1,33 @@
+﻿app_name: qmt-quant-demo
+environment: backtest
+database_url: postgresql+psycopg://quant:quantpass@127.0.0.1:5432/quant_backtest
+history_parquet: data/parquet/history.parquet
+history_source: qmt
+history_period: 1d
+history_adjustment: front
+history_start: "20200101"
+history_end: ""
+history_fill_data: true
+history_force_refresh: false
+history_batch_size: 200
+history_universe_sector: 沪深京A股
+history_universe_limit: 0
+report_dir: data/reports
+qmt_install_dir: runtime/qmt_client/installed
+qmt_download_url: https://download.gjzq.com.cn/temp/organ/gjzqqmt_ceshi.rar
+default_strategy: first_alpha_v1
+symbols: []
+backtest_engine: qlib
+qlib_source_dir: runtime/qlib_source
+qlib_provider_dir: runtime/qlib_data/cn_data
+qlib_dataset_dir: runtime/qlib_data/source
+qlib_region: cn
+qlib_benchmark: SH000300
+qlib_benchmark_symbol: 000300.SH
+qlib_n_drop: 1
+qlib_force_rebuild: false
+risk:
+  max_position_ratio: 0.35
+  daily_loss_limit: -0.04
+  trading_start: "09:35"
+  trading_end: "14:55"

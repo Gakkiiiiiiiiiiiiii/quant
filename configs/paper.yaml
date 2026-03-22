@@ -1,0 +1,25 @@
+app_name: qmt-quant-demo-paper
+environment: paper
+database_url: postgresql+psycopg://quant:quantpass@127.0.0.1:5432/quant_paper
+history_parquet: data/parquet/history.parquet
+history_source: qmt
+history_period: 1d
+history_adjustment: front
+history_start: "20200101"
+history_end: ""
+history_fill_data: true
+history_force_refresh: false
+report_dir: data/reports/paper
+qmt_install_dir: runtime/qmt_client/installed
+qmt_download_url: https://download.gjzq.com.cn/temp/organ/gjzqqmt_ceshi.rar
+default_strategy: first_alpha_v1
+symbols:
+  - 510300.SH
+  - 159915.SZ
+  - 510500.SH
+  - 588000.SH
+risk:
+  max_position_ratio: 0.30
+  daily_loss_limit: -0.03
+  trading_start: "09:35"
+  trading_end: "14:55"

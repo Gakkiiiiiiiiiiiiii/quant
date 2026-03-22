@@ -1,0 +1,6 @@
+﻿name: etf_rotation
+implementation: etf_rotation
+rebalance_frequency: weekly
+lookback_days: 20
+top_n: 2
+lot_size: 100

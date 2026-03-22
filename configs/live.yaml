@@ -1,0 +1,30 @@
+app_name: qmt-quant-demo-live
+environment: live
+database_url: postgresql+psycopg://quant:quantpass@127.0.0.1:5432/quant_live
+history_parquet: data/parquet/history.parquet
+history_source: qmt
+history_period: 1d
+history_adjustment: front
+history_start: "20200101"
+history_end: ""
+history_fill_data: true
+history_force_refresh: false
+report_dir: data/reports/live
+qmt_install_dir: runtime/qmt_client/installed
+qmt_download_url: https://download.gjzq.com.cn/temp/organ/gjzqqmt_ceshi.rar
+qmt_userdata_dir: runtime/qmt_client/installed/userdata_mini
+qmt_bridge_python: .venv-qmt36/Scripts/python.exe
+qmt_bridge_script: scripts/qmt_bridge.py
+qmt_account_id: "39957041"
+qmt_trade_enabled: false
+default_strategy: first_alpha_v1
+symbols:
+  - 510300.SH
+  - 159915.SZ
+  - 510500.SH
+  - 588000.SH
+risk:
+  max_position_ratio: 0.25
+  daily_loss_limit: -0.02
+  trading_start: "09:35"
+  trading_end: "14:50"

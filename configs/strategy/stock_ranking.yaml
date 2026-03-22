@@ -1,0 +1,6 @@
+﻿name: stock_ranking
+implementation: stock_ranking
+rebalance_frequency: weekly
+lookback_days: 15
+top_n: 3
+lot_size: 100

@@ -1,0 +1,6 @@
+﻿name: first_alpha_v1
+implementation: first_alpha_v1
+rebalance_frequency: weekly
+lookback_days: 20
+top_n: 3
+lot_size: 100
