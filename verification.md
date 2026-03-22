@@ -116,3 +116,70 @@
 - 使用 `configs/app.yaml` 重新回测 `B1`，区间 `2023-01-01` 至 `2026-03-20`，初始资金 `500000`。
 - 验证 `data/reports/user_pattern_backtests/b1_daily_actions.csv` 中不存在 `2026-01-09` 买入 `301218.SZ` 的记录。
 - 最新 `B1` 回测结果：期末权益 `179748.80`，总收益 `-64.05%`，年化 `-28.27%`，最大回撤 `-65.55%`。
+
+## 2026-03-22 Codex B1 reimplementation
+
+- 依据 `strategy/b1.pdf` 与 `strategy/B1_B2_B3_交易策略文档.docx` 重写 `B1` 信号：支持“启动日右侧试错”和“1-3 日缩量回踩再上”两类入场，并将启动 K 线低点持续作为回踩止损锚点。
+- 新增 `quality_score / priority_score` 评分体系，并在用户回测脚本中加入 `评分换仓`，仅当 `T-1` 新候选显著高于持仓评分时才在 `T` 日换仓。
+- 新增 `最小新开仓比例` 过滤，默认 `6%`，避免总资金 `50w` 时出现单笔约 `1w` 的过小新开仓。
+- 回测执行层新增 `ST` 过滤、`上市天数 >= 60` 和 `20 日成交额均值 >= 3000 万` 过滤。
+- 交易台账 `data/reports/user_pattern_backtests/b1_daily_actions.csv` 已新增 `买入价格 / 卖出价格 / 买入评分 / 卖出评分 / BUY股数 / 卖出原因` 列。
+- `summary.json` / `summary.md` 的权益计算已修正为不再重复扣减手续费，现与 `b1_report.csv` 的 `account` 口径一致。
+- 执行 `python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 3 个测试，覆盖 `B1` 启动/回踩止损锚点、评分换仓和最小新开仓过滤。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2022-06-01 --end 2026-03-20 --account 500000 --modes B1` 通过。
+- 最新 `B1` 回测结果：期末权益 `14932.11`，总收益 `-97.01%`，年化 `-61.70%`，最大回撤 `-97.01%`，换手 `460.56`。
+
+## 2026-03-22 Codex B1 no-lookahead execution
+
+- 回测执行语义已改为 `T-1` 出信号、`T` 日开盘成交；买入与卖出都不再读取 `T` 日收盘信号做决策。
+- `scripts/run_user_pattern_backtests.py` 新增 `_decide_exit_from_signal` 与 `_resolve_trade_price`，卖出决策只依赖 `previous_signal_df`，成交价默认取执行日 `open`。
+- CLI 默认执行价已从 `close` 改为 `open`；`strategy/strategy.py` 的 `run_pattern_backtest()` 默认 `deal_price` 也改为 `open`。
+- `python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 5 个测试，其中新增 2 个测试覆盖 `T-1` 卖出判定和 `T` 日开盘成交价。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2022-06-01 --end 2026-03-20 --account 500000 --modes B1` 通过。
+- 最新 `B1` 回测结果：期末权益 `18486.07`，总收益 `-96.30%`，年化 `-59.40%`，最大回撤 `-96.30%`，换手 `457.98`。
+
+## 2026-03-22 Codex B1 formula version
+
+- 按用户提供的通达信公式重写 `B1`：`结构条件 + 启动基础 + 回调到位 + 极致缩量 + K线约束`，不再使用此前的“启动/回踩二段式”B1 判定。
+- 保留 `T-1` 信号、`T` 日开盘成交语义。
+- `python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 5 个测试。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2025-12-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir data/reports/user_pattern_backtests_recent3m` 通过。
+- 最近 3 个月回测结果：无交易记录，`signal_count=0`，期末权益 `500000.00`，总收益 `0.00%`。
+
+## 2026-03-22 Codex B1 114 trading-day warmup
+
+- 修正 `scripts/run_user_pattern_backtests.py` 的行情加载窗口：正式回测开始日前，额外补载 `114` 个历史交易日，用于 `LT=(MA(C,14)+MA(C,28)+MA(C,57)+MA(C,114))/4` 的预热计算。
+- 正式交易循环仍只统计用户指定区间，但首个正式交易日允许读取预热期最后一个交易日的 `T-1` 信号。
+- 新增 `_shift_start_by_trading_days()` 测试，`python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 `6` 个测试。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir data/reports/user_pattern_backtests_recent6m` 通过。
+- 修正后最近半年回测结果：期末权益 `185576.13`，总收益 `-62.88%`，年化 `-88.39%`，最大回撤 `-63.78%`，换手 `138.57`。
+- 最近半年交易台账 `data/reports/user_pattern_backtests_recent6m/b1_daily_actions.csv` 共 `751` 条记录，首笔正式区间交易发生在 `2025-10-15`，未将预热期交易混入统计结果。
+
+## 2026-03-22 Codex B1 md final version
+
+- 依据 `strategy/b1.md` 重写 `B1`：买点改为 `B1核心 AND 非禁入`，其中 `禁入 = 最近30日出现过出货信号 AND 尚未修复`。
+- 新增 `B1` 五类顶部出货形态：`b1_exit_1 ~ b1_exit_5`，统一汇总为 `b1_exit_flag`；`B1` 持仓只按该信号离场，不再使用 `stop_loss / time_stop / score_swap`。
+- `b1.md` 中 `重新修复 := C>HHV(H,30)*1.03 OR COUNT(C>ST,10)>=8` 的第一项若按当日 `HHV(H,30)` 实现将恒不成立，本次按文档语义实现为“突破前30日高点3%”，即前30日高点使用 `shift(1)`。
+- `python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 `8` 个测试；新增覆盖 `30日禁入` 与 `B1仅按出货信号离场`。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir data/reports/user_pattern_backtests_recent6m_b1md` 通过。
+- 由于旧目录中的 `b1_daily_actions.csv` 被占用，本次最近半年结果写入 `data/reports/user_pattern_backtests_recent6m_b1md/`。
+- 最新最近半年回测结果：期末权益 `387800.35`，总收益 `-22.44%`，年化 `-42.42%`，最大回撤 `-24.19%`，换手 `1.72`。
+- 最近半年交易台账 `data/reports/user_pattern_backtests_recent6m_b1md/b1_daily_actions.csv` 共 `8` 条记录，其中唯一已完成卖出为 `605333.SH`，卖出原因 `b1_distribution`。
+
+## 2026-03-22 Codex B1 final version v2
+
+- 依据 `strategy/B1_最终版策略说明_v2.md` 更新 `B1` 离场系统，在原有 `五类顶部出货形态` 基础上新增 `LT硬止损 / ST止损 / 平台止损 / 信号日低点止损 / 时间止损A / 时间止损B`。
+- `B1` 回测执行层继续保持 `T-1` 出信号、`T` 日开盘成交`，新增防守止损同样按 `T-1` 信号确认、`T` 日开盘卖出。
+- `python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 `10` 个测试；新增覆盖 `B1 v2 防守止损` 与 `B1 v2 时间止损`。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir data/reports/user_pattern_backtests_recent6m_b1v2` 通过。
+- 最新最近半年回测结果写入 `data/reports/user_pattern_backtests_recent6m_b1v2/`：期末权益 `293756.79`，总收益 `-41.25%`，年化 `-68.51%`，最大回撤 `-41.69%`，换手 `91.98`。
+- 最近半年交易台账 `data/reports/user_pattern_backtests_recent6m_b1v2/b1_daily_actions.csv` 共 `529` 条记录；卖出原因分布为：`b1_st_stop=463`、`b1_lt_hard_stop=35`、`b1_signal_low_stop=16`、`b1_distribution=5`，其余 `10` 条为未平仓记录。
+
+## 2026-03-22 Codex B1 v2 ST stop adjustment
+
+- 根据用户反馈，删除 `B1 v2` 中不合理的 `COUNT(C<ST,2)>=2` 止损条件，因为 `B1` 买点本身允许出现在 `ST` 下方附近。
+- `B1 ST止损` 现仅保留“放量走弱跌破 ST”条件：`C<ST AND V>MA(V,5)*1.2 AND C<REF(C,1)`。
+- 新增测试覆盖“连续两天在 ST 下方但未放量走弱时，不应触发 `b1_st_stop`”，`python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 `11` 个测试。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir data/reports/user_pattern_backtests_recent6m_b1v2_nost2day` 通过。
+- 修正后最近半年回测结果：期末权益 `446308.02`，总收益 `-10.74%`，年化 `-21.87%`，最大回撤 `-19.41%`，换手 `26.24`。
+- 修正后卖出原因分布显著变化：`b1_signal_low_stop=56`、`b1_lt_hard_stop=32`、`b1_st_stop=24`、`b1_platform_stop=10`、`b1_distribution=9`、`b1_time_stop_a=3`、`b1_time_stop_b=3`，未平仓记录 `10` 条。
