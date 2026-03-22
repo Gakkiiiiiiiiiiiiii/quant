@@ -100,9 +100,18 @@ def configure_user_module(user_module, app_settings) -> None:
 
         candidate_df = candidate_df.sort_values("priority_score", ascending=False)
         if self.cfg.mode == "B1":
-            slots = max(int(self.cfg.max_holdings) - len(keep), 0)
+            main_limit = min(int(self.cfg.max_holdings), int(getattr(user_module, "B1_ACTIVE_MAIN_POSITION_LIMIT", 8)))
+            slots = max(main_limit - len(keep), 0)
             new_codes = [str(code) for code in candidate_df.head(slots).index.tolist()]
             target_codes = keep + new_codes
+            target_ratios: dict[str, float] = {}
+            for code in keep:
+                target_ratios[code] = float(
+                    self.entry_meta.get(code, {}).get(
+                        "position_ratio",
+                        getattr(user_module, "B1_STANDARD_POSITION_RATIO", 0.15),
+                    )
+                )
         else:
             target_codes, keep, new_codes = _select_target_codes(
                 candidate_df=candidate_df,
@@ -115,13 +124,30 @@ def configure_user_module(user_module, app_settings) -> None:
 
         for code in new_codes:
             row = candidate_df.loc[code]
+            position_ratio = _resolve_b1_position_ratio(user_module, row) if self.cfg.mode == "B1" else None
             self.entry_meta[code] = {
                 "stop_price": None if self.cfg.mode == "B1" else float(row.get("stop_price", user_module.np.nan)),
                 "pattern": row.get("pattern", ""),
                 "entry_dt": trade_start_time,
+                "position_ratio": position_ratio,
             }
+            if self.cfg.mode == "B1":
+                target_ratios[code] = float(position_ratio or getattr(user_module, "B1_STANDARD_POSITION_RATIO", 0.15))
         if not target_codes:
             return {}
+
+        if self.cfg.mode == "B1":
+            total_ratio = sum(
+                target_ratios.get(code, getattr(user_module, "B1_STANDARD_POSITION_RATIO", 0.15))
+                for code in target_codes
+            )
+            if total_ratio <= 0:
+                return {}
+            scale = min(1.0 / total_ratio, 1.0)
+            return {
+                code: target_ratios.get(code, getattr(user_module, "B1_STANDARD_POSITION_RATIO", 0.15)) * scale
+                for code in target_codes
+            }
 
         weight = 1.0 / len(target_codes)
         return {code: weight for code in target_codes}
@@ -135,7 +161,7 @@ def configure_user_module(user_module, app_settings) -> None:
         benchmark: str = "SH000300",
         deal_price: str = "open",
         mode: str = "COMBINED",
-        max_holdings: int = 10,
+        max_holdings: int = 8,
         risk_degree: float = 0.95,
         max_holding_days: int = 15,
         account: float = 10_000_000,
@@ -553,6 +579,8 @@ def _select_candidates(day_df: pd.DataFrame, mode: str, excluded_codes: set[str]
         candidate_df = candidate_df[candidate_df["volume"].fillna(0) > 0]
     if mode == "B1":
         candidate_df = candidate_df[candidate_df["b1"] == 1]
+        if "b1_env_ok" in candidate_df.columns:
+            candidate_df = candidate_df[candidate_df["b1_env_ok"] == 1]
     elif mode == "B2":
         candidate_df = candidate_df[candidate_df["b2"] == 1]
     elif mode == "B3":
@@ -697,6 +725,232 @@ def _resolve_trade_price(row: pd.Series | None, price_field: str, fallback: floa
     return float(price)
 
 
+def _b1_stage_target_ratio(stage: int) -> float:
+    targets = {1: 0.70, 2: 0.40, 3: 0.10}
+    return float(targets.get(int(stage), 0.0))
+
+
+def _b1_counts_as_main_position(meta: dict[str, object] | None) -> bool:
+    if not meta:
+        return False
+    if str(meta.get("b1_phase", "confirmed")) == "probe":
+        return False
+    return int(meta.get("position_stage", 0)) == 0 and int(meta.get("shares", 0)) > 0
+
+
+def _resolve_b1_position_ratio(user_module, row: pd.Series) -> float:
+    helper = getattr(user_module, "resolve_b1_position_ratio", None)
+    if callable(helper):
+        return float(helper(row))
+    priority_score = float(row.get("priority_score", 0.0) or 0.0)
+    quality_score = float(row.get("quality_score", max(priority_score - 60.0, 0.0)) or 0.0)
+    b1_confirm = bool(row.get("b1_confirm", 0))
+    if priority_score >= 145.0 or (b1_confirm and quality_score >= 72.0):
+        return 0.18
+    if priority_score >= 125.0 or quality_score >= 60.0 or b1_confirm:
+        return 0.15
+    return 0.12
+
+
+def _resolve_b1_probe_ratio(user_module, row: pd.Series) -> float:
+    base_ratio = _resolve_b1_position_ratio(user_module, row)
+    divisor = float(getattr(user_module, "B1_PROBE_RATIO_DIVISOR", 3.0))
+    if divisor <= 0:
+        return base_ratio
+    return base_ratio / divisor
+
+
+def _plan_b1_new_entries(
+    *,
+    user_module,
+    candidate_df: pd.DataFrame,
+    keep_codes: list[str],
+    holdings: dict[str, dict[str, object]],
+    max_holdings: int,
+    total_equity_before_buy: float,
+    current_value: float,
+    risk_degree: float,
+    min_position_ratio: float,
+) -> list[dict[str, object]]:
+    if candidate_df.empty:
+        return []
+    main_limit = min(int(max_holdings), int(getattr(user_module, "B1_ACTIVE_MAIN_POSITION_LIMIT", 8)))
+    active_main_count = sum(1 for code in keep_codes if _b1_counts_as_main_position(holdings.get(code)))
+    available_slots = max(main_limit - active_main_count, 0)
+    if available_slots <= 0:
+        return []
+
+    available_for_new = max(float(total_equity_before_buy) * float(risk_degree) - float(current_value), 0.0)
+    min_ratio = max(float(min_position_ratio), 0.04)
+    min_position_value = float(total_equity_before_buy) * min_ratio
+    if available_for_new + 1e-6 < min_position_value:
+        return []
+
+    planned: list[dict[str, object]] = []
+    remaining_value = available_for_new
+    for code in candidate_df.index.tolist():
+        symbol = str(code)
+        if symbol in keep_codes:
+            continue
+        row = candidate_df.loc[code]
+        target_ratio = max(_resolve_b1_probe_ratio(user_module, row), min_ratio)
+        target_value = float(total_equity_before_buy) * target_ratio
+        if target_value > remaining_value + 1e-6:
+            continue
+        planned.append(
+            {
+                "code": symbol,
+                "target_ratio": float(target_ratio),
+                "target_value": float(target_value),
+            }
+        )
+        remaining_value -= target_value
+        if len(planned) >= available_slots:
+            break
+    return planned
+
+
+def _execute_sell_trade(
+    *,
+    code: str,
+    meta: dict[str, object],
+    raw_sell_price: float,
+    reason: str,
+    trade_date,
+    score_value: float,
+    close_cost: float,
+    min_cost: float,
+    slippage_rate: float,
+    shares: int | None = None,
+) -> tuple[float, float, float, dict[str, object]]:
+    sell_shares = int(meta.get("shares", 0) if shares is None else shares)
+    sell_shares = max(sell_shares, 0)
+    sell_price = _apply_slippage(raw_sell_price, side="sell", slippage_rate=slippage_rate)
+    sell_amount = sell_shares * sell_price
+    sell_fee = _trade_cost(sell_amount, close_cost, min_cost)
+    initial_shares = max(int(meta.get("initial_shares", sell_shares)), 1)
+    buy_amount_alloc = float(meta.get("buy_amount", 0.0)) * sell_shares / initial_shares
+    buy_fee_alloc = float(meta.get("buy_fee", 0.0)) * sell_shares / initial_shares
+    pnl = sell_amount - sell_fee - buy_amount_alloc - buy_fee_alloc
+    ledger_row = {
+        "日期": pd.Timestamp(meta.get("buy_date")).date().isoformat() if meta.get("buy_date") is not None else "",
+        "策略(B1 B2 B3)": str(meta.get("pattern", "")) or "B1",
+        "BUY": "BUY",
+        "标的": code,
+        "股票代码": _to_qmt_symbol(code),
+        "标的名称": "",
+        "买入信号日期": pd.Timestamp(meta.get("signal_date")).date().isoformat() if meta.get("signal_date") is not None else "",
+        "买入价格": round(float(meta.get("buy_price", 0.0)), 4),
+        "卖出价格": round(float(sell_price), 4),
+        "买入评分": round(float(meta.get("entry_score", 0.0)), 4),
+        "卖出评分": round(float(score_value), 4),
+        "BUY金额": round(buy_amount_alloc, 2),
+        "BUY股数": sell_shares,
+        "SELL日期": pd.Timestamp(trade_date).date().isoformat(),
+        "卖出原因": reason,
+        "这个标的这次操作的盈亏金额": round(pnl, 2),
+        "收益率": round(pnl / buy_amount_alloc, 6) if buy_amount_alloc > 0 else None,
+    }
+    cash_delta = sell_amount - sell_fee
+    return cash_delta, sell_amount, sell_fee, ledger_row
+
+
+def _last_buy_date(meta: dict[str, object]):
+    raw = meta.get("last_buy_date", meta.get("buy_date"))
+    if raw is None:
+        return None
+    return pd.Timestamp(raw).normalize()
+
+
+def _decide_b1_probe_action(signal_row: pd.Series | None, meta: dict[str, object]) -> tuple[str, str]:
+    if signal_row is None:
+        return "full_exit", "signal_missing"
+    if bool(signal_row.get("b1_probe_invalid", 0)):
+        return "full_exit", "b1_probe_invalid"
+    if bool(signal_row.get("b1_lt_hard_stop_flag", 0)):
+        return "full_exit", "b1_lt_hard_stop"
+    if bool(signal_row.get("b1_st_stop_flag", 0)):
+        return "full_exit", "b1_st_stop"
+    if bool(signal_row.get("b1_hard_distribution_flag", 0)):
+        return "full_exit", "b1_distribution_hard"
+    if bool(signal_row.get("b1_soft_exit_flag", 0)):
+        return "full_exit", "b1_distribution_soft"
+    try:
+        watch_days = float(signal_row.get("b1_watch_days", float("nan")))
+    except (TypeError, ValueError):
+        watch_days = float("nan")
+    if pd.notna(watch_days) and watch_days > 5:
+        return "full_exit", "b1_probe_timeout"
+    return "hold", ""
+
+
+def _decide_b1_position_action(
+    signal_row: pd.Series | None,
+    meta: dict[str, object],
+    *,
+    signal_date,
+) -> tuple[str, str, int | None]:
+    if signal_row is None:
+        return "full_exit", "signal_missing", None
+
+    signal_close = float(signal_row.get("close", float("inf")))
+    signal_st = float(signal_row.get("st", 0.0))
+    if bool(signal_row.get("b1_lt_hard_stop_flag", 0)):
+        return "full_exit", "b1_lt_hard_stop", None
+    if bool(signal_row.get("b1_st_stop_flag", 0)):
+        return "full_exit", "b1_st_stop", None
+    if bool(meta.get("entry_platform_established", False)):
+        platform_low = float(meta.get("entry_platform_low", float("nan")))
+        if pd.notna(platform_low) and signal_close < platform_low * 0.99:
+            return "full_exit", "b1_platform_stop", None
+    signal_low = float(meta.get("entry_signal_low", float("nan")))
+    if pd.notna(signal_low) and signal_close < signal_low * 0.99:
+        return "full_exit", "b1_signal_low_stop", None
+
+    hold_days = int(meta.get("hold_days", 0))
+    entry_signal_close = float(meta.get("entry_signal_close", float("nan")))
+    max_high_since_entry = float(meta.get("max_high_since_entry", float("nan")))
+    min_low_since_entry = float(meta.get("min_low_since_entry", float("nan")))
+    if (
+        hold_days >= 8
+        and pd.notna(entry_signal_close)
+        and pd.notna(max_high_since_entry)
+        and max_high_since_entry < entry_signal_close * 1.05
+        and signal_close < signal_st
+    ):
+        return "full_exit", "b1_time_stop_a", None
+    if (
+        hold_days >= 12
+        and pd.notna(entry_signal_close)
+        and pd.notna(max_high_since_entry)
+        and pd.notna(min_low_since_entry)
+        and max_high_since_entry < entry_signal_close * 1.08
+        and min_low_since_entry > entry_signal_close * 0.95
+    ):
+        return "full_exit", "b1_time_stop_b", None
+    if bool(signal_row.get("b1_hard_distribution_flag", 0)):
+        return "full_exit", "b1_distribution_hard", None
+
+    stage = int(meta.get("position_stage", 0))
+    buy_price = float(meta.get("buy_price", float("nan")))
+    mfe = (max_high_since_entry / buy_price - 1.0) if pd.notna(max_high_since_entry) and pd.notna(buy_price) and buy_price > 0 else 0.0
+    soft_signal = bool(signal_row.get("b1_soft_exit_flag", 0))
+    signal_date_text = pd.Timestamp(signal_date).date().isoformat() if signal_date is not None else ""
+    soft_signal_new = soft_signal and signal_date_text != str(meta.get("last_soft_exit_signal_date", ""))
+
+    if stage == 0 and mfe >= 0.10:
+        return "partial_exit", "b1_profit_take_10", 1
+    if stage == 1 and (soft_signal_new or mfe >= 0.20):
+        reason = "b1_soft_exit_1" if soft_signal_new else "b1_profit_take_20"
+        return "partial_exit", reason, 2
+    if stage == 2 and (soft_signal_new or mfe >= 0.30):
+        reason = "b1_soft_exit_2" if soft_signal_new else "b1_profit_take_30"
+        return "partial_exit", reason, 3
+    if stage >= 3 and soft_signal_new:
+        return "full_exit", "b1_soft_tail_exit", None
+    return "hold", "", None
+
+
 def _decide_exit_from_signal(
     signal_row: pd.Series | None,
     meta: dict[str, object],
@@ -707,43 +961,8 @@ def _decide_exit_from_signal(
         return True, "signal_missing"
     pattern = str(meta.get("pattern", ""))
     if pattern == "B1":
-        signal_close = float(signal_row.get("close", float("inf")))
-        signal_st = float(signal_row.get("st", 0.0))
-        if bool(signal_row.get("b1_lt_hard_stop_flag", 0)):
-            return True, "b1_lt_hard_stop"
-        if bool(signal_row.get("b1_st_stop_flag", 0)):
-            return True, "b1_st_stop"
-        if bool(meta.get("entry_platform_established", False)):
-            platform_low = float(meta.get("entry_platform_low", float("nan")))
-            if pd.notna(platform_low) and signal_close < platform_low * 0.99:
-                return True, "b1_platform_stop"
-        signal_low = float(meta.get("entry_signal_low", float("nan")))
-        if pd.notna(signal_low) and signal_close < signal_low * 0.99:
-            return True, "b1_signal_low_stop"
-        hold_days = int(meta.get("hold_days", 0))
-        entry_signal_close = float(meta.get("entry_signal_close", float("nan")))
-        max_high_since_entry = float(meta.get("max_high_since_entry", float("nan")))
-        min_low_since_entry = float(meta.get("min_low_since_entry", float("nan")))
-        if (
-            hold_days >= 8
-            and pd.notna(entry_signal_close)
-            and pd.notna(max_high_since_entry)
-            and max_high_since_entry < entry_signal_close * 1.05
-            and signal_close < signal_st
-        ):
-            return True, "b1_time_stop_a"
-        if (
-            hold_days >= 12
-            and pd.notna(entry_signal_close)
-            and pd.notna(max_high_since_entry)
-            and pd.notna(min_low_since_entry)
-            and max_high_since_entry < entry_signal_close * 1.08
-            and min_low_since_entry > entry_signal_close * 0.95
-        ):
-            return True, "b1_time_stop_b"
-        if bool(signal_row.get("b1_exit_flag", signal_row.get("exit_flag", 0))):
-            return True, "b1_distribution"
-        return False, ""
+        action, reason, _ = _decide_b1_position_action(signal_row, meta, signal_date=None)
+        return action == "full_exit", reason
     if bool(signal_row.get("exit_flag", 0)):
         return True, "signal_exit"
     stop_price = meta.get("stop_price")
@@ -794,6 +1013,40 @@ def _resolve_warmup_start(app_settings, start_time: str, warmup_bars: int) -> st
     return warmup_start.date().isoformat()
 
 
+def _resolve_b1_env_symbol(app_settings, start_time: str, end_time: str) -> str:
+    preferred_symbols = [
+        "000852.SH",
+        "000905.SH",
+        _to_qmt_symbol(app_settings.qlib_benchmark_symbol or app_settings.qlib_benchmark),
+        "000300.SH",
+    ]
+    seen: set[str] = set()
+    for symbol in preferred_symbols:
+        normalized = _to_qmt_symbol(symbol)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        bench = _load_local_ohlcv(app_settings, [normalized], start_time, end_time)
+        if not bench.empty:
+            return normalized
+    return ""
+
+
+def _build_b1_env_filter(app_settings, start_time: str, end_time: str) -> tuple[pd.Series, str]:
+    env_symbol = _resolve_b1_env_symbol(app_settings, start_time, end_time)
+    if not env_symbol:
+        return pd.Series(dtype=bool), ""
+    bench = _load_local_ohlcv(app_settings, [env_symbol], start_time, end_time)
+    if bench.empty:
+        return pd.Series(dtype=bool), env_symbol
+    bench = bench.reset_index().sort_values("datetime")
+    close_series = bench.set_index(pd.to_datetime(bench["datetime"]).dt.normalize())["close"].astype(float)
+    ma20 = close_series.rolling(20, min_periods=20).mean()
+    ma60 = close_series.rolling(60, min_periods=60).mean()
+    env_a = (close_series > ma20) & (ma20 > ma60) & (close_series.pct_change(5) > -0.03)
+    return env_a.fillna(False).astype(bool), env_symbol
+
+
 def _benchmark_returns(user_module, app_settings, start_time: str, end_time: str) -> pd.Series:
     benchmark_symbol = _to_qmt_symbol(app_settings.qlib_benchmark_symbol or app_settings.qlib_benchmark)
     if not benchmark_symbol:
@@ -841,6 +1094,8 @@ def simulate_pattern_backtest(
     signal_frame = signal.reset_index().copy()
     signal_frame["instrument"] = signal_frame["instrument"].astype(str)
     signal_frame["datetime"] = pd.to_datetime(signal_frame["datetime"]).dt.normalize()
+    b1_env_ok, b1_env_symbol = _build_b1_env_filter(app_settings, warmup_start, end_time)
+    signal_frame["b1_env_ok"] = signal_frame["datetime"].map(b1_env_ok).fillna(False).astype(int)
     signal_frame = signal_frame.sort_values(["datetime", "priority_score", "instrument"], ascending=[True, False, True])
     grouped_frames = {
         trading_date: frame.set_index("instrument", drop=False)
@@ -867,31 +1122,166 @@ def simulate_pattern_backtest(
         previous_signal_date = all_trade_dates[date_position - 1] if date_position is not None and date_position > 0 else None
         previous_signal_df = grouped_frames.get(previous_signal_date, _empty_signal_frame(signal_frame))
 
+        executed_sell_symbols: list[str] = []
         sell_codes: list[str] = []
+        partial_sell_orders: list[dict[str, object]] = []
         keep_codes: list[str] = []
+        pre_open_buy_codes: list[str] = []
         sell_reasons: dict[str, str] = {}
         daily_turnover = 0.0
         daily_cost = 0.0
 
         for code, meta in list(holdings.items()):
-            signal_row = previous_signal_df.loc[code] if code in previous_signal_df.index else None
-            exit_now, sell_reason = _decide_exit_from_signal(
-                signal_row,
-                meta,
-                max_holding_days=max_holding_days,
-            )
-            if exit_now:
-                sell_codes.append(code)
-                sell_reasons[code] = sell_reason or "signal_exit"
+            pending_action = str(meta.get("pending_exit_action", ""))
+            if pending_action not in {"full_exit", "partial_exit"}:
+                continue
+            row = execution_df.loc[code] if code in execution_df.index else None
+            raw_sell_price = _resolve_trade_price(row, "open", float(meta.get("last_close", meta.get("buy_price", 0.0))))
+            score_value = float(meta.get("pending_exit_score", meta.get("last_score", meta.get("entry_score", 0.0))))
+            if pending_action == "partial_exit":
+                next_stage = int(meta.get("pending_exit_next_stage", meta.get("position_stage", 0)))
+                target_remaining_ratio = _b1_stage_target_ratio(next_stage)
+                initial_shares = int(meta.get("initial_shares", meta.get("shares", 0)))
+                target_remaining_shares = max(int(round(initial_shares * target_remaining_ratio)), 0)
+                sell_shares = max(int(meta.get("shares", 0)) - target_remaining_shares, 0)
+                if sell_shares > 0:
+                    cash_delta, turnover_delta, cost_delta, ledger_row = _execute_sell_trade(
+                        code=code,
+                        meta=meta,
+                        raw_sell_price=raw_sell_price,
+                        reason=str(meta.get("pending_exit_reason", "pending_partial_exit")),
+                        trade_date=trade_date,
+                        score_value=score_value,
+                        close_cost=close_cost,
+                        min_cost=min_cost,
+                        slippage_rate=slippage_rate,
+                        shares=sell_shares,
+                    )
+                    ledger_row["策略(B1 B2 B3)"] = mode
+                    cash += cash_delta
+                    daily_turnover += turnover_delta
+                    daily_cost += cost_delta
+                    cumulative_turnover += turnover_delta
+                    cumulative_cost += cost_delta
+                    ledger_rows.append(ledger_row)
+                    executed_sell_symbols.append(code)
+                    meta["shares"] = int(meta.get("shares", 0)) - sell_shares
+                    meta["position_stage"] = next_stage
+                    if str(meta.get("pending_exit_reason", "")).startswith("b1_soft_exit"):
+                        meta["last_soft_exit_signal_date"] = str(meta.get("pending_exit_signal_date", ""))
+                meta.pop("pending_exit_action", None)
+                meta.pop("pending_exit_reason", None)
+                meta.pop("pending_exit_next_stage", None)
+                meta.pop("pending_exit_signal_date", None)
+                meta.pop("pending_exit_score", None)
+                holdings[code] = meta
+                if int(meta.get("shares", 0)) <= 0:
+                    holdings.pop(code, None)
             else:
+                shares = int(meta.get("shares", 0))
+                if shares > 0:
+                    cash_delta, turnover_delta, cost_delta, ledger_row = _execute_sell_trade(
+                        code=code,
+                        meta=meta,
+                        raw_sell_price=raw_sell_price,
+                        reason=str(meta.get("pending_exit_reason", "pending_exit")),
+                        trade_date=trade_date,
+                        score_value=score_value,
+                        close_cost=close_cost,
+                        min_cost=min_cost,
+                        slippage_rate=slippage_rate,
+                        shares=shares,
+                    )
+                    ledger_row["策略(B1 B2 B3)"] = mode
+                    cash += cash_delta
+                    daily_turnover += turnover_delta
+                    daily_cost += cost_delta
+                    cumulative_turnover += turnover_delta
+                    cumulative_cost += cost_delta
+                    ledger_rows.append(ledger_row)
+                    executed_sell_symbols.append(code)
+                holdings.pop(code, None)
+
+        for code, meta in list(holdings.items()):
+            if mode == "B1" and str(meta.get("pattern", "")) == "B1":
                 keep_codes.append(code)
+            else:
+                signal_row = previous_signal_df.loc[code] if code in previous_signal_df.index else None
+                exit_now, sell_reason = _decide_exit_from_signal(
+                    signal_row,
+                    meta,
+                    max_holding_days=max_holding_days,
+                )
+                if exit_now:
+                    sell_codes.append(code)
+                    sell_reasons[code] = sell_reason or "signal_exit"
+                else:
+                    keep_codes.append(code)
+
+        if mode == "B1":
+            current_value_before_open = sum(
+                int(meta.get("shares", 0)) * float(meta.get("last_close", meta.get("buy_price", 0.0)))
+                for meta in holdings.values()
+            )
+            total_equity_before_open = cash + current_value_before_open
+            for code, meta in list(holdings.items()):
+                if str(meta.get("pattern", "")) != "B1" or str(meta.get("b1_phase", "confirmed")) != "probe":
+                    continue
+                if previous_signal_df.empty or code not in previous_signal_df.index:
+                    continue
+                signal_row = previous_signal_df.loc[code]
+                if not bool(signal_row.get("b1_confirm", 0)):
+                    continue
+                row = execution_df.loc[code] if code in execution_df.index else None
+                raw_buy_price = _resolve_trade_price(row, buy_price_field, float(meta.get("last_close", meta.get("buy_price", 0.0))))
+                buy_price = _apply_slippage(raw_buy_price, side="buy", slippage_rate=slippage_rate)
+                if buy_price <= 0:
+                    continue
+                target_ratio = float(meta.get("base_position_ratio", meta.get("position_ratio", 0.15)))
+                current_position_value = int(meta.get("shares", 0)) * buy_price
+                target_position_value = total_equity_before_open * target_ratio
+                add_position_value = max(target_position_value - current_position_value, 0.0)
+                add_shares = int(add_position_value // (buy_price * lot_size)) * lot_size
+                if add_shares <= 0:
+                    meta["b1_phase"] = "confirmed"
+                    meta["position_ratio"] = target_ratio
+                    holdings[code] = meta
+                    continue
+                add_amount = add_shares * buy_price
+                add_fee = _trade_cost(add_amount, open_cost, min_cost)
+                while add_shares > 0 and cash < add_amount + add_fee:
+                    add_shares -= lot_size
+                    add_amount = add_shares * buy_price
+                    add_fee = _trade_cost(add_amount, open_cost, min_cost)
+                if add_shares <= 0:
+                    continue
+                total_new_cost = add_amount + add_fee
+                total_shares = int(meta.get("shares", 0)) + add_shares
+                if total_shares <= 0:
+                    continue
+                cash -= total_new_cost
+                daily_turnover += add_amount
+                daily_cost += add_fee
+                cumulative_turnover += add_amount
+                cumulative_cost += add_fee
+                weighted_buy_price = ((float(meta.get("buy_price", 0.0)) * int(meta.get("shares", 0))) + add_amount) / total_shares
+                meta["shares"] = total_shares
+                meta["initial_shares"] = int(meta.get("initial_shares", 0)) + add_shares
+                meta["buy_amount"] = float(meta.get("buy_amount", 0.0)) + add_amount
+                meta["buy_fee"] = float(meta.get("buy_fee", 0.0)) + add_fee
+                meta["buy_price"] = weighted_buy_price
+                meta["position_ratio"] = target_ratio
+                meta["b1_phase"] = "confirmed"
+                meta["last_buy_date"] = trade_date
+                meta["entry_score"] = max(float(meta.get("entry_score", 0.0)), _read_priority_score(previous_signal_df, code, float(meta.get("entry_score", 0.0))))
+                holdings[code] = meta
+                pre_open_buy_codes.append(code)
 
         candidate_df = _select_candidates(previous_signal_df, mode, set(keep_codes), blocked_codes=blocked_symbols)
         if mode == "B1":
             target_keep_codes = list(keep_codes)
-            remaining_slots = max(int(max_holdings) - len(target_keep_codes), 0)
-            planned_buy_codes = [str(code) for code in candidate_df.head(remaining_slots).index.tolist()]
-            target_codes = target_keep_codes + planned_buy_codes
+            planned_buy_codes: list[str] = []
+            target_codes = target_keep_codes[:]
         else:
             target_codes, target_keep_codes, planned_buy_codes = _select_target_codes(
                 candidate_df=candidate_df,
@@ -908,6 +1298,56 @@ def simulate_pattern_backtest(
                 sell_codes.append(code)
             keep_codes = target_keep_codes
 
+        for order in partial_sell_orders:
+            code = str(order["code"])
+            if code not in holdings:
+                continue
+            meta = holdings[code]
+            row = execution_df.loc[code] if code in execution_df.index else None
+            raw_sell_price = _resolve_trade_price(row, sell_price_field, float(meta.get("last_close", meta.get("buy_price", 0.0))))
+            sell_price = _apply_slippage(raw_sell_price, side="sell", slippage_rate=slippage_rate)
+            sell_shares = min(int(order.get("sell_shares", 0)), int(meta.get("shares", 0)))
+            if sell_shares <= 0:
+                continue
+            sell_amount = sell_shares * sell_price
+            sell_fee = _trade_cost(sell_amount, close_cost, min_cost)
+            cash += sell_amount - sell_fee
+            daily_turnover += sell_amount
+            daily_cost += sell_fee
+            cumulative_turnover += sell_amount
+            cumulative_cost += sell_fee
+            initial_shares = max(int(meta.get("initial_shares", meta.get("shares", sell_shares))), 1)
+            buy_amount_alloc = float(meta.get("buy_amount", 0.0)) * sell_shares / initial_shares
+            buy_fee_alloc = float(meta.get("buy_fee", 0.0)) * sell_shares / initial_shares
+            pnl = sell_amount - sell_fee - buy_amount_alloc - buy_fee_alloc
+            ledger_rows.append(
+                {
+                    "日期": pd.Timestamp(meta.get("buy_date")).date().isoformat() if meta.get("buy_date") is not None else "",
+                    "策略(B1 B2 B3)": mode,
+                    "BUY": "BUY",
+                    "标的": code,
+                    "股票代码": _to_qmt_symbol(code),
+                    "标的名称": "",
+                    "买入信号日期": pd.Timestamp(meta.get("signal_date")).date().isoformat() if meta.get("signal_date") is not None else "",
+                    "买入价格": round(float(meta.get("buy_price", 0.0)), 4),
+                    "卖出价格": round(float(sell_price), 4),
+                    "买入评分": round(float(meta.get("entry_score", 0.0)), 4),
+                    "卖出评分": round(_read_priority_score(previous_signal_df, code, float(meta.get("last_score", 0.0))), 4),
+                    "BUY金额": round(buy_amount_alloc, 2),
+                    "BUY股数": sell_shares,
+                    "SELL日期": trade_date.date().isoformat(),
+                    "卖出原因": str(order.get("reason", "b1_partial_exit")),
+                    "这个标的这次操作的盈亏金额": round(pnl, 2),
+                    "收益率": round(pnl / buy_amount_alloc, 6) if buy_amount_alloc > 0 else None,
+                }
+            )
+            executed_sell_symbols.append(code)
+            meta["shares"] = int(meta.get("shares", 0)) - sell_shares
+            meta["position_stage"] = int(order.get("next_stage", meta.get("position_stage", 0)))
+            if str(order.get("reason", "")).startswith("b1_soft_exit"):
+                meta["last_soft_exit_signal_date"] = pd.Timestamp(order.get("signal_date")).date().isoformat() if order.get("signal_date") is not None else ""
+            holdings[code] = meta
+
         for code in sell_codes:
             meta = holdings.pop(code)
             row = execution_df.loc[code] if code in execution_df.index else None
@@ -921,7 +1361,10 @@ def simulate_pattern_backtest(
             daily_cost += sell_fee
             cumulative_turnover += sell_amount
             cumulative_cost += sell_fee
-            total_buy_cash = float(meta.get("buy_amount", 0.0)) + float(meta.get("buy_fee", 0.0))
+            initial_shares = max(int(meta.get("initial_shares", shares)), 1)
+            buy_amount_alloc = float(meta.get("buy_amount", 0.0)) * shares / initial_shares
+            buy_fee_alloc = float(meta.get("buy_fee", 0.0)) * shares / initial_shares
+            total_buy_cash = buy_amount_alloc + buy_fee_alloc
             pnl = sell_amount - sell_fee - total_buy_cash
             ledger_rows.append(
                 {
@@ -936,39 +1379,50 @@ def simulate_pattern_backtest(
                     "卖出价格": round(float(sell_price), 4),
                     "买入评分": round(float(meta.get("entry_score", 0.0)), 4),
                     "卖出评分": round(_read_priority_score(previous_signal_df, code, float(meta.get("last_score", 0.0))), 4),
-                    "BUY金额": round(float(meta.get("buy_amount", 0.0)), 2),
-                    "BUY股数": int(meta.get("shares", 0)),
+                    "BUY金额": round(buy_amount_alloc, 2),
+                    "BUY股数": shares,
                     "SELL日期": trade_date.date().isoformat(),
                     "卖出原因": sell_reasons.get(code, "signal_exit"),
                     "这个标的这次操作的盈亏金额": round(pnl, 2),
-                    "收益率": round(pnl / float(meta.get("buy_amount", 0.0)), 6) if float(meta.get("buy_amount", 0.0)) > 0 else None,
+                    "收益率": round(pnl / buy_amount_alloc, 6) if buy_amount_alloc > 0 else None,
                 }
             )
+            executed_sell_symbols.append(code)
 
         current_value = 0.0
         for code in keep_codes:
-            row = execution_df.loc[code] if code in execution_df.index else None
-            if row is not None:
-                holdings[code]["last_close"] = float(row.get("close", holdings[code].get("last_close", 0.0)))
-                holdings[code]["last_score"] = _read_priority_score(previous_signal_df, code, float(holdings[code].get("last_score", 0.0)))
-                holdings[code]["max_high_since_entry"] = max(float(holdings[code].get("max_high_since_entry", float("-inf"))), float(row.get("high", holdings[code].get("last_close", 0.0))))
-                holdings[code]["min_low_since_entry"] = min(float(holdings[code].get("min_low_since_entry", float("inf"))), float(row.get("low", holdings[code].get("last_close", 0.0))))
-            holdings[code]["hold_days"] = int(holdings[code].get("hold_days", 0)) + 1
-            current_value += int(holdings[code].get("shares", 0)) * float(holdings[code].get("last_close", 0.0))
+            current_value += int(holdings[code].get("shares", 0)) * float(holdings[code].get("last_close", holdings[code].get("buy_price", 0.0)))
 
         total_equity_before_buy = cash + current_value
-        candidate_codes = _limit_new_buys(
-            buy_codes=planned_buy_codes,
-            total_equity_before_buy=total_equity_before_buy,
-            current_value=current_value,
-            risk_degree=risk_degree,
-            min_position_ratio=min_position_ratio,
-        )
-
         target_invested_value = total_equity_before_buy * float(risk_degree)
         available_for_new = max(target_invested_value - current_value, 0.0)
-        per_position_budget = available_for_new / len(candidate_codes) if candidate_codes else 0.0
-        buy_codes: list[str] = []
+        buy_codes: list[str] = list(pre_open_buy_codes)
+        b1_buy_plan_map: dict[str, dict[str, object]] = {}
+
+        if mode == "B1":
+            b1_buy_plans = _plan_b1_new_entries(
+                user_module=user_module,
+                candidate_df=candidate_df,
+                keep_codes=keep_codes,
+                holdings=holdings,
+                max_holdings=max_holdings,
+                total_equity_before_buy=total_equity_before_buy,
+                current_value=current_value,
+                risk_degree=risk_degree,
+                min_position_ratio=min_position_ratio,
+            )
+            candidate_codes = [str(item["code"]) for item in b1_buy_plans]
+            b1_buy_plan_map = {str(item["code"]): item for item in b1_buy_plans}
+        else:
+            candidate_codes = _limit_new_buys(
+                buy_codes=planned_buy_codes,
+                total_equity_before_buy=total_equity_before_buy,
+                current_value=current_value,
+                risk_degree=risk_degree,
+                min_position_ratio=min_position_ratio,
+            )
+
+        per_position_budget = available_for_new / len(candidate_codes) if candidate_codes and mode != "B1" else 0.0
 
         for code in candidate_codes:
             if code not in execution_df.index:
@@ -978,7 +1432,8 @@ def simulate_pattern_backtest(
             buy_price = _apply_slippage(raw_buy_price, side="buy", slippage_rate=slippage_rate)
             if buy_price <= 0:
                 continue
-            tentative_shares = int(per_position_budget // (buy_price * lot_size)) * lot_size
+            target_position_value = float(b1_buy_plan_map.get(code, {}).get("target_value", per_position_budget))
+            tentative_shares = int(target_position_value // (buy_price * lot_size)) * lot_size
             if tentative_shares <= 0:
                 continue
             buy_amount = tentative_shares * buy_price
@@ -996,7 +1451,12 @@ def simulate_pattern_backtest(
             cumulative_cost += buy_fee
             holdings[code] = {
                 "shares": tentative_shares,
+                "initial_shares": tentative_shares,
+                "position_stage": 0,
+                "b1_phase": "probe" if mode == "B1" else "confirmed",
+                "last_soft_exit_signal_date": "",
                 "buy_date": trade_date,
+                "last_buy_date": trade_date,
                 "signal_date": previous_signal_date,
                 "buy_price": buy_price,
                 "buy_amount": buy_amount,
@@ -1008,6 +1468,8 @@ def simulate_pattern_backtest(
                 "entry_platform_established": bool(previous_signal_df.loc[code].get("b1_platform_established", 0)) if code in previous_signal_df.index else False,
                 "entry_platform_low": float(previous_signal_df.loc[code].get("b1_platform_low", float("nan"))) if code in previous_signal_df.index else float("nan"),
                 "entry_score": _read_priority_score(previous_signal_df, code, 0.0),
+                "position_ratio": float(b1_buy_plan_map.get(code, {}).get("target_ratio", 0.0)) if mode == "B1" else 0.0,
+                "base_position_ratio": float(_resolve_b1_position_ratio(user_module, previous_signal_df.loc[code])) if mode == "B1" and code in previous_signal_df.index else 0.0,
                 "hold_days": 1,
                 "last_close": float(row.get("close", buy_price)),
                 "max_high_since_entry": float(row.get("high", buy_price)),
@@ -1015,6 +1477,114 @@ def simulate_pattern_backtest(
                 "last_score": _read_priority_score(previous_signal_df, code, 0.0),
             }
             buy_codes.append(code)
+
+        for code, meta in list(holdings.items()):
+            row = execution_df.loc[code] if code in execution_df.index else None
+            if row is not None:
+                meta["last_close"] = float(row.get("close", meta.get("last_close", meta.get("buy_price", 0.0))))
+                meta["last_score"] = _read_priority_score(execution_df, code, float(meta.get("last_score", 0.0)))
+                meta["max_high_since_entry"] = max(
+                    float(meta.get("max_high_since_entry", float("-inf"))),
+                    float(row.get("high", meta.get("last_close", meta.get("buy_price", 0.0)))),
+                )
+                meta["min_low_since_entry"] = min(
+                    float(meta.get("min_low_since_entry", float("inf"))),
+                    float(row.get("low", meta.get("last_close", meta.get("buy_price", 0.0)))),
+                )
+            if pd.Timestamp(meta.get("buy_date")).normalize() != trade_date:
+                meta["hold_days"] = int(meta.get("hold_days", 0)) + 1
+            holdings[code] = meta
+
+        if mode == "B1":
+            for code, meta in list(holdings.items()):
+                if str(meta.get("pattern", "")) != "B1":
+                    continue
+                signal_row = execution_df.loc[code] if code in execution_df.index else None
+                if str(meta.get("b1_phase", "confirmed")) == "probe":
+                    action, sell_reason = _decide_b1_probe_action(signal_row, meta)
+                    next_stage = None
+                else:
+                    action, sell_reason, next_stage = _decide_b1_position_action(
+                        signal_row,
+                        meta,
+                        signal_date=trade_date,
+                    )
+                if action == "hold":
+                    continue
+                last_buy_date = _last_buy_date(meta)
+                bought_today = last_buy_date is not None and last_buy_date == trade_date
+                if bought_today:
+                    meta["pending_exit_action"] = action
+                    meta["pending_exit_reason"] = sell_reason or "signal_exit"
+                    meta["pending_exit_next_stage"] = int(next_stage or 0)
+                    meta["pending_exit_signal_date"] = trade_date.date().isoformat()
+                    meta["pending_exit_score"] = _read_priority_score(execution_df, code, float(meta.get("last_score", meta.get("entry_score", 0.0))))
+                    holdings[code] = meta
+                    continue
+
+                row = execution_df.loc[code] if code in execution_df.index else None
+                raw_sell_price = float(row.get("close", meta.get("last_close", meta.get("buy_price", 0.0)))) if row is not None else float(meta.get("last_close", meta.get("buy_price", 0.0)))
+                score_value = _read_priority_score(execution_df, code, float(meta.get("last_score", meta.get("entry_score", 0.0))))
+                if action == "partial_exit":
+                    target_remaining_ratio = _b1_stage_target_ratio(int(next_stage or 0))
+                    initial_shares = int(meta.get("initial_shares", meta.get("shares", 0)))
+                    target_remaining_shares = max(int(round(initial_shares * target_remaining_ratio)), 0)
+                    sell_shares = max(int(meta.get("shares", 0)) - target_remaining_shares, 0)
+                    if sell_shares <= 0:
+                        continue
+                    cash_delta, turnover_delta, cost_delta, ledger_row = _execute_sell_trade(
+                        code=code,
+                        meta=meta,
+                        raw_sell_price=raw_sell_price,
+                        reason=sell_reason or "b1_partial_exit",
+                        trade_date=trade_date,
+                        score_value=score_value,
+                        close_cost=close_cost,
+                        min_cost=min_cost,
+                        slippage_rate=slippage_rate,
+                        shares=sell_shares,
+                    )
+                    ledger_row["策略(B1 B2 B3)"] = mode
+                    cash += cash_delta
+                    daily_turnover += turnover_delta
+                    daily_cost += cost_delta
+                    cumulative_turnover += turnover_delta
+                    cumulative_cost += cost_delta
+                    ledger_rows.append(ledger_row)
+                    executed_sell_symbols.append(code)
+                    meta["shares"] = int(meta.get("shares", 0)) - sell_shares
+                    meta["position_stage"] = int(next_stage or meta.get("position_stage", 0))
+                    if str(sell_reason or "").startswith("b1_soft_exit"):
+                        meta["last_soft_exit_signal_date"] = trade_date.date().isoformat()
+                    holdings[code] = meta
+                    if int(meta.get("shares", 0)) <= 0:
+                        holdings.pop(code, None)
+                else:
+                    shares = int(meta.get("shares", 0))
+                    if shares <= 0:
+                        holdings.pop(code, None)
+                        continue
+                    cash_delta, turnover_delta, cost_delta, ledger_row = _execute_sell_trade(
+                        code=code,
+                        meta=meta,
+                        raw_sell_price=raw_sell_price,
+                        reason=sell_reason or "signal_exit",
+                        trade_date=trade_date,
+                        score_value=score_value,
+                        close_cost=close_cost,
+                        min_cost=min_cost,
+                        slippage_rate=slippage_rate,
+                        shares=shares,
+                    )
+                    ledger_row["策略(B1 B2 B3)"] = mode
+                    cash += cash_delta
+                    daily_turnover += turnover_delta
+                    daily_cost += cost_delta
+                    cumulative_turnover += turnover_delta
+                    cumulative_cost += cost_delta
+                    ledger_rows.append(ledger_row)
+                    executed_sell_symbols.append(code)
+                    holdings.pop(code, None)
 
         hold_codes = sorted(holdings.keys())
         end_value = sum(int(meta.get("shares", 0)) * float(meta.get("last_close", 0.0)) for meta in holdings.values())
@@ -1044,17 +1614,20 @@ def simulate_pattern_backtest(
                 "mode": mode,
                 "signal_count": int(len(_select_candidates(previous_signal_df, mode, set(), blocked_codes=blocked_symbols).index)),
                 "buy_count": int(len(buy_codes)),
-                "sell_count": int(len(sell_codes)),
+                "sell_count": int(len(executed_sell_symbols)),
                 "hold_count": int(len(hold_codes)),
                 "candidate_symbols": _join_symbols([_to_qmt_symbol(symbol) for symbol in candidate_df.index.tolist()]),
                 "buy_symbols": _join_symbols([_to_qmt_symbol(symbol) for symbol in buy_codes]),
-                "sell_symbols": _join_symbols([_to_qmt_symbol(symbol) for symbol in sell_codes]),
+                "sell_symbols": _join_symbols([_to_qmt_symbol(symbol) for symbol in executed_sell_symbols]),
                 "hold_symbols": _join_symbols([_to_qmt_symbol(symbol) for symbol in hold_codes]),
             }
         )
         previous_account = end_account
 
     for code, meta in holdings.items():
+        remaining_shares = int(meta.get("shares", 0))
+        initial_shares = max(int(meta.get("initial_shares", remaining_shares)), 1)
+        remaining_buy_amount = float(meta.get("buy_amount", 0.0)) * remaining_shares / initial_shares
         ledger_rows.append(
             {
                 "日期": pd.Timestamp(meta.get("buy_date")).date().isoformat() if meta.get("buy_date") is not None else "",
@@ -1068,8 +1641,8 @@ def simulate_pattern_backtest(
                 "卖出价格": None,
                 "买入评分": round(float(meta.get("entry_score", 0.0)), 4),
                 "卖出评分": None,
-                "BUY金额": round(float(meta.get("buy_amount", 0.0)), 2),
-                "BUY股数": int(meta.get("shares", 0)),
+                "BUY金额": round(remaining_buy_amount, 2),
+                "BUY股数": remaining_shares,
                 "SELL日期": "",
                 "卖出原因": "",
                 "这个标的这次操作的盈亏金额": None,
@@ -1203,10 +1776,10 @@ def main() -> None:
     parser.add_argument("--buy-price-field", default="")
     parser.add_argument("--sell-price-field", default="")
     parser.add_argument("--slippage-rate", type=float, default=0.005)
-    parser.add_argument("--max-holdings", type=int, default=10)
+    parser.add_argument("--max-holdings", type=int, default=8)
     parser.add_argument("--risk-degree", type=float, default=0.95)
     parser.add_argument("--max-holding-days", type=int, default=15)
-    parser.add_argument("--min-position-ratio", type=float, default=0.06)
+    parser.add_argument("--min-position-ratio", type=float, default=0.04)
     parser.add_argument("--swap-score-gap", type=float, default=15.0)
     parser.add_argument("--modes", nargs="+", default=["B1", "B2", "B3"])
     parser.add_argument("--output-dir", default=str(ROOT / "data" / "reports" / "user_pattern_backtests"))

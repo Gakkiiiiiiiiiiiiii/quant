@@ -73,6 +73,57 @@ def _scaled_score(series: pd.Series, low: float, high: float) -> pd.Series:
     return ((series - low) / width).clip(lower=0.0, upper=1.0)
 
 
+B1_EXPLORATORY_POSITION_RATIO = 0.12
+B1_STANDARD_POSITION_RATIO = 0.15
+B1_HIGH_CONVICTION_POSITION_RATIO = 0.18
+B1_ACTIVE_MAIN_POSITION_LIMIT = 8
+B1_PROBE_RATIO_DIVISOR = 3.0
+
+
+def resolve_b1_position_ratio(row: pd.Series | dict[str, object]) -> float:
+    """
+    按 v4 文档把 B1 初始主仓分成三档：
+    - 试探仓：10%
+    - 标准仓：15%
+    - 高确信仓：18%
+    """
+    priority_score = float(row.get("priority_score", 0.0) or 0.0)
+    quality_score = float(row.get("quality_score", max(priority_score - 60.0, 0.0)) or 0.0)
+    b1_confirm = bool(row.get("b1_confirm", 0))
+    if priority_score >= 145.0 or (b1_confirm and quality_score >= 72.0):
+        return B1_HIGH_CONVICTION_POSITION_RATIO
+    if priority_score >= 125.0 or quality_score >= 60.0 or b1_confirm:
+        return B1_STANDARD_POSITION_RATIO
+    return B1_EXPLORATORY_POSITION_RATIO
+
+
+def _barslast(mask: pd.Series) -> pd.Series:
+    values = mask.fillna(False).astype(bool).tolist()
+    result: list[float] = []
+    last_true = -1
+    for idx, flag in enumerate(values):
+        if flag:
+            last_true = idx
+            result.append(0.0)
+        elif last_true < 0:
+            result.append(np.nan)
+        else:
+            result.append(float(idx - last_true))
+    return pd.Series(result, index=mask.index, dtype=float)
+
+
+def _last_event_value(values: pd.Series, mask: pd.Series) -> pd.Series:
+    event_mask = mask.fillna(False).astype(bool).tolist()
+    raw_values = values.tolist()
+    result: list[float] = []
+    last_value = np.nan
+    for value, flag in zip(raw_values, event_mask):
+        if flag:
+            last_value = float(value)
+        result.append(last_value)
+    return pd.Series(result, index=values.index, dtype=float)
+
+
 def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     基于 OHLCV 计算你三个战法要用的全部基础指标
@@ -120,7 +171,11 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
         g["hh20"] = h.rolling(20, min_periods=20).max()
         g["hh25"] = h.rolling(25, min_periods=25).max()
         g["hh30"] = h.rolling(30, min_periods=30).max()
+        g["hh40"] = h.rolling(40, min_periods=40).max()
+        g["hh50"] = h.rolling(50, min_periods=50).max()
         g["ll20"] = l.rolling(20, min_periods=20).min()
+        g["ll40"] = l.rolling(40, min_periods=40).min()
+        g["ll50"] = l.rolling(50, min_periods=50).min()
         g["vol_hh60"] = v.rolling(60, min_periods=60).max()
 
         # 补票战法的区间位置值
@@ -132,7 +187,9 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
         )
 
         g["count_above_lt_20"] = (c > g["lt"]).rolling(20, min_periods=20).sum()
+        g["count_above_lt_30"] = (c > g["lt"]).rolling(30, min_periods=30).sum()
         g["count_above_lt_10"] = (c > g["lt"]).rolling(10, min_periods=10).sum()
+        g["count_above_st_20"] = (c > g["st"]).rolling(20, min_periods=20).sum()
         g["small_move_5"] = (c.pct_change(fill_method=None).abs() < 0.03).rolling(5, min_periods=5).sum()
 
         g["st_slope_up"] = g["st"] >= g["st"].shift(1)
@@ -186,40 +243,49 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         # -----------------
         # B1: 按用户给定的通达信公式实现
         # -----------------
+        hh40 = g["hh40"] if "hh40" in g.columns else h.rolling(40, min_periods=1).max()
+        ll40 = g["ll40"] if "ll40" in g.columns else l.rolling(40, min_periods=1).min()
+        count_above_lt_30 = g["count_above_lt_30"] if "count_above_lt_30" in g.columns else (c > g["lt"]).rolling(30, min_periods=1).sum()
+        count_above_st_20 = g["count_above_st_20"] if "count_above_st_20" in g.columns else (c > g["st"]).rolling(20, min_periods=1).sum()
+        prev_high = g["hh20"].shift(1)
+        dist_from_prev_high = (prev_high - c) / (prev_high + eps)
+        recent_high = h >= g["hh20"] * 0.995
+        days_since_recent_high = _barslast(recent_high)
+        explosive_bull = (c > g["open"]) & (c / (c.shift(1) + eps) >= 1.05) & (v >= g["vol_ma20"] * 1.5)
+        pullback_big_bear = (c < g["open"]) & (((g["open"] - c) / (c.shift(1) + eps)) >= 0.04)
+        pullback_distribution_bear = (c < g["open"]) & (v >= g["vol_ma20"] * 1.8)
         b1_structure = (
-            g["lt_slope_up"]
-            & (g["count_above_lt_20"] >= 12)
-            & (g["st"] >= g["lt"] * 0.98)
-            & (c >= g["lt"] * 0.98)
+            (g["lt"] > g["lt"].shift(3))
+            & (g["st"] > g["lt"])
+            & (count_above_lt_30 >= 20)
+            & (count_above_st_20 >= 12)
         )
-        b1_startup_base = (g["hh20"] / (g["ll20"] + eps) >= 1.12)
+        b1_startup_base = (
+            (hh40 / (ll40 + eps) >= 1.25)
+            & (explosive_bull.rolling(30, min_periods=1).sum() >= 1)
+            & (recent_high.rolling(15, min_periods=1).sum() >= 1)
+            & b1_structure
+        )
         b1_retrace_ready = (
-            (g["j"] < 13)
-            & (c <= g["st"] * 1.03)
-            & (c >= g["lt"] * 0.98)
-            & (l >= g["lt"] * 0.96)
+            (g["j"] < 20)
+            & (c <= g["st"] * 1.02)
+            & (c >= g["lt"] * 0.99)
+            & (l >= g["lt"] * 0.97)
+            & (dist_from_prev_high >= 0.04)
+            & (dist_from_prev_high <= 0.15)
+            & (days_since_recent_high >= 2)
+            & (days_since_recent_high <= 12)
+            & ((c < g["lt"]).rolling(10, min_periods=1).sum() <= 1)
+            & (pullback_big_bear.rolling(12, min_periods=1).sum() == 0)
+            & (pullback_distribution_bear.rolling(12, min_periods=1).sum() == 0)
         )
         b1_extreme_shrink = (
-            (v <= v.rolling(8, min_periods=8).min())
-            & (v < g["vol_ma20"] * 0.7)
+            (v <= v.rolling(10, min_periods=1).min())
+            & (v < g["vol_ma20"] * 0.65)
         )
         b1_kline = (
-            (g["body_pct"] <= 0.025)
-            & (g["range_pct_prev_close"] <= 0.06)
-        )
-        b1_core = (
-            eligible_entry
-            & b1_structure
-            & b1_startup_base
-            & b1_retrace_ready
-            & b1_extreme_shrink
-            & b1_kline
-        )
-        b1_confirm = (
-            b1_core.shift(1, fill_value=False)
-            & (c > h.shift(1))
-            & (c > g["st"])
-            & (v > v.shift(1) * 1.2)
+            (g["body_pct"] <= 0.022)
+            & (g["range_pct_prev_close"] <= 0.055)
         )
 
         acceleration_zone = (
@@ -259,12 +325,42 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
             & (g["hh8"] / (g["ll8"] + eps) < 1.12)
         )
 
-        b1_exit_signal = b1_exit_1 | b1_exit_2 | b1_exit_3 | b1_exit_4 | b1_exit_5
+        b1_soft_exit_flag = b1_exit_1 | b1_exit_2 | b1_exit_4 | b1_exit_5
+        b1_hard_distribution_flag = b1_exit_3
+        b1_exit_signal = b1_soft_exit_flag | b1_hard_distribution_flag
         recent_distribution = b1_exit_signal.rolling(30, min_periods=1).sum() >= 1
-        # b1.md 的“C>HHV(H,30)*1.03”若按当日 HHV 实现将永远不成立，这里按文档语义取前 30 日高点。
         repair = (c > g["hh30"].shift(1) * 1.03) | (g["count_above_st_10"] >= 8)
-        b1_forbidden = recent_distribution & ~repair
-        b1_formula = b1_core & ~b1_forbidden
+        b1_pullback_distribution_forbidden = pullback_distribution_bear.rolling(10, min_periods=1).sum() >= 1
+        b1_forbidden = (recent_distribution & ~repair) | b1_pullback_distribution_forbidden
+        b1_candidate_v5 = (
+            eligible_entry
+            & b1_startup_base
+            & b1_retrace_ready
+            & b1_extreme_shrink
+            & b1_kline
+            & ~b1_forbidden
+        )
+        b1_probe_bars = _barslast(b1_candidate_v5)
+        b1_signal_high = _last_event_value(h, b1_candidate_v5)
+        b1_signal_low = _last_event_value(l, b1_candidate_v5)
+        b1_confirm_window = (b1_probe_bars >= 1) & (b1_probe_bars <= 5)
+        b1_confirm = (
+            b1_confirm_window
+            & (c > b1_signal_high * 1.01)
+            & (c > g["st"])
+            & (c > h.shift(1))
+            & (v > np.maximum(v.shift(1) * 1.2, g["vol_ma20"] * 1.2))
+        )
+        b1_probe_invalid = (
+            (b1_probe_bars <= 5)
+            & (
+                (c < b1_signal_low * 0.99)
+                | (c < g["lt"] * 0.98)
+                | ((b1_probe_bars >= 5) & (c < g["st"]))
+            )
+        ).fillna(False)
+        b1_core = b1_candidate_v5
+        b1_formula = b1_candidate_v5
         b1_lt_hard_stop_flag = ((c < g["lt"] * 0.98) | ((c < g["lt"]).rolling(2, min_periods=2).sum() >= 2)).fillna(False)
         b1_st_stop_flag = (
             (c < g["st"]) & (v > g["vol_ma5"] * 1.2) & (c < c.shift(1))
@@ -348,14 +444,19 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         g["exit_flag"] = (generic_exit_flag | b1_exit_signal).astype(int)
 
         g["b1_trigger_raw"] = b1_core.astype(int)
-        g["b1_watch_days"] = np.nan
+        g["b1_watch_days"] = b1_probe_bars.astype(float)
         g["b1_anchor_low"] = l.where(b1_formula)
         g["b1_trigger_entry"] = b1_formula.astype(int)
         g["b1_pullback_entry"] = 0
         g["b1_core"] = b1_core.astype(int)
         g["b1_confirm"] = b1_confirm.astype(int)
+        g["b1_probe_invalid"] = b1_probe_invalid.astype(int)
+        g["b1_signal_high"] = b1_signal_high.astype(float)
+        g["b1_signal_low"] = b1_signal_low.astype(float)
         g["b1_forbidden"] = b1_forbidden.astype(int)
         g["b1"] = b1_formula.astype(int)
+        g["b1_soft_exit_flag"] = b1_soft_exit_flag.astype(int)
+        g["b1_hard_distribution_flag"] = b1_hard_distribution_flag.astype(int)
         g["b1_lt_hard_stop_flag"] = b1_lt_hard_stop_flag.astype(int)
         g["b1_st_stop_flag"] = b1_st_stop_flag.astype(int)
         g["b1_platform_established"] = b1_platform_established.astype(int)
@@ -384,20 +485,20 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         )
 
         g["quality_score"] = (
-            20.0 * _scaled_score(g["lt"] / (g["lt"].shift(1) + eps) - 1.0, 0.0, 0.02)
-            + 18.0 * _scaled_score(g["count_above_lt_20"], 12.0, 20.0)
-            + 18.0 * _scaled_score(13.0 - g["j"], 0.0, 13.0)
-            + 14.0 * _scaled_score((g["vol_ma20"] * 0.7 - v) / (g["vol_ma20"] + eps), 0.0, 0.4)
-            + 10.0 * _scaled_score(g["st"] * 1.03 - c, 0.0, g["st"] * 0.08)
-            + 10.0 * _scaled_score(0.025 - g["body_pct"], 0.0, 0.025)
-            + 10.0 * _scaled_score(0.06 - g["range_pct_prev_close"], 0.0, 0.06)
+            18.0 * _scaled_score(g["lt"] / (g["lt"].shift(3) + eps) - 1.0, 0.0, 0.03)
+            + 16.0 * _scaled_score(count_above_lt_30, 20.0, 30.0)
+            + 14.0 * _scaled_score(count_above_st_20, 12.0, 20.0)
+            + 14.0 * _scaled_score(20.0 - g["j"], 0.0, 20.0)
+            + 14.0 * _scaled_score((g["vol_ma20"] * 0.65 - v) / (g["vol_ma20"] + eps), 0.0, 0.35)
+            + 12.0 * _scaled_score(dist_from_prev_high, 0.04, 0.15)
+            + 12.0 * _scaled_score(0.055 - g["range_pct_prev_close"], 0.0, 0.055)
         )
         g["priority_score"] = (
             g["quality_score"]
             + 100.0 * g["b2"]
             + 80.0 * g["b3"]
             + 60.0 * g["b1"]
-            + 10.0 * g["b1_confirm"]
+            + 20.0 * g["b1_confirm"]
         ).astype(float)
 
         return g
@@ -409,7 +510,8 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         "st", "lt", "vol_ma5",
         "b1_trigger_raw", "b1_watch_days",
         "b1_trigger_entry", "b1_pullback_entry",
-        "b1_core", "b1_confirm", "b1_forbidden", "b1_exit_flag",
+        "b1_core", "b1_confirm", "b1_probe_invalid", "b1_signal_high", "b1_signal_low", "b1_forbidden", "b1_exit_flag",
+        "b1_soft_exit_flag", "b1_hard_distribution_flag",
         "b1_lt_hard_stop_flag", "b1_st_stop_flag", "b1_platform_established", "b1_platform_low",
         "b1", "b2", "b3",
         "entry_flag", "exit_flag", "stop_price",
@@ -427,7 +529,7 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
 @dataclass
 class StrategyConfig:
     mode: Literal["B1", "B2", "B3", "COMBINED"] = "COMBINED"
-    max_holdings: int = 10
+    max_holdings: int = 8
     risk_degree: float = 0.95
     max_holding_days: int = 15
     min_swap_score_gap: float = 15.0
@@ -504,20 +606,30 @@ class PatternSignalStrategy(WeightStrategyBase):
         candidate_df = candidate_df.sort_values("priority_score", ascending=False)
 
         if self.cfg.mode == "B1":
-            slots = max(int(self.cfg.max_holdings) - len(keep), 0)
+            main_limit = min(int(self.cfg.max_holdings), B1_ACTIVE_MAIN_POSITION_LIMIT)
+            slots = max(main_limit - len(keep), 0)
             target_codes = keep + [str(code) for code in candidate_df.head(slots).index.tolist()]
             new_codes = [code for code in target_codes if code not in keep]
+            target_ratios: dict[str, float] = {}
+            for code in keep:
+                target_ratios[code] = float(self.entry_meta.get(code, {}).get("position_ratio", B1_STANDARD_POSITION_RATIO))
             for code in new_codes:
                 row = candidate_df.loc[code]
+                position_ratio = resolve_b1_position_ratio(row)
                 self.entry_meta[code] = {
                     "stop_price": None,
                     "pattern": row.get("pattern", ""),
                     "entry_dt": trade_start_time,
+                    "position_ratio": position_ratio,
                 }
+                target_ratios[code] = position_ratio
             if not target_codes:
                 return {}
-            weight = 1.0 / len(target_codes)
-            return {code: weight for code in target_codes}
+            total_ratio = sum(target_ratios.get(code, B1_STANDARD_POSITION_RATIO) for code in target_codes)
+            if total_ratio <= 0:
+                return {}
+            scale = min(1.0 / total_ratio, 1.0)
+            return {code: target_ratios.get(code, B1_STANDARD_POSITION_RATIO) * scale for code in target_codes}
 
         keep_scores = []
         for code in keep:
@@ -584,7 +696,7 @@ def run_pattern_backtest(
     benchmark: str = "SH000300",
     deal_price: str = "open",  # 默认按 T-1 信号、T 日开盘执行
     mode: Literal["B1", "B2", "B3", "COMBINED"] = "COMBINED",
-    max_holdings: int = 10,
+    max_holdings: int = 8,
     risk_degree: float = 0.95,
     max_holding_days: int = 15,
     account: float = 10_000_000,

@@ -183,3 +183,54 @@
 - 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir data/reports/user_pattern_backtests_recent6m_b1v2_nost2day` 通过。
 - 修正后最近半年回测结果：期末权益 `446308.02`，总收益 `-10.74%`，年化 `-21.87%`，最大回撤 `-19.41%`，换手 `26.24`。
 - 修正后卖出原因分布显著变化：`b1_signal_low_stop=56`、`b1_lt_hard_stop=32`、`b1_st_stop=24`、`b1_platform_stop=10`、`b1_distribution=9`、`b1_time_stop_a=3`、`b1_time_stop_b=3`，未平仓记录 `10` 条。
+
+## 2026-03-22 Codex B1 final version v3
+
+- 依据 `strategy/B1_最终版策略说明_v3.md` 更新 `B1`：保留 `B1核心 / 禁入 / LT-ST-平台-时间防守止损`，并将离场拆分为 `硬清仓` 与 `软卖点` 两层。
+- `strategy.py` 新增 `b1_soft_exit_flag` 与 `b1_hard_distribution_flag`，其中 `出货3` 提升为硬清仓信号，`出货1/2/4/5` 作为软卖点信号。
+- `scripts/run_user_pattern_backtests.py` 执行层新增 `position_stage` 与 `last_soft_exit_signal_date` 状态，按 `30% / 30% / 30% / 10%` 规则实现分批卖出；盈利阈值分别为 `10% / 20% / 30%` 的持仓内最高涨幅。
+- 只要触发 `LT硬止损 / ST止损 / 平台止损 / 信号低点止损 / 时间止损A/B / 出货3`，剩余仓位全部清仓；否则按软卖点或盈利阈值分批兑现。
+- `python -m pytest tests/test_b1_strategy_logic.py -q` 通过，共 `13` 个测试；新增覆盖 `10%浮盈先卖30%` 和 `硬清仓优先级高于分批卖出`。
+- 执行 `scripts/run_user_pattern_backtests.py --config .tmp/app_sqlite_backtest.yaml --strategy-file strategy/strategy.py --provider-strategy configs/strategy/first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir data/reports/user_pattern_backtests_recent6m_b1v3` 通过。
+- 最新最近半年回测结果写入 `data/reports/user_pattern_backtests_recent6m_b1v3/`：期末权益 `357584.03`，总收益 `-28.48%`，年化 `-51.73%`，最大回撤 `-29.02%`，换手 `36.24`。
+- 最近半年交易台账 `data/reports/user_pattern_backtests_recent6m_b1v3/b1_daily_actions.csv` 共 `189` 条记录，已出现 `b1_profit_take_10 / 20 / 30` 与 `b1_soft_exit_1`，说明 `v3` 分批兑现逻辑已实际触发。
+
+## 2026-03-22 Codex B1 final version v4
+
+- 依据 `strategy/B1_最终版策略说明_v4.md` 增加 `B1` 仓位管理：主仓初始仓位分为 `10% / 15% / 18%` 三档，映射到 `strategy.py::resolve_b1_position_ratio()`，并新增 `B1_ACTIVE_MAIN_POSITION_LIMIT = 8`。
+- `scripts/run_user_pattern_backtests.py` 执行层新增 `_b1_counts_as_main_position()` 与 `_plan_b1_new_entries()`：只有 `position_stage = 0` 的未减仓主仓会占用主仓名额，已经减仓后的尾仓不再占用 `4-8` 只活跃主仓配额。
+- `B1` 新开仓不再按剩余资金等权切分，而是按 `v4` 档位直接分配目标建仓金额；默认 `--max-holdings` 已调整为 `8`，`--min-position-ratio` 已调整为 `0.10`。
+- `strategy.py` 的 `PatternSignalStrategy` 与脚本中的 Qlib monkey patch 同步更新为 B1 比例权重版本，避免策略层和本地回测层出现两套不同的默认主仓口径。
+- `D:\project\quant\.venv\Scripts\python.exe -m pytest -q D:\project\quant\tests\test_b1_strategy_logic.py` 通过，共 `15` 个测试；新增覆盖 `v4` 仓位分层和“已减仓尾仓不占主仓名额”。
+- 执行 `D:\project\quant\.venv\Scripts\python.exe D:\project\quant\scripts\run_user_pattern_backtests.py --config D:\project\quant\.tmp\app_sqlite_backtest.yaml --strategy-file D:\project\quant\strategy\strategy.py --provider-strategy D:\project\quant\configs\strategy\first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir D:\project\quant\data\reports\user_pattern_backtests_recent6m_b1v4` 通过。
+- 最新最近半年回测结果写入 `data/reports/user_pattern_backtests_recent6m_b1v4/`：期末权益 `346526.88`，总收益 `-30.69%`，年化 `-54.91%`，最大回撤 `-30.82%`，换手 `33.98`。
+- 最近半年交易台账 `data/reports/user_pattern_backtests_recent6m_b1v4/b1_daily_actions.csv` 共 `157` 条记录，其中已平仓 `150` 条、未平仓 `7` 条；按单笔完整建仓汇总后，初始买入金额区间约为 `27508.86 ~ 88047.04`。
+
+## 2026-03-22 Codex B1 close sell timing
+
+- 按用户要求调整 `B1` 卖出执行时点：老仓在 `T` 日收盘确认卖出信号后，按 `T` 日收盘价卖出；若某仓位在 `T` 日开盘刚买入、当日收盘又出现卖出信号，则挂为 `pending_exit`，在 `T+1` 日开盘卖出。
+- `scripts/run_user_pattern_backtests.py` 新增 `_execute_sell_trade()`，并把 `simulate_pattern_backtest()` 的 B1 路径改成“开盘处理前一日待卖单 -> 当日开盘买入 -> 当日收盘判定并执行老仓卖出 -> 新仓信号顺延到次日开盘”。
+- 本次顺带修正了开盘买入前的持仓估值口径：不再用当日收盘价给当日开盘的新仓分配预算，避免仓位分配层面的未来数据污染。
+- `D:\project\quant\.venv\Scripts\python.exe -m pytest -q D:\project\quant\tests\test_b1_strategy_logic.py` 通过，共 `17` 个测试；新增覆盖“老仓同日收盘卖出”和“新仓同日触发卖点后次日开盘卖出”。
+- 执行 `D:\project\quant\.venv\Scripts\python.exe D:\project\quant\scripts\run_user_pattern_backtests.py --config D:\project\quant\.tmp\app_sqlite_backtest.yaml --strategy-file D:\project\quant\strategy\strategy.py --provider-strategy D:\project\quant\configs\strategy\first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --output-dir D:\project\quant\data\reports\user_pattern_backtests_recent6m_b1v4_close_sell` 通过。
+- 新的最近半年结果写入 `data/reports/user_pattern_backtests_recent6m_b1v4_close_sell/`：期末权益 `368732.67`，总收益 `-26.25%`，年化 `-48.40%`，最大回撤 `-26.39%`，换手 `34.04`。
+
+## 2026-03-22 Codex B1 final version v5
+
+- 依据用户提供的 `ChatGPT share v5` 方案，重写 `B1` 的入场质量过滤与 `probe / confirm` 执行链路，核心目标是减少低质量回调样本，而不是继续堆叠离场条件。
+- `strategy.py` 中 `B1` 买点改为 `结构强化 + 启动基础v5 + 回调质量v5 + 极致缩量v5 + K线约束v5 + 禁入v5`，并新增 `b1_confirm / b1_probe_invalid / b1_signal_high / b1_signal_low`。
+- `scripts/run_user_pattern_backtests.py` 中新增 `env_a` 环境过滤、`probe` 仓与 `confirmed` 仓分层管理、确认加仓、试探失效卖出，以及 `probe` 仓不占主仓名额的仓位统计。
+- 本地数据中没有 `000852.SH` 与行业强弱排序数据，实际半年回测自动回退到 `000300.SH` 作为环境过滤基准，因此本次只实现并验证了 `env_a`；`env_b` 未在本地回测中启用。
+- `D:\project\quant\.venv\Scripts\python.exe -m pytest -q D:\project\quant\tests\test_b1_strategy_logic.py` 通过，共 `18` 个测试；新增覆盖 `v5` 公式、`probe` 失效、`probe` 仓位比例与 `B1 env` 过滤。
+- 执行 `D:\project\quant\.venv\Scripts\python.exe D:\project\quant\scripts\run_user_pattern_backtests.py --config D:\project\quant\.tmp\app_sqlite_backtest.yaml --strategy-file D:\project\quant\strategy\strategy.py --provider-strategy D:\project\quant\configs\strategy\first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --slippage-rate 0.005 --output-dir D:\project\quant\data\reports\user_pattern_backtests_recent6m_b1v5` 通过。
+- 最近半年 `B1 v5` 结果写入 `data/reports/user_pattern_backtests_recent6m_b1v5/`：期末权益 `497851.32`，总收益 `-0.43%`，年化 `-0.93%`，最大回撤 `-7.72%`，换手 `6.09`。
+- 最新交易台账 `data/reports/user_pattern_backtests_recent6m_b1v5/b1_daily_actions.csv` 共 `69` 条记录；主要卖出原因分布为 `b1_probe_invalid=33`、`b1_profit_take_10=7`、`b1_st_stop=6`、`b1_lt_hard_stop=5`。
+
+## 2026-03-23 Codex B1 v5 probe exit tightening
+
+- 根据用户补充，收紧 `probe` 持仓规则：`probe` 仓在确认前不仅接受 `b1_probe_invalid`，还接受 `LT硬止损 / ST止损 / 出货信号` 的即时卖出；若超过 `5` 个交易日仍未确认，则当日收盘直接卖出。
+- `scripts/run_user_pattern_backtests.py` 中 `_decide_b1_probe_action()` 已同步改成：`b1_probe_invalid -> LT -> ST -> 出货 -> 5日超时` 的全平判定。
+- `D:\project\quant\.venv\Scripts\python.exe -m pytest -q D:\project\quant\tests\test_b1_strategy_logic.py` 通过，共 `19` 个测试；新增覆盖 `probe` 接受 `LT/ST/出货/超时`，以及“超过 5 天未确认按当日收盘卖出”的端到端时序。
+- 执行 `D:\project\quant\.venv\Scripts\python.exe D:\project\quant\scripts\run_user_pattern_backtests.py --config D:\project\quant\.tmp\app_sqlite_backtest.yaml --strategy-file D:\project\quant\strategy\strategy.py --provider-strategy D:\project\quant\configs\strategy\first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --slippage-rate 0.005 --output-dir D:\project\quant\data\reports\user_pattern_backtests_recent6m_b1v5` 通过。
+- 更新后的最近半年 `B1 v5` 结果：期末权益 `476240.44`，总收益 `-4.75%`，年化 `-10.04%`，最大回撤 `-8.02%`，换手 `9.96`。
+- 这次修正后，`600995.SH / 南网储能` 已在 `2025-11-03` 因 `b1_probe_timeout` 卖出，`600580.SH / 卧龙电驱` 已在 `2026-01-23` 因 `b1_probe_timeout` 卖出，交易明细见 `data/reports/user_pattern_backtests_recent6m_b1v5/b1_daily_actions.csv`。
