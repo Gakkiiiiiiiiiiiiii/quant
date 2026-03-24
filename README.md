@@ -35,3 +35,11 @@
 - 历史数据默认落到 `data/parquet/history.parquet`。若本机未安装 QMT/xtquant，则自动生成示例 ETF 数据，保障回测链路可运行。
 - QMT 实盘接入通过动态导入 `xtdata` / `xttrader`。如果 QMT 客户端尚未安装，系统仍可执行回测和仿真盘流程。
 - `api/app.py` 提供基于标准库 `http.server` 的演示接口，避免无网环境下额外安装 FastAPI；`ui/streamlit_app.py` 保持 Streamlit 展示入口。
+
+## 聚宽风格策略形态
+
+- 新增 `configs/strategy/joinquant_style.yaml`，将策略声明改成更接近聚宽的钩子风格：`initialize / before_trading_start / handle_data / after_trading_end`。
+- 数据接入层继续沿用 QMT（`history_source=qmt`），在 UI 的“聚宽风格”模板下仍由 `scripts/load_history.py` 和 QMT bridge 负责历史行情拉取。
+- 回测层保持 Qlib 引擎不变（`backtest_engine=qlib`），新增策略的信号映射可直接进入 `TopkDropoutStrategy` 完成全市场回测。
+- 回测详情主图区支持“策略曲线 + Benchmark 曲线”同图展示；Qlib 回测完成后会输出 `report_dir/qlib_curve.csv` 供 UI 读取。
+- UI 侧边栏新增“准实时刷新”选项，可按秒级间隔自动轮询最新资产快照与报告。

@@ -1,0 +1,8 @@
+name: joinquant_style
+implementation: joinquant_style
+rebalance_frequency: daily
+lookback_days: 20
+top_n: 3
+lot_size: 100
+short_window: 5
+long_window: 20
