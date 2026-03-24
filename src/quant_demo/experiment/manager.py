@@ -43,6 +43,7 @@ from quant_demo.risk.service import RiskService
 from quant_demo.strategy.base import StrategyContext
 from quant_demo.strategy.implementations.etf_rotation import EtfRotationStrategy
 from quant_demo.strategy.implementations.first_alpha import FirstAlphaStrategy
+from quant_demo.strategy.implementations.joinquant_style import JoinQuantStyleStrategy
 from quant_demo.strategy.implementations.stock_ranking import StockRankingStrategy
 from quant_demo.strategy.registry import StrategyRegistry
 
@@ -63,6 +64,13 @@ class ExperimentManager:
         self.registry.register(EtfRotationStrategy(strategy_settings.lookback_days, strategy_settings.top_n))
         self.registry.register(StockRankingStrategy(strategy_settings.lookback_days, strategy_settings.top_n))
         self.registry.register(FirstAlphaStrategy(strategy_settings.lookback_days, strategy_settings.top_n))
+        self.registry.register(
+            JoinQuantStyleStrategy(
+                strategy_settings.lookback_days,
+                strategy_settings.top_n,
+                strategy_settings.extra,
+            )
+        )
 
     def _should_rebalance(self, index: int) -> bool:
         if self.strategy_settings.rebalance_frequency == "daily":

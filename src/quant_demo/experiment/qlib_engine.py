@@ -155,6 +155,18 @@ class QlibBacktestEngine:
             ) / 1_000_000
             score = momentum * 0.55 + win_rate * 0.25 - volatility.fillna(0.0) * 0.15 + liquidity * 0.05
             score = score.where((momentum > 0) & (score > 0))
+        elif implementation == "joinquant_style":
+            extra = self.strategy_settings.extra or {}
+            short_window = max(2, int(extra.get("short_window", max(3, lookback // 4))))
+            long_window = max(5, int(extra.get("long_window", lookback)))
+            short_ma = grouped["close"].transform(lambda series: series.rolling(short_window, min_periods=short_window).mean())
+            long_ma = grouped["close"].transform(lambda series: series.rolling(long_window, min_periods=long_window).mean())
+            trend = short_ma / long_ma - 1
+            liquidity = grouped["volume"].transform(
+                lambda series: series.rolling(long_window, min_periods=long_window).mean()
+            ) / 1_000_000
+            score = trend * 0.85 + liquidity * 0.15
+            score = score.where((long_ma > 0) & (score > 0))
         else:
             raise ValueError(f"Unsupported Qlib signal mapping for strategy: {implementation}")
 
@@ -216,6 +228,12 @@ class QlibBacktestEngine:
         net_return = return_series - cost_series
         cumulative_turnover = turnover_series.fillna(0.0).cumsum()
         equity = float(initial_cash) * (1.0 + net_return).cumprod()
+        benchmark_series = None
+        for key in ["bench", "benchmark", "bench_return"]:
+            if key in ordered_report:
+                benchmark_series = ordered_report[key].astype(float)
+                break
+        benchmark_equity = float(initial_cash) * (1.0 + benchmark_series).cumprod() if benchmark_series is not None else pd.Series(index=ordered_report.index, dtype=float)
         drawdown = equity / equity.cummax() - 1
         equity_curve = pd.DataFrame(
             {
@@ -224,6 +242,11 @@ class QlibBacktestEngine:
                 "turnover": cumulative_turnover.astype(float),
             }
         )
+        if not benchmark_equity.empty:
+            equity_curve["benchmark_equity"] = benchmark_equity.astype(float).values
+        report_dir = self._resolve_path(self.app_settings.report_dir)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        equity_curve.to_csv(report_dir / "qlib_curve.csv", index=False, encoding="utf-8")
 
         with self.session_factory() as session:
             self._reset_non_live_state(session)
