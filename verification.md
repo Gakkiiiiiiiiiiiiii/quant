@@ -234,3 +234,18 @@
 - 执行 `D:\project\quant\.venv\Scripts\python.exe D:\project\quant\scripts\run_user_pattern_backtests.py --config D:\project\quant\.tmp\app_sqlite_backtest.yaml --strategy-file D:\project\quant\strategy\strategy.py --provider-strategy D:\project\quant\configs\strategy\first_alpha_v1.yaml --start 2025-09-20 --end 2026-03-20 --account 500000 --modes B1 --slippage-rate 0.005 --output-dir D:\project\quant\data\reports\user_pattern_backtests_recent6m_b1v5` 通过。
 - 更新后的最近半年 `B1 v5` 结果：期末权益 `476240.44`，总收益 `-4.75%`，年化 `-10.04%`，最大回撤 `-8.02%`，换手 `9.96`。
 - 这次修正后，`600995.SH / 南网储能` 已在 `2025-11-03` 因 `b1_probe_timeout` 卖出，`600580.SH / 卧龙电驱` 已在 `2026-01-23` 因 `b1_probe_timeout` 卖出，交易明细见 `data/reports/user_pattern_backtests_recent6m_b1v5/b1_daily_actions.csv`。
+
+## 2026-03-24 B1 排序重构验证
+
+1. `D:\project\quant\.venv\Scripts\python.exe -m pytest tests\test_b1_strategy_logic.py tests\test_b1_rank_pipeline.py -q`
+   - 结果：通过，共 `24` 个测试。
+2. `D:\project\quant\.venv\Scripts\python.exe -m py_compile D:\project\quant\strategy\strategy.py D:\project\quant\scripts\run_user_pattern_backtests.py D:\project\quant\scripts\build_b1_rank_scores.py`
+   - 结果：通过。
+3. `D:\project\quant\.venv\Scripts\python.exe scripts\build_b1_rank_scores.py --config data\manual_test\b1_rank_smoke.yaml --start 2023-01-01 --end 2026-03-20 --train-months 12 --valid-months 3 --test-months 3 --step-months 3 --min-train-rows 50 --output-dir data\reports\b1_rank_smoke_small`
+   - 结果：通过；生成 `b1_events.parquet / b1_model_scores.parquet / b1_windows.csv / summary.json`。
+4. 直接调用 `simulate_pattern_backtest(..., b1_score_file='data/reports/b1_rank_smoke_small/b1_model_scores.parquet')`
+   - 结果：通过；确认模型分数能够实际参与 B1 回测。
+
+风险与说明：
+- `scripts/run_user_pattern_backtests.py` 的 CLI 全流程若走 `ensure_provider()`，在当前 smoke 配置下会被 provider 准备阶段拖慢；本次验证改为直接调用 `simulate_pattern_backtest()`，已覆盖本次实际修改路径。
+- 本机 `.tmp` 历史权限问题仍存在，导致 `apply_patch` 在后半程无法继续刷新工作区；新增测试文件和 smoke 配置改用 shell 落地，但代码语法、单测和烟测均已完成。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Literal
 
 import numpy as np
@@ -78,6 +79,361 @@ B1_STANDARD_POSITION_RATIO = 0.15
 B1_HIGH_CONVICTION_POSITION_RATIO = 0.18
 B1_ACTIVE_MAIN_POSITION_LIMIT = 8
 B1_PROBE_RATIO_DIVISOR = 3.0
+B1_PROBE_TOPK = 3
+B1_EVENT_DEDUP_WINDOW = 8
+B1_CONFIRM_SCORE_THRESHOLD = 60.0
+B1_MODEL_SCORE_Q50 = 50.0
+B1_MODEL_SCORE_Q80 = 80.0
+B1_QUALITY_WEIGHT = 0.3
+B1_MODEL_WEIGHT = 0.7
+B1_RANK_FEATURE_COLUMNS = [
+    "f_lt_slope_3",
+    "f_lt_slope_5",
+    "f_st_over_lt",
+    "f_cnt_above_lt",
+    "f_cnt_above_st",
+    "f_close_lt_dev",
+    "f_close_st_dev",
+    "f_range_40",
+    "f_bull_bars_20",
+    "f_big_up_cnt_30",
+    "f_recent_high_days",
+    "f_attack_quality",
+    "f_j_value",
+    "f_pullback_from_hh",
+    "f_days_from_recent_high",
+    "f_break_lt_cnt_10",
+    "f_big_down_cnt_12",
+    "f_dist_down_cnt_12",
+    "f_low_lt_dev",
+    "f_pullback_range_5",
+    "f_down_vol_share_8",
+    "f_vol_to_ma20",
+    "f_vol_rank_10",
+    "f_vol_rank_20",
+    "f_turnover_to_ma20",
+    "f_shrink_days_5",
+    "f_atr_5_to_20",
+    "f_body_pct",
+    "f_range_pct",
+    "f_upper_wick",
+    "f_lower_wick",
+]
+
+
+def _safe_float(value: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if pd.notna(number) else float("nan")
+
+
+def _rolling_rank(series: pd.Series, window: int) -> pd.Series:
+    def _calc(values: np.ndarray) -> float:
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0 or np.isnan(arr[-1]):
+            return np.nan
+        valid = arr[~np.isnan(arr)]
+        if valid.size == 0:
+            return np.nan
+        return float((valid <= valid[-1]).sum() / valid.size)
+
+    return series.rolling(window, min_periods=window).apply(_calc, raw=True)
+
+
+def _normalize_cross_sectional_percentile(series: pd.Series) -> pd.Series:
+    valid = series.dropna()
+    if valid.empty:
+        return pd.Series(np.nan, index=series.index, dtype=float)
+    ranked = valid.rank(method="average", pct=True) * 100.0
+    return ranked.reindex(series.index)
+
+
+def load_b1_model_scores(score_path: str | Path | None) -> pd.DataFrame:
+    if score_path is None:
+        return pd.DataFrame(columns=["instrument", "datetime", "model_score_raw"])
+    path = Path(score_path)
+    if not path.exists():
+        raise FileNotFoundError(f"B1 模型分数文件不存在: {path}")
+    if path.suffix.lower() == ".parquet":
+        frame = pd.read_parquet(path)
+    else:
+        frame = pd.read_csv(path)
+
+    renamed = frame.copy()
+    if "symbol" in renamed.columns and "instrument" not in renamed.columns:
+        renamed = renamed.rename(columns={"symbol": "instrument"})
+    if "trading_date" in renamed.columns and "datetime" not in renamed.columns:
+        renamed = renamed.rename(columns={"trading_date": "datetime"})
+    if "model_score_raw" not in renamed.columns:
+        for candidate in ("model_score", "score", "prediction", "pred"):
+            if candidate in renamed.columns:
+                renamed = renamed.rename(columns={candidate: "model_score_raw"})
+                break
+    required = {"instrument", "datetime", "model_score_raw"}
+    missing = sorted(required - set(renamed.columns))
+    if missing:
+        raise ValueError(f"B1 模型分数文件缺少字段: {', '.join(missing)}")
+    payload = renamed.loc[:, ["instrument", "datetime", "model_score_raw"]].copy()
+    payload["instrument"] = payload["instrument"].astype(str)
+    payload["datetime"] = pd.to_datetime(payload["datetime"]).dt.normalize()
+    payload["model_score_raw"] = pd.to_numeric(payload["model_score_raw"], errors="coerce")
+    payload = payload.dropna(subset=["instrument", "datetime"]).drop_duplicates(["instrument", "datetime"], keep="last")
+    return payload
+
+
+def apply_b1_model_scores(
+    signal: pd.DataFrame,
+    score_frame: pd.DataFrame | None = None,
+    *,
+    quality_weight: float = B1_QUALITY_WEIGHT,
+    model_weight: float = B1_MODEL_WEIGHT,
+) -> pd.DataFrame:
+    enriched = signal.copy()
+    if "rule_priority_score" not in enriched.columns:
+        enriched["rule_priority_score"] = enriched["priority_score"].astype(float)
+    if "model_score_raw" not in enriched.columns:
+        enriched["model_score_raw"] = np.nan
+    if "model_score" not in enriched.columns:
+        enriched["model_score"] = np.nan
+    if "final_score" not in enriched.columns:
+        enriched["final_score"] = enriched["priority_score"].astype(float)
+    if "score_source" not in enriched.columns:
+        enriched["score_source"] = "rule_only"
+    if "b1_rank_active" not in enriched.columns:
+        enriched["b1_rank_active"] = 0
+
+    if score_frame is None or score_frame.empty:
+        enriched["score"] = enriched["priority_score"].astype(float)
+        return enriched
+
+    lookup = score_frame.copy()
+    lookup["instrument"] = lookup["instrument"].astype(str)
+    lookup["datetime"] = pd.to_datetime(lookup["datetime"]).dt.normalize()
+    merged = (
+        enriched.reset_index()
+        .merge(lookup, on=["instrument", "datetime"], how="left", suffixes=("", "_ext"))
+        .set_index(["instrument", "datetime"])
+        .sort_index()
+    )
+    merged["model_score_raw"] = pd.to_numeric(merged["model_score_raw_ext"], errors="coerce").combine_first(
+        pd.to_numeric(merged["model_score_raw"], errors="coerce")
+    )
+    merged = merged.drop(columns=["model_score_raw_ext"], errors="ignore")
+
+    active_mask = merged["b1"].eq(1) & merged["model_score_raw"].notna()
+    if active_mask.any():
+        normalized = (
+            merged.loc[active_mask, ["model_score_raw"]]
+            .groupby(level="datetime")["model_score_raw"]
+            .transform(_normalize_cross_sectional_percentile)
+        )
+        merged.loc[active_mask, "model_score"] = normalized.astype(float)
+        blended = quality_weight * merged.loc[active_mask, "quality_score"].astype(float) + model_weight * merged.loc[
+            active_mask, "model_score"
+        ].astype(float)
+        merged.loc[active_mask, "final_score"] = blended.astype(float)
+        merged.loc[active_mask, "priority_score"] = merged.loc[active_mask, "final_score"]
+        merged.loc[active_mask, "score_source"] = "model_blend"
+        merged.loc[active_mask, "b1_rank_active"] = 1
+
+    merged["score"] = merged["priority_score"].astype(float)
+    return merged
+
+
+def allow_b1_confirm(row: pd.Series | dict[str, object], threshold: float = B1_CONFIRM_SCORE_THRESHOLD) -> bool:
+    if not bool(row.get("b1_confirm", 0)):
+        return False
+    model_score = _safe_float(row.get("model_score", np.nan))
+    if pd.notna(model_score):
+        return model_score >= float(threshold)
+    return True
+
+
+def select_b1_probe_candidates(
+    candidate_df: pd.DataFrame,
+    *,
+    topk: int = B1_PROBE_TOPK,
+) -> pd.DataFrame:
+    if candidate_df.empty:
+        return candidate_df.copy()
+    working = candidate_df.sort_values("priority_score", ascending=False).copy()
+    if "model_score" in working.columns and working["model_score"].notna().any():
+        score_floor = float(working["model_score"].dropna().median())
+        working = working[(working["model_score"].isna()) | (working["model_score"] >= score_floor)]
+    if int(topk) > 0:
+        working = working.head(int(topk))
+    return working
+
+
+def build_b1_rank_event_frame(
+    features: pd.DataFrame,
+    signal: pd.DataFrame,
+    *,
+    dedup_window: int = B1_EVENT_DEDUP_WINDOW,
+) -> pd.DataFrame:
+    joined = features.join(
+        signal[
+            [
+                "b1",
+                "b1_confirm",
+                "b1_probe_invalid",
+                "b1_lt_hard_stop_flag",
+                "b1_st_stop_flag",
+                "b1_soft_exit_flag",
+                "b1_watch_days",
+            ]
+        ],
+        how="inner",
+    ).sort_index()
+    rows: list[dict[str, object]] = []
+
+    for instrument, group in joined.groupby(level="instrument", sort=False):
+        g = group.droplevel("instrument").sort_index().copy()
+        o = g["open"].astype(float)
+        h = g["high"].astype(float)
+        l = g["low"].astype(float)
+        c = g["close"].astype(float)
+        v = g["volume"].astype(float)
+        st = g["st"].astype(float)
+        lt = g["lt"].astype(float)
+        prev_close = c.shift(1)
+        bullish = (c > o) & (c / (prev_close + 1e-12) > 1.03)
+        explosive_bull = bullish & (c / (prev_close + 1e-12) >= 1.05) & (v > g["vol_ma20"] * 1.5)
+        big_down = (c < o) & (((o - c) / (prev_close + 1e-12)) >= 0.04)
+        dist_down = (c < o) & (v >= g["vol_ma20"] * 1.8)
+        recent_high = h >= g["hh20"] * 0.995
+        recent_high_days = _barslast(recent_high)
+        true_range = pd.concat(
+            [
+                (h - l).abs(),
+                (h - prev_close).abs(),
+                (l - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr5 = true_range.rolling(5, min_periods=5).mean()
+        atr20 = true_range.rolling(20, min_periods=20).mean()
+        vol_rank_10 = _rolling_rank(v, 10)
+        vol_rank_20 = _rolling_rank(v, 20)
+        returns = c.pct_change(fill_method=None)
+        attack_quality = returns.clip(lower=0.0).rolling(10, min_periods=10).sum() / (
+            returns.abs().rolling(10, min_periods=10).sum() + 1e-6
+        )
+        pullback_from_hh = (g["hh20"].shift(1) - c) / (g["hh20"].shift(1) + 1e-12)
+        down_vol_share_8 = g["down_vol_8"] / (g["down_vol_8"] + g["up_vol_8"] + 1e-6)
+        upper_wick = (h - pd.concat([c, o], axis=1).max(axis=1)) / (prev_close + 1e-12)
+        lower_wick = (pd.concat([c, o], axis=1).min(axis=1) - l) / (prev_close + 1e-12)
+
+        candidate_positions = np.flatnonzero(g["b1"].fillna(0).astype(int).to_numpy() == 1)
+        last_kept_idx: int | None = None
+        last_kept_resolved = True
+        for pos in candidate_positions:
+            if pos + 10 >= len(g):
+                continue
+            if pos + 1 >= len(g):
+                continue
+            if last_kept_idx is not None and pos - last_kept_idx <= int(dedup_window) and not last_kept_resolved:
+                continue
+
+            entry_px = _safe_float(o.iloc[pos + 1])
+            if pd.isna(entry_px) or entry_px <= 0:
+                continue
+
+            future10 = g.iloc[pos + 1 : pos + 11]
+            future5 = g.iloc[pos + 1 : pos + 6]
+            if len(future10) < 10 or len(future5) < 5:
+                continue
+            confirm_hit = bool(future5["b1_confirm"].fillna(0).astype(int).eq(1).any())
+            probe_fail = bool(
+                future5[
+                    [
+                        "b1_probe_invalid",
+                        "b1_lt_hard_stop_flag",
+                        "b1_st_stop_flag",
+                    ]
+                ]
+                .fillna(0)
+                .astype(int)
+                .any(axis=1)
+                .any()
+            )
+            probe_timeout = bool(g.iloc[pos + 1 : pos + 7]["b1_watch_days"].fillna(-1).astype(float).gt(5).any())
+            if not probe_fail:
+                probe_fail = probe_timeout
+            mfe_10 = float(future10["high"].max() / entry_px - 1.0)
+            mae_5 = float(future5["low"].min() / entry_px - 1.0)
+            label_rank = (
+                1.2 * float(np.clip(mfe_10, 0.0, 0.15))
+                - 1.0 * float(np.clip(-mae_5, 0.0, 0.08))
+                + 0.4 * float(int(confirm_hit))
+                - 0.8 * float(int(probe_fail))
+            )
+            label_cls = int(confirm_hit and mfe_10 >= 0.10 and not probe_fail)
+
+            row = {
+                "instrument": str(instrument),
+                "datetime": g.index[pos],
+                "entry_date": g.index[pos + 1],
+                "entry_open": entry_px,
+                "mfe_10": mfe_10,
+                "mae_5": mae_5,
+                "confirm_hit": int(confirm_hit),
+                "probe_fail": int(probe_fail),
+                "label_rank": float(label_rank),
+                "label_cls": label_cls,
+                "f_lt_slope_3": float(lt.iloc[pos] / (lt.shift(3).iloc[pos] + 1e-12) - 1.0),
+                "f_lt_slope_5": float(lt.iloc[pos] / (lt.shift(5).iloc[pos] + 1e-12) - 1.0),
+                "f_st_over_lt": float(st.iloc[pos] / (lt.iloc[pos] + 1e-12) - 1.0),
+                "f_cnt_above_lt": float(g["count_above_lt_30"].iloc[pos] / 30.0),
+                "f_cnt_above_st": float(g["count_above_st_20"].iloc[pos] / 20.0),
+                "f_close_lt_dev": float(c.iloc[pos] / (lt.iloc[pos] + 1e-12) - 1.0),
+                "f_close_st_dev": float(c.iloc[pos] / (st.iloc[pos] + 1e-12) - 1.0),
+                "f_range_40": float(g["hh40"].iloc[pos] / (g["ll40"].iloc[pos] + 1e-12) - 1.0),
+                "f_bull_bars_20": float(bullish.rolling(20, min_periods=20).sum().iloc[pos]),
+                "f_big_up_cnt_30": float(explosive_bull.rolling(30, min_periods=30).sum().iloc[pos]),
+                "f_recent_high_days": float(recent_high_days.iloc[pos]),
+                "f_attack_quality": float(attack_quality.iloc[pos]),
+                "f_j_value": float(g["j"].iloc[pos]),
+                "f_pullback_from_hh": float(pullback_from_hh.iloc[pos]),
+                "f_days_from_recent_high": float(recent_high_days.iloc[pos]),
+                "f_break_lt_cnt_10": float((c < lt).rolling(10, min_periods=10).sum().iloc[pos]),
+                "f_big_down_cnt_12": float(big_down.rolling(12, min_periods=12).sum().iloc[pos]),
+                "f_dist_down_cnt_12": float(dist_down.rolling(12, min_periods=12).sum().iloc[pos]),
+                "f_low_lt_dev": float(l.iloc[pos] / (lt.iloc[pos] + 1e-12) - 1.0),
+                "f_pullback_range_5": float(h.rolling(5, min_periods=5).max().iloc[pos] / (l.rolling(5, min_periods=5).min().iloc[pos] + 1e-12) - 1.0),
+                "f_down_vol_share_8": float(down_vol_share_8.iloc[pos]),
+                "f_vol_to_ma20": float(v.iloc[pos] / (g["vol_ma20"].iloc[pos] + 1e-12)),
+                "f_vol_rank_10": float(vol_rank_10.iloc[pos]),
+                "f_vol_rank_20": float(vol_rank_20.iloc[pos]),
+                "f_turnover_to_ma20": float(g["amount_proxy"].iloc[pos] / (g["amount_ma20"].iloc[pos] + 1e-12)),
+                "f_shrink_days_5": float((v < g["vol_ma20"] * 0.8).rolling(5, min_periods=5).sum().iloc[pos]),
+                "f_atr_5_to_20": float(atr5.iloc[pos] / (atr20.iloc[pos] + 1e-12)),
+                "f_body_pct": float(g["body_pct"].iloc[pos]),
+                "f_range_pct": float(g["range_pct_prev_close"].iloc[pos]),
+                "f_upper_wick": float(upper_wick.iloc[pos]),
+                "f_lower_wick": float(lower_wick.iloc[pos]),
+            }
+            rows.append(row)
+
+            last_kept_idx = pos
+            resolve_window = g.iloc[pos + 1 : pos + 6]
+            last_kept_resolved = bool(
+                resolve_window["b1_confirm"].fillna(0).astype(int).eq(1).any()
+                or resolve_window["b1_probe_invalid"].fillna(0).astype(int).eq(1).any()
+                or resolve_window["b1_lt_hard_stop_flag"].fillna(0).astype(int).eq(1).any()
+                or resolve_window["b1_st_stop_flag"].fillna(0).astype(int).eq(1).any()
+            )
+
+    if not rows:
+        columns = ["instrument", "datetime", "entry_date", "entry_open", "mfe_10", "mae_5", "confirm_hit", "probe_fail", "label_rank", "label_cls", *B1_RANK_FEATURE_COLUMNS]
+        return pd.DataFrame(columns=columns)
+    dataset = pd.DataFrame(rows)
+    dataset["datetime"] = pd.to_datetime(dataset["datetime"]).dt.normalize()
+    dataset["entry_date"] = pd.to_datetime(dataset["entry_date"]).dt.normalize()
+    dataset = dataset.sort_values(["datetime", "instrument"]).reset_index(drop=True)
+    return dataset
 
 
 def resolve_b1_position_ratio(row: pd.Series | dict[str, object]) -> float:
@@ -87,6 +443,13 @@ def resolve_b1_position_ratio(row: pd.Series | dict[str, object]) -> float:
     - 标准仓：15%
     - 高确信仓：18%
     """
+    model_score = _safe_float(row.get("model_score", np.nan))
+    if pd.notna(model_score):
+        if model_score >= B1_MODEL_SCORE_Q80:
+            return B1_HIGH_CONVICTION_POSITION_RATIO
+        if model_score >= B1_MODEL_SCORE_Q50:
+            return B1_STANDARD_POSITION_RATIO
+        return B1_EXPLORATORY_POSITION_RATIO
     priority_score = float(row.get("priority_score", 0.0) or 0.0)
     quality_score = float(row.get("quality_score", max(priority_score - 60.0, 0.0)) or 0.0)
     b1_confirm = bool(row.get("b1_confirm", 0))
@@ -500,6 +863,12 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
             + 60.0 * g["b1"]
             + 20.0 * g["b1_confirm"]
         ).astype(float)
+        g["rule_priority_score"] = g["priority_score"].astype(float)
+        g["model_score_raw"] = np.nan
+        g["model_score"] = np.nan
+        g["final_score"] = g["priority_score"].astype(float)
+        g["score_source"] = "rule_only"
+        g["b1_rank_active"] = 0
 
         return g
 
@@ -515,7 +884,7 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         "b1_lt_hard_stop_flag", "b1_st_stop_flag", "b1_platform_established", "b1_platform_low",
         "b1", "b2", "b3",
         "entry_flag", "exit_flag", "stop_price",
-        "priority_score", "quality_score", "pattern",
+        "priority_score", "rule_priority_score", "quality_score", "model_score_raw", "model_score", "final_score", "score_source", "b1_rank_active", "pattern",
     ]
     signal = out[cols].copy()
     signal["score"] = signal["priority_score"]  # 兼容 qlib signal 的 score 列

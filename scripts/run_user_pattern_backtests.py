@@ -742,6 +742,16 @@ def _resolve_b1_position_ratio(user_module, row: pd.Series) -> float:
     helper = getattr(user_module, "resolve_b1_position_ratio", None)
     if callable(helper):
         return float(helper(row))
+    try:
+        model_score = float(row.get("model_score", float("nan")))
+    except (TypeError, ValueError):
+        model_score = float("nan")
+    if pd.notna(model_score):
+        if model_score >= 80.0:
+            return 0.18
+        if model_score >= 50.0:
+            return 0.15
+        return 0.12
     priority_score = float(row.get("priority_score", 0.0) or 0.0)
     quality_score = float(row.get("quality_score", max(priority_score - 60.0, 0.0)) or 0.0)
     b1_confirm = bool(row.get("b1_confirm", 0))
@@ -772,6 +782,11 @@ def _plan_b1_new_entries(
     risk_degree: float,
     min_position_ratio: float,
 ) -> list[dict[str, object]]:
+    if candidate_df.empty:
+        return []
+    selector = getattr(user_module, "select_b1_probe_candidates", None)
+    if callable(selector):
+        candidate_df = selector(candidate_df)
     if candidate_df.empty:
         return []
     main_limit = min(int(max_holdings), int(getattr(user_module, "B1_ACTIVE_MAIN_POSITION_LIMIT", 8)))
@@ -1079,6 +1094,7 @@ def simulate_pattern_backtest(
     slippage_rate: float,
     min_position_ratio: float,
     min_swap_score_gap: float,
+    b1_score_file: str | None = None,
     lot_size: int = 100,
 ) -> dict[str, object]:
     from qlib.contrib.evaluate import risk_analysis
@@ -1090,6 +1106,16 @@ def simulate_pattern_backtest(
     ohlcv = _load_local_ohlcv(app_settings, "all", warmup_start, end_time)
     features = user_module.build_indicators(ohlcv)
     signal = user_module.build_pattern_signals(features)
+    score_loader = getattr(user_module, "load_b1_model_scores", None)
+    score_applier = getattr(user_module, "apply_b1_model_scores", None)
+    if callable(score_applier):
+        score_frame = None
+        if b1_score_file:
+            if callable(score_loader):
+                score_frame = score_loader(b1_score_file)
+            else:
+                score_frame = pd.read_parquet(b1_score_file) if str(b1_score_file).lower().endswith(".parquet") else pd.read_csv(b1_score_file)
+        signal = score_applier(signal, score_frame)
 
     signal_frame = signal.reset_index().copy()
     signal_frame["instrument"] = signal_frame["instrument"].astype(str)
@@ -1230,7 +1256,12 @@ def simulate_pattern_backtest(
                 if previous_signal_df.empty or code not in previous_signal_df.index:
                     continue
                 signal_row = previous_signal_df.loc[code]
-                if not bool(signal_row.get("b1_confirm", 0)):
+                confirm_checker = getattr(user_module, "allow_b1_confirm", None)
+                if callable(confirm_checker):
+                    confirm_ok = bool(confirm_checker(signal_row))
+                else:
+                    confirm_ok = bool(signal_row.get("b1_confirm", 0))
+                if not confirm_ok:
                     continue
                 row = execution_df.loc[code] if code in execution_df.index else None
                 raw_buy_price = _resolve_trade_price(row, buy_price_field, float(meta.get("last_close", meta.get("buy_price", 0.0))))
@@ -1781,6 +1812,7 @@ def main() -> None:
     parser.add_argument("--max-holding-days", type=int, default=15)
     parser.add_argument("--min-position-ratio", type=float, default=0.04)
     parser.add_argument("--swap-score-gap", type=float, default=15.0)
+    parser.add_argument("--b1-score-file", default="")
     parser.add_argument("--modes", nargs="+", default=["B1", "B2", "B3"])
     parser.add_argument("--output-dir", default=str(ROOT / "data" / "reports" / "user_pattern_backtests"))
     args = parser.parse_args()
@@ -1815,6 +1847,7 @@ def main() -> None:
             slippage_rate=args.slippage_rate,
             min_position_ratio=args.min_position_ratio,
             min_swap_score_gap=args.swap_score_gap,
+            b1_score_file=args.b1_score_file or None,
         )
         report_df = result["report"].sort_index().copy()
         report_path = output_dir / f"{mode.lower()}_report.csv"

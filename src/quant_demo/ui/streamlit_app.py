@@ -450,19 +450,15 @@ def render_user_pattern_panel() -> None:
     with cfg_col:
         st.markdown('<div class="control">', unsafe_allow_html=True)
         st.selectbox("Pattern Selection", list(USER_PATTERN_OPTIONS.keys()), key="user_pattern_label")
-        left, right = st.columns(2)
-        with left:
-            st.date_input("Start Date", key="user_pattern_start")
-            st.number_input("Initial Capital", min_value=10000, max_value=50000000, step=10000, key="user_pattern_account")
-            st.number_input("Max Holdings", min_value=1, max_value=50, key="user_pattern_max_holdings")
-        with right:
-            st.date_input("End Date", key="user_pattern_end")
-            st.number_input("Risk Degree", min_value=0.1, max_value=1.0, step=0.05, key="user_pattern_risk_degree")
-            st.number_input("Max Holding Days", min_value=1, max_value=60, key="user_pattern_max_holding_days")
-        btn_left, btn_right = st.columns(2)
-        if btn_left.button("Run Selected", use_container_width=True, type="primary"):
+        st.date_input("Start Date", key="user_pattern_start")
+        st.date_input("End Date", key="user_pattern_end")
+        st.number_input("Initial Capital", min_value=10000, max_value=50000000, step=10000, key="user_pattern_account")
+        st.number_input("Risk Degree", min_value=0.1, max_value=1.0, step=0.05, key="user_pattern_risk_degree")
+        st.number_input("Max Holdings", min_value=1, max_value=50, key="user_pattern_max_holdings")
+        st.number_input("Max Holding Days", min_value=1, max_value=60, key="user_pattern_max_holding_days")
+        if st.button("Run Selected", use_container_width=True, type="primary"):
             run_user_pattern_action(False)
-        if btn_right.button("Run All", use_container_width=True):
+        if st.button("Run All", use_container_width=True):
             run_user_pattern_action(True)
         st.caption(f"Report Dir: {artifacts['base_dir']}")
         st.markdown('</div>', unsafe_allow_html=True)
