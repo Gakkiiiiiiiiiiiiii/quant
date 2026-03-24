@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -31,6 +32,7 @@ STRATEGIES = {
     "ETF 轮动": ROOT / "configs" / "strategy" / "etf_rotation.yaml",
     "股票打分": ROOT / "configs" / "strategy" / "stock_ranking.yaml",
     "第一版策略": ROOT / "configs" / "strategy" / "first_alpha_v1.yaml",
+    "聚宽风格": ROOT / "configs" / "strategy" / "joinquant_style.yaml",
 }
 USER_PATTERN_OPTIONS = {
     "形态策略 B1": "B1",
@@ -56,28 +58,33 @@ class DashboardData:
     audit: pd.DataFrame
     rules: pd.DataFrame
     report_text: str
+    benchmark_curve: pd.DataFrame
 
 
 def inject_styles() -> None:
     st.markdown(
         """
         <style>
-        .stApp {background:linear-gradient(180deg,#f5efe4 0%,#eef4f8 52%,#f8fafc 100%);color:#0f172a;}
-        .block-container {max-width:1520px;padding-top:1.2rem;padding-bottom:2rem;}
-        .hero {background:linear-gradient(135deg,#0b1f37,#132949);color:#f8fafc;border-radius:28px;padding:1.2rem 1.4rem;margin-bottom:1rem;box-shadow:0 18px 44px rgba(15,23,42,.14);}
-        .kpi {background:rgba(255,255,255,.86);border:1px solid rgba(148,163,184,.25);border-radius:20px;padding:.9rem 1rem;min-height:110px;}
-        .kpi-label {color:#475569;font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem;}
-        .kpi-value {font-size:1.65rem;font-weight:700;line-height:1.1;margin-bottom:.3rem;}
-        .kpi-foot {color:#64748b;font-size:.84rem;}
-        .panel-title {font-size:1.02rem;font-weight:700;color:#0f172a;margin-bottom:.15rem;}
-        .panel-subtitle {color:#64748b;font-size:.84rem;margin-bottom:.7rem;}
-        .control,.feed,.alert {background:rgba(255,255,255,.82);border:1px solid rgba(148,163,184,.24);border-radius:18px;padding:.95rem;box-shadow:0 8px 22px rgba(15,23,42,.05);}
-        .alert {border-left:6px solid var(--accent);margin-bottom:.65rem;}
-        .light {display:inline-flex;align-items:center;gap:.45rem;padding:.32rem .65rem;border-radius:999px;background:rgba(255,255,255,.82);border:1px solid rgba(148,163,184,.22);}
-        .dot {width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(15,23,42,.05);}
-        .stTabs [data-baseweb="tab-list"] {gap:.5rem;margin-top:.35rem;}
-        .stTabs [data-baseweb="tab"] {background:rgba(255,255,255,.72);border-radius:999px;padding:.4rem .95rem;border:1px solid rgba(148,163,184,.18);}
-        .stTabs [aria-selected="true"] {background:#0f172a;color:#f8fafc;}
+        .stApp {background:#f2f4f7;color:#0f172a;}
+        .block-container {max-width:1680px;padding-top:.4rem;padding-bottom:1.2rem;}
+        .jq-topbar {background:#1f3566;color:#fff;border-radius:0;padding:.85rem 1.1rem;margin:-.4rem -1rem .7rem -1rem;display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;}
+        .jq-brand {font-size:1.8rem;font-weight:800;letter-spacing:.02em;}
+        .jq-nav {display:flex;gap:1.1rem;color:#dbeafe;font-size:.95rem;}
+        .jq-toolbar {background:#fff;border:1px solid #d9dde5;border-radius:4px;padding:.65rem .8rem;margin-bottom:.8rem;display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;}
+        .jq-btn {background:#2e62ad;color:#fff;border-radius:4px;padding:.34rem .72rem;font-size:.88rem;}
+        .jq-side {background:#f8fafc;border:1px solid #d9dde5;border-radius:4px;padding:.65rem;min-height:680px;}
+        .jq-content {background:#fff;border:1px solid #d9dde5;border-radius:4px;padding:.75rem;}
+        .jq-card-grid {display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:.6rem;margin-bottom:.7rem;}
+        .jq-card {background:#fff;border:1px solid #e5e7eb;border-radius:4px;padding:.52rem .6rem;}
+        .jq-card-label {color:#64748b;font-size:.78rem;}
+        .jq-card-value {font-size:1.6rem;font-weight:700;margin-top:.2rem;}
+        .jq-section-title {font-size:1.45rem;font-weight:800;margin:.2rem 0 .55rem 0;}
+        .panel-title {font-size:1rem;font-weight:700;color:#0f172a;margin-bottom:.2rem;}
+        .panel-subtitle {color:#64748b;font-size:.84rem;margin-bottom:.55rem;}
+        .control,.feed,.alert {background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:.85rem;}
+        .alert {border-left:5px solid var(--accent);margin-bottom:.55rem;}
+        .light {display:inline-flex;align-items:center;gap:.45rem;padding:.25rem .55rem;border-radius:999px;background:#fff;border:1px solid #cbd5e1;}
+        .dot {width:9px;height:9px;border-radius:50%;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -150,7 +157,16 @@ def load_dashboard_data(database_url: str, report_dir: str) -> DashboardData:
         audit = _sql(conn, "select audit_log_id,object_type,object_id,message,payload,created_at from audit_logs order by created_at desc", ["created_at"])
     report_file = _report_path(report_dir)
     report_text = _decode(report_file.read_bytes()) if report_file.exists() else "暂无日终报告。"
-    return DashboardData(assets, positions, orders, trades, risk, audit, _expand_rules(risk), report_text)
+    benchmark_curve = pd.DataFrame()
+    curve_file = (ROOT / report_dir if not Path(report_dir).is_absolute() else Path(report_dir)) / "qlib_curve.csv"
+    if curve_file.exists():
+        try:
+            benchmark_curve = pd.read_csv(curve_file)
+            if "trading_date" in benchmark_curve.columns:
+                benchmark_curve["trading_date"] = pd.to_datetime(benchmark_curve["trading_date"], errors="coerce")
+        except Exception:
+            benchmark_curve = pd.DataFrame()
+    return DashboardData(assets, positions, orders, trades, risk, audit, _expand_rules(risk), report_text, benchmark_curve)
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -587,11 +603,33 @@ def render_status(settings: AppSettings, info: dict[str, Any], data: DashboardDa
 
 
 def render_equity(data: DashboardData) -> None:
-    st.markdown('<div class="panel-title">账户曲线</div><div class="panel-subtitle">总资产、现金的时间序列。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="panel-title">账户曲线</div><div class="panel-subtitle">策略净值与 Benchmark 同图对比。</div>', unsafe_allow_html=True)
     if data.assets.empty:
         st.info("当前数据库没有资产快照。")
         return
-    st.area_chart(data.assets.copy().set_index("snapshot_time")[["total_asset", "cash"]], height=320)
+    assets = data.assets.copy().sort_values("snapshot_time")
+    frame = pd.DataFrame({"trading_date": pd.to_datetime(assets["snapshot_time"], errors="coerce"), "strategy_equity": assets["total_asset"].astype(float)})
+    benchmark = data.benchmark_curve.copy()
+    if not benchmark.empty and {"trading_date", "benchmark_equity"}.issubset(set(benchmark.columns)):
+        benchmark = benchmark[["trading_date", "benchmark_equity"]].dropna()
+        benchmark["trading_date"] = pd.to_datetime(benchmark["trading_date"], errors="coerce")
+        frame = frame.merge(benchmark, on="trading_date", how="left")
+    melted = frame.melt(id_vars="trading_date", value_vars=[col for col in ["strategy_equity", "benchmark_equity"] if col in frame.columns], var_name="series", value_name="equity")
+    if melted.empty:
+        st.area_chart(assets.set_index("snapshot_time")[["total_asset", "cash"]], height=320)
+        return
+    label_map = {"strategy_equity": "策略曲线", "benchmark_equity": "Benchmark"}
+    melted["series"] = melted["series"].map(lambda item: label_map.get(item, item))
+    chart = px.line(melted.dropna(), x="trading_date", y="equity", color="series", template="plotly_white")
+    chart.update_layout(height=360, margin=dict(l=16, r=16, t=12, b=16), legend_title_text="曲线")
+    st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False})
+
+
+def render_refresh_controls() -> tuple[bool, int]:
+    st.sidebar.markdown("### 刷新设置")
+    enabled = st.sidebar.checkbox("开启准实时刷新", value=st.session_state.get("auto_refresh_enabled", False), key="auto_refresh_enabled")
+    interval = int(st.sidebar.number_input("刷新间隔(秒)", min_value=3, max_value=120, value=int(st.session_state.get("auto_refresh_interval", 15)), step=1, key="auto_refresh_interval"))
+    return enabled, interval
 
 
 def render_positions(data: DashboardData) -> None:
@@ -727,11 +765,87 @@ def render_tabs(data: DashboardData) -> None:
         st.markdown(data.report_text)
 
 
+def render_joinquant_topbar(settings: AppSettings, info: dict[str, Any]) -> None:
+    latest = info["latest_time"].strftime("%Y-%m-%d %H:%M") if info["latest_time"] is not None and not pd.isna(info["latest_time"]) else "暂无快照"
+    st.markdown(
+        f"""
+        <div class="jq-topbar">
+          <div style="display:flex;align-items:center;gap:1.1rem;">
+            <div class="jq-brand">JoinQuant 风格回测台</div>
+            <div class="jq-nav"><span>首页</span><span>量化研究</span><span>回测详情</span><span>实盘模拟</span></div>
+          </div>
+          <div style="font-size:.9rem;color:#dbeafe;">模式: {settings.environment.value} · 最新快照: {latest}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <div class="jq-toolbar">
+          <div>设置：回测资金展示按数据库快照自动读取，当前总资产 <b>{fmt_money(info["total_asset"])}</b>，状态：<b>回测完成</b></div>
+          <div style="display:flex;gap:.45rem;align-items:center;">
+            <span class="jq-btn">模拟交易</span>
+            <span class="jq-btn">归因分析</span>
+            <span class="jq-btn">导出</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_joinquant_overview(data: DashboardData, info: dict[str, Any]) -> None:
+    st.markdown('<div class="jq-content"><div class="jq-section-title">收益概述</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="jq-card-grid">
+          <div class="jq-card"><div class="jq-card-label">策略收益</div><div class="jq-card-value">{fmt_ratio(info["total_return"])}</div></div>
+          <div class="jq-card"><div class="jq-card-label">最大回撤</div><div class="jq-card-value">{fmt_ratio(info["drawdown"])}</div></div>
+          <div class="jq-card"><div class="jq-card-label">累计换手</div><div class="jq-card-value">{fmt_money(info["turnover"])}</div></div>
+          <div class="jq-card"><div class="jq-card-label">订单数</div><div class="jq-card-value">{info["order_count"]}</div></div>
+          <div class="jq-card"><div class="jq-card-label">成交数</div><div class="jq-card-value">{info["trade_count"]}</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_equity(data)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_joinquant_trade_detail(data: DashboardData) -> None:
+    st.markdown('<div class="jq-content"><div class="jq-section-title">交易详情</div>', unsafe_allow_html=True)
+    render_tabs(data)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_joinquant_daily_pnl(data: DashboardData) -> None:
+    st.markdown('<div class="jq-content"><div class="jq-section-title">每日持仓&收益</div>', unsafe_allow_html=True)
+    if data.assets.empty:
+        st.info("暂无资产快照。")
+    else:
+        frame = data.assets.copy().sort_values("snapshot_time")
+        frame["snapshot_time"] = frame["snapshot_time"].dt.strftime("%Y-%m-%d")
+        show_cols = [col for col in ["snapshot_time", "total_asset", "cash", "total_pnl", "turnover", "max_drawdown"] if col in frame.columns]
+        st.dataframe(frame[show_cols], use_container_width=True, hide_index=True, height=380)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_joinquant_perf(settings: AppSettings, info: dict[str, Any], data: DashboardData, probe: dict[str, Any] | None, alerts_items: list[dict[str, str]]) -> None:
+    st.markdown('<div class="jq-content"><div class="jq-section-title">性能分析</div>', unsafe_allow_html=True)
+    left, right = st.columns([1.2, 0.8])
+    with left:
+        render_status(settings, info, data, probe)
+    with right:
+        render_alerts(alerts_items)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def main(default_config_path: str | None = None) -> None:
-    st.set_page_config(page_title="Quant Control Room", layout="wide")
+    st.set_page_config(page_title="JoinQuant 风格量化平台", layout="wide")
     inject_styles()
     default_profile = next((name for name, path in CONFIGS.items() if default_config_path and Path(default_config_path).resolve() == path.resolve()), "????")
     profile, settings, config_path = render_sidebar(default_profile)
+    auto_refresh_enabled, auto_refresh_interval = render_refresh_controls()
     data = load_dashboard_data(settings.database_url, settings.report_dir)
     probe = None
     if settings.environment == Environment.LIVE:
@@ -741,35 +855,49 @@ def main(default_config_path: str | None = None) -> None:
             st.sidebar.warning(f"QMT ????: {exc}")
     info = overview(data)
     alert_items = alerts(settings, info, data, probe)
-    render_hero(settings, profile, info, probe)
-    render_kpis(info)
+    if settings.environment == Environment.BACKTEST:
+        render_joinquant_topbar(settings, info)
+    else:
+        render_hero(settings, profile, info, probe)
+        render_kpis(info)
 
     if settings.environment == Environment.BACKTEST:
-        tab_overview, tab_qlib, tab_pattern, tab_ops = st.tabs(["Overview", "Qlib Market", "Pattern Lab", "Ops"])
-        with tab_overview:
-            left, right = st.columns([1.35, 1])
-            with left:
-                render_equity(data)
-            with right:
-                render_status(settings, info, data, probe)
-            render_pattern_overview()
-            lower_left, lower_right = st.columns([1.15, 0.85])
-            with lower_left:
-                render_positions(data)
-            with lower_right:
-                render_alerts(alert_items)
-                render_market(settings, probe)
-        with tab_qlib:
-            upper_left, upper_right = st.columns([1.05, 0.95])
-            with upper_left:
+        layout_left, layout_right = st.columns([0.18, 1])
+        with layout_left:
+            st.markdown('<div class="jq-side">', unsafe_allow_html=True)
+            section = st.radio(
+                "回测导航",
+                ["收益概述", "交易详情", "每日持仓&收益", "日志输出", "性能分析", "策略代码", "Qlib 全市场", "形态实验室"],
+                label_visibility="collapsed",
+            )
+            st.markdown("---")
+            st.caption("可在这里切换与聚宽类似的回测详情视图。")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with layout_right:
+            if section == "收益概述":
+                render_joinquant_overview(data, info)
+            elif section == "交易详情":
+                render_joinquant_trade_detail(data)
+            elif section == "每日持仓&收益":
+                render_joinquant_daily_pnl(data)
+            elif section == "日志输出":
+                st.markdown('<div class="jq-content"><div class="jq-section-title">日志输出</div>', unsafe_allow_html=True)
+                render_logs()
+                st.markdown("</div>", unsafe_allow_html=True)
+            elif section == "性能分析":
+                render_joinquant_perf(settings, info, data, probe, alert_items)
+            elif section == "策略代码":
+                st.markdown('<div class="jq-content"><div class="jq-section-title">策略代码与运行</div>', unsafe_allow_html=True)
                 render_controls(settings)
-            with upper_right:
+                st.markdown("</div>", unsafe_allow_html=True)
+            elif section == "Qlib 全市场":
+                st.markdown('<div class="jq-content"><div class="jq-section-title">Qlib 全市场回测</div>', unsafe_allow_html=True)
                 render_qlib_panel()
-        with tab_pattern:
-            render_user_pattern_panel()
-        with tab_ops:
-            render_logs()
-            render_tabs(data)
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="jq-content"><div class="jq-section-title">形态实验室</div>', unsafe_allow_html=True)
+                render_user_pattern_panel()
+                st.markdown("</div>", unsafe_allow_html=True)
     else:
         tab_overview, tab_ops = st.tabs(["Overview", "Ops"])
         with tab_overview:
@@ -785,6 +913,10 @@ def main(default_config_path: str | None = None) -> None:
         with tab_ops:
             render_logs()
             render_tabs(data)
+    if auto_refresh_enabled:
+        st.caption(f"准实时刷新已开启：每 {auto_refresh_interval} 秒自动轮询最新快照和报告。")
+        time.sleep(auto_refresh_interval)
+        st.rerun()
 
 
 if __name__ == "__main__":
