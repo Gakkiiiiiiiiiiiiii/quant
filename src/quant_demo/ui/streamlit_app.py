@@ -441,57 +441,22 @@ def run_user_pattern_action(run_all: bool) -> None:
 
 
 def render_user_pattern_panel() -> None:
-    ensure_user_pattern_state()
     artifacts = load_user_pattern_results(str(USER_PATTERN_REPORT_DIR))
     summary = artifacts["summary"]
-    comparison = artifacts["comparison"]
     st.markdown('<div class="panel-title">Pattern Research</div><div class="panel-subtitle">Run B1, B2, B3 individually or compare all three equity curves.</div>', unsafe_allow_html=True)
-    cfg_col, chart_col = st.columns([0.9, 1.1])
-    with cfg_col:
-        st.markdown('<div class="control">', unsafe_allow_html=True)
-        st.selectbox("Pattern Selection", list(USER_PATTERN_OPTIONS.keys()), key="user_pattern_label")
-        st.date_input("Start Date", key="user_pattern_start")
-        st.date_input("End Date", key="user_pattern_end")
-        st.number_input("Initial Capital", min_value=10000, max_value=50000000, step=10000, key="user_pattern_account")
-        st.number_input("Risk Degree", min_value=0.1, max_value=1.0, step=0.05, key="user_pattern_risk_degree")
-        st.number_input("Max Holdings", min_value=1, max_value=50, key="user_pattern_max_holdings")
-        st.number_input("Max Holding Days", min_value=1, max_value=60, key="user_pattern_max_holding_days")
-        if st.button("Run Selected", use_container_width=True, type="primary"):
-            run_user_pattern_action(False)
-        if st.button("Run All", use_container_width=True):
-            run_user_pattern_action(True)
-        st.caption(f"Report Dir: {artifacts['base_dir']}")
-        st.markdown('</div>', unsafe_allow_html=True)
-        if not summary.empty:
-            selected_mode = USER_PATTERN_OPTIONS[st.session_state["user_pattern_label"]]
-            focus = summary if selected_mode == "ALL" else summary[summary["mode"] == selected_mode]
-            if not focus.empty:
-                item = focus.iloc[0]
-                metric_cols = st.columns(3)
-                metric_cols[0].metric("Total Return", fmt_ratio(item.get("total_return")))
-                metric_cols[1].metric("Annualized", fmt_ratio(item.get("annualized_return")))
-                metric_cols[2].metric("Max Drawdown", fmt_ratio(item.get("max_drawdown")))
-            st.dataframe(summary[["mode", "total_return", "annualized_return", "max_drawdown", "ending_equity", "trading_days"]], use_container_width=True, hide_index=True)
-        result = st.session_state.get("last_user_pattern_result")
-        if result:
-            with st.expander("Pattern Task Output", expanded=not result.get("ok")):
-                st.code(result.get("command", ""), language="bash")
-                st.text(result.get("stdout") or result.get("stderr") or "No output")
-    with chart_col:
-        st.markdown('<div class="control">', unsafe_allow_html=True)
-        st.markdown('<div class="panel-title">Equity Comparison</div><div class="panel-subtitle">Compare B1, B2, B3 and benchmark equity curves.</div>', unsafe_allow_html=True)
-        if comparison.empty:
-            st.info("No pattern equity curve yet. Run a pattern backtest first.")
-        else:
-            selected_mode = USER_PATTERN_OPTIONS[st.session_state["user_pattern_label"]]
-            view = comparison if selected_mode == "ALL" else comparison[comparison["series"].isin([selected_mode, "Benchmark"])]
-            chart = px.line(view, x="datetime", y="equity", color="series", template="plotly_white")
-            chart.update_layout(height=440, margin=dict(l=16, r=16, t=12, b=16), legend_title_text="Series")
-            st.plotly_chart(chart, use_container_width=True)
-            png_path = Path(artifacts["png_path"])
-            if png_path.exists():
-                st.caption(f"Static Image: {png_path}")
-        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="control">', unsafe_allow_html=True)
+    st.caption(f"Report Dir: {artifacts['base_dir']}")
+    if summary.empty:
+        st.info("No pattern backtest result found yet.")
+    else:
+        st.code(summary.to_csv(index=False), language="text")
+    png_path = Path(artifacts["png_path"])
+    if png_path.exists():
+        st.image(str(png_path), caption="Latest equity comparison")
+    html_path = Path(artifacts["html_path"])
+    if html_path.exists():
+        st.caption(f"Interactive HTML: {html_path}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def render_pattern_overview() -> None:
@@ -858,42 +823,39 @@ def main(default_config_path: str | None = None) -> None:
         render_kpis(info)
 
     if settings.environment == Environment.BACKTEST:
-        layout_left, layout_right = st.columns([0.18, 1])
-        with layout_left:
-            st.markdown('<div class="jq-side">', unsafe_allow_html=True)
-            section = st.radio(
-                "回测导航",
-                ["收益概述", "交易详情", "每日持仓&收益", "日志输出", "性能分析", "策略代码", "Qlib 全市场", "形态实验室"],
-                label_visibility="collapsed",
-            )
-            st.markdown("---")
-            st.caption("可在这里切换与聚宽类似的回测详情视图。")
+        st.markdown('<div class="jq-side">', unsafe_allow_html=True)
+        section = st.radio(
+            "回测导航",
+            ["收益概述", "交易详情", "每日持仓&收益", "日志输出", "性能分析", "策略代码", "Qlib 全市场", "形态实验室"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        st.caption("可在这里切换与聚宽类似的回测详情视图。")
+        st.markdown("</div>", unsafe_allow_html=True)
+        if section == "收益概述":
+            render_joinquant_overview(data, info)
+        elif section == "交易详情":
+            render_joinquant_trade_detail(data)
+        elif section == "每日持仓&收益":
+            render_joinquant_daily_pnl(data)
+        elif section == "日志输出":
+            st.markdown('<div class="jq-content"><div class="jq-section-title">日志输出</div>', unsafe_allow_html=True)
+            render_logs()
             st.markdown("</div>", unsafe_allow_html=True)
-        with layout_right:
-            if section == "收益概述":
-                render_joinquant_overview(data, info)
-            elif section == "交易详情":
-                render_joinquant_trade_detail(data)
-            elif section == "每日持仓&收益":
-                render_joinquant_daily_pnl(data)
-            elif section == "日志输出":
-                st.markdown('<div class="jq-content"><div class="jq-section-title">日志输出</div>', unsafe_allow_html=True)
-                render_logs()
-                st.markdown("</div>", unsafe_allow_html=True)
-            elif section == "性能分析":
-                render_joinquant_perf(settings, info, data, probe, alert_items)
-            elif section == "策略代码":
-                st.markdown('<div class="jq-content"><div class="jq-section-title">策略代码与运行</div>', unsafe_allow_html=True)
-                render_controls(settings)
-                st.markdown("</div>", unsafe_allow_html=True)
-            elif section == "Qlib 全市场":
-                st.markdown('<div class="jq-content"><div class="jq-section-title">Qlib 全市场回测</div>', unsafe_allow_html=True)
-                render_qlib_panel()
-                st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="jq-content"><div class="jq-section-title">形态实验室</div>', unsafe_allow_html=True)
-                render_user_pattern_panel()
-                st.markdown("</div>", unsafe_allow_html=True)
+        elif section == "性能分析":
+            render_joinquant_perf(settings, info, data, probe, alert_items)
+        elif section == "策略代码":
+            st.markdown('<div class="jq-content"><div class="jq-section-title">策略代码与运行</div>', unsafe_allow_html=True)
+            render_controls(settings)
+            st.markdown("</div>", unsafe_allow_html=True)
+        elif section == "Qlib 全市场":
+            st.markdown('<div class="jq-content"><div class="jq-section-title">Qlib 全市场回测</div>', unsafe_allow_html=True)
+            render_qlib_panel()
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="jq-content"><div class="jq-section-title">形态实验室</div>', unsafe_allow_html=True)
+            render_user_pattern_panel()
+            st.markdown("</div>", unsafe_allow_html=True)
     else:
         tab_overview, tab_ops = st.tabs(["Overview", "Ops"])
         with tab_overview:

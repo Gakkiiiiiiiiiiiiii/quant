@@ -8,7 +8,6 @@ from _bootstrap import ROOT, SRC
 sys.path.insert(0, str(SRC))
 
 from quant_demo.api.app import serve
-from quant_demo.core.config import load_app_settings
 
 
 def run() -> None:
@@ -18,8 +17,7 @@ def run() -> None:
     parser.add_argument("--port", type=int, default=8011)
     args = parser.parse_args()
 
-    app_settings = load_app_settings(args.config)
-    serve(host=args.host, port=args.port, database_url=app_settings.database_url)
+    serve(host=args.host, port=args.port, config_path=args.config, frontend_dist=None)
 
 
 if __name__ == "__main__":

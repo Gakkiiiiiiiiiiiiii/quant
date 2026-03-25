@@ -1,4 +1,4 @@
-﻿# QMT 事件驱动量化交易 Demo
+# QMT 事件驱动量化交易 Demo
 
 日期：2026-03-21  
 执行者：Codex
@@ -29,6 +29,12 @@
 .\.venv\Scripts\python.exe -m pytest
 ```
 
+## Vue 前端
+
+- 新前端位于 `frontend/joinquant-vue/`，使用 `Vue 3 + Vite`，整体信息架构与视觉语言对齐聚宽量化平台。
+- `scripts/run_api.py` 可单独启动 API；`scripts/run_dashboard.py` 会在 `8501` 端口直接托管打包后的 Vue 页面和 `/api` 接口。
+- 开发模式下可进入 `frontend/joinquant-vue/` 后执行 `D:\nodejs\npm.cmd run dev`，默认把 `/api` 代理到 `127.0.0.1:8011`。
+- 生产静态产物输出到 `frontend/joinquant-vue/dist/`，由 Python 本地服务直接托管。
 ## 默认实现说明
 
 - 数据库默认使用 `SQLite` 文件库，方便本地 Demo 直接运行；设计文档要求的 PostgreSQL DDL 已同步到 `sql/schema.sql`。

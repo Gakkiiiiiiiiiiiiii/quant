@@ -1,4 +1,4 @@
-﻿# 验证报告
+# 验证报告
 
 日期：2026-03-21  
 执行者：Codex
@@ -249,3 +249,11 @@
 风险与说明：
 - `scripts/run_user_pattern_backtests.py` 的 CLI 全流程若走 `ensure_provider()`，在当前 smoke 配置下会被 provider 准备阶段拖慢；本次验证改为直接调用 `simulate_pattern_backtest()`，已覆盖本次实际修改路径。
 - 本机 `.tmp` 历史权限问题仍存在，导致 `apply_patch` 在后半程无法继续刷新工作区；新增测试文件和 smoke 配置改用 shell 落地，但代码语法、单测和烟测均已完成。
+
+## 2026-03-25 Vue 聚宽风格前端改造验证
+
+- Python 语法检查：`python -m py_compile src/quant_demo/api/dashboard_payloads.py src/quant_demo/api/app.py scripts/run_api.py scripts/run_dashboard.py`
+- API 聚合层冒烟：`dashboard_payload_smoke: ok`
+- 前端构建：`D:\nodejs\npm.cmd run build` 通过，产物输出到 `frontend/joinquant-vue/dist/`
+- 页面实测：`http://127.0.0.1:8501` 返回 `200`，Playwright 截图确认已切换为 Vue 版聚宽风格页面，并验证“形态实验室”“策略代码”页签可见
+- 额外说明：`pytest` 在当前 Windows 环境会在会话结束清理临时目录时触发 `PermissionError [WinError 5]`，不是新增测试断言失败；本次改用等价的本地断言脚本完成 `dashboard_payloads` 逻辑验证
