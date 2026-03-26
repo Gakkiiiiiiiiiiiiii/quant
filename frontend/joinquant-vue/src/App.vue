@@ -68,6 +68,12 @@ const actionState = reactive({
   strategy: null,
   qlib: null,
   pattern: null,
+  b1Score: null,
+})
+
+const b1ScoreForm = reactive({
+  symbol: '000001.SZ',
+  date: '2026-03-24',
 })
 
 function formatMoney(value) {
@@ -196,6 +202,33 @@ async function runPattern(runAll) {
   }
 }
 
+async function queryB1Score() {
+  actionState.busy = 'b1-score'
+  try {
+    const response = await apiGet('/api/pattern/b1-score', {
+      symbol: b1ScoreForm.symbol,
+      date: b1ScoreForm.date,
+    })
+    actionState.b1Score = response.result
+  } catch (error) {
+    actionState.b1Score = { error: error.message }
+  } finally {
+    actionState.busy = ''
+  }
+}
+
+async function deleteBacktestResult(backtestResultId) {
+  actionState.busy = 'pattern-delete'
+  try {
+    await apiPost('/api/actions/pattern/delete', { backtest_result_id: backtestResultId })
+    await fetchBootstrap({ preserveForms: true })
+  } catch (error) {
+    actionState.pattern = { ok: false, stderr: error.message }
+  } finally {
+    actionState.busy = ''
+  }
+}
+
 const settings = computed(() => state.payload?.settings || {})
 const overview = computed(() => state.payload?.overview || {})
 const connection = computed(() => state.payload?.connection || {})
@@ -217,6 +250,20 @@ const assets = computed(() => dashboardData.value.assets || [])
 const benchmarkCurve = computed(() => dashboardData.value.benchmark_curve || [])
 const patternSummary = computed(() => pattern.value.summary || [])
 const patternComparison = computed(() => pattern.value.comparison || [])
+const strategyRegistry = computed(() => pattern.value.strategy_registry || [])
+const b1ScoreSeries = computed(() => {
+  const series = actionState.b1Score?.series || []
+  if (!series.length) {
+    return []
+  }
+  return [
+    {
+      name: 'B1评分',
+      color: '#2563eb',
+      points: series.map((item) => ({ label: item.date, value: Number(item.score || 0) })),
+    },
+  ]
+})
 const patternImageUrl = computed(() => {
   if (!pattern.value.png_url) {
     return ''
@@ -233,6 +280,17 @@ const overviewMetrics = computed(() => [
   { label: '成交数', value: String(overview.value.trade_count ?? 0) },
 ])
 
+function toReturnSeries(points, valueKey) {
+  const normalized = points
+    .filter((item) => item[valueKey] !== null && item[valueKey] !== undefined)
+    .map((item) => ({ label: formatDatetime(item.snapshot_time || item.datetime).slice(0, 10), value: Number(item[valueKey]) }))
+  if (!normalized.length) {
+    return []
+  }
+  const base = normalized[0].value
+  return normalized.map((item) => ({ label: item.label, value: base ? (item.value / base) - 1 : 0 }))
+}
+
 const performanceMetrics = computed(() => [
   { label: '总资产', value: formatMoney(overview.value.total_asset) },
   { label: '现金', value: formatMoney(overview.value.cash) },
@@ -241,22 +299,23 @@ const performanceMetrics = computed(() => [
 ])
 
 const equitySeries = computed(() => {
+  const strategyPoints = toReturnSeries(
+    assets.value.map((item) => ({ ...item, value: item.total_asset ?? item.account })),
+    'value',
+  )
+  const benchmarkPoints = toReturnSeries(
+    benchmarkCurve.value.map((item) => ({ ...item, value: item.benchmark_equity })),
+    'value',
+  )
   const strategySeries = {
-    name: primaryMode.value || '策略曲线',
+    name: `${primaryMode.value || '策略'}收益`,
     color: '#2e62ad',
-    points: assets.value
-      .filter((item) => (item.total_asset ?? item.account) !== null && (item.total_asset ?? item.account) !== undefined)
-      .map((item) => ({
-        label: formatDatetime(item.snapshot_time || item.datetime).slice(0, 10),
-        value: Number(item.total_asset ?? item.account),
-      })),
+    points: strategyPoints,
   }
   const benchmarkSeries = {
-    name: 'Benchmark',
+    name: 'Benchmark收益',
     color: '#f59e0b',
-    points: benchmarkCurve.value
-      .filter((item) => item.benchmark_equity !== null && item.benchmark_equity !== undefined)
-      .map((item) => ({ label: formatDatetime(item.trading_date || item.datetime).slice(0, 10), value: Number(item.benchmark_equity) })),
+    points: benchmarkPoints,
   }
   return [strategySeries, benchmarkSeries].filter((item) => item.points.length > 0)
 })
@@ -276,7 +335,14 @@ const patternSeries = computed(() => {
     }
     groups.get(key).push({ label: formatDatetime(item.datetime).slice(0, 10), value: item.equity })
   })
-  return Array.from(groups.entries()).map(([name, points]) => ({ name, color: palette[name] || '#334155', points }))
+  return Array.from(groups.entries()).map(([name, points]) => {
+    if (!points.length) {
+      return { name, color: palette[name] || '#334155', points: [] }
+    }
+    const base = Number(points[0].value) || 1
+    const returns = points.map((item) => ({ label: item.label, value: (Number(item.value) / base) - 1 }))
+    return { name: `${name}收益`, color: palette[name] || '#334155', points: returns }
+  })
 })
 
 const tradeRows = computed(() => {
@@ -406,7 +472,7 @@ onMounted(() => {
               </div>
             </div>
             <MetricStrip :items="overviewMetrics" />
-            <LineChart :series="equitySeries" :height="360" />
+            <LineChart :series="equitySeries" :height="360" :as-percent="true" />
           </div>
           <div class="panel-card">
             <div class="panel-card__header">
@@ -415,7 +481,7 @@ onMounted(() => {
                 <p>{{ primaryMode }} 与 Benchmark 的最新对比。</p>
               </div>
             </div>
-            <LineChart :series="patternSeries" :height="300" />
+            <LineChart :series="patternSeries" :height="300" :as-percent="true" />
             <DataTable :rows="patternSummary" :max-height="260" empty-text="暂无形态策略回测结果" />
           </div>
         </template>
@@ -608,7 +674,37 @@ onMounted(() => {
               <button class="btn btn--primary" :disabled="actionState.busy === 'pattern'" @click="runPattern(false)">运行当前策略</button>
               <button class="btn" :disabled="actionState.busy === 'pattern'" @click="runPattern(true)">运行三策略对比</button>
             </div>
+            <div class="form-grid form-grid--pattern">
+              <label><span>B1 股票代码</span><input v-model="b1ScoreForm.symbol" type="text" /></label>
+              <label><span>B1 评分日期</span><input v-model="b1ScoreForm.date" type="date" /></label>
+              <div class="action-row">
+                <button class="btn" :disabled="actionState.busy === 'b1-score'" @click="queryB1Score">查询 B1 图形评分</button>
+              </div>
+            </div>
+            <div v-if="actionState.b1Score" class="markdown-report">
+              <h3>B1 评分结果</h3>
+              <p>
+                代码 {{ actionState.b1Score.symbol || '--' }}，
+                查询日 {{ actionState.b1Score.target_date || '--' }}，
+                生效日 {{ actionState.b1Score.resolved_date || '--' }}，
+                评分 {{ actionState.b1Score.score ?? '--' }}，
+                分位 {{ actionState.b1Score.percentile ? `${Number(actionState.b1Score.percentile).toFixed(2)}%` : '--' }}。
+              </p>
+              <LineChart :series="b1ScoreSeries" :height="240" />
+            </div>
             <DataTable :rows="patternSummary" :max-height="260" empty-text="暂无形态策略结果" />
+            <DataTable :rows="strategyRegistry" :max-height="220" empty-text="暂无常用策略记录" />
+            <div v-if="strategyRegistry.length > 0" class="action-row action-row--wrap">
+              <button
+                v-for="item in (strategyRegistry[0]?.results || [])"
+                :key="item.backtest_result_id"
+                class="btn"
+                :disabled="actionState.busy === 'pattern-delete'"
+                @click="deleteBacktestResult(item.backtest_result_id)"
+              >
+                删除 {{ item.mode }} / {{ item.end_date }}
+              </button>
+            </div>
             <img v-if="patternImageUrl" class="pattern-image" :src="patternImageUrl" alt="形态策略权益对比图" />
             <pre v-if="actionState.pattern" class="task-output">{{ JSON.stringify(actionState.pattern, null, 2) }}</pre>
           </div>
