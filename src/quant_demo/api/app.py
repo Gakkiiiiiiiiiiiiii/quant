@@ -6,7 +6,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from quant_demo.api.dashboard_payloads import ROOT, build_dashboard_payload, load_runtime_logs, run_pattern_action, run_qlib_action, run_strategy_action
+from quant_demo.api.dashboard_payloads import (
+    ROOT,
+    build_b1_score_card,
+    build_dashboard_payload,
+    delete_backtest_result,
+    load_runtime_logs,
+    resolve_settings,
+    run_pattern_action,
+    run_qlib_action,
+    run_strategy_action,
+)
 
 
 class DemoApiHandler(BaseHTTPRequestHandler):
@@ -102,6 +112,14 @@ class DemoApiHandler(BaseHTTPRequestHandler):
                 return
             self._send_file(target)
             return
+        if parsed.path == "/api/pattern/b1-score":
+            symbol = query.get("symbol", [""])[0].strip()
+            target_date = query.get("date", [""])[0].strip()
+            if not symbol or not target_date:
+                self._json({"error": "symbol_and_date_required"}, status=400)
+                return
+            self._json({"result": build_b1_score_card(symbol, target_date)})
+            return
         self._serve_static(parsed.path)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -116,6 +134,11 @@ class DemoApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/actions/pattern":
                 self._json({"result": run_pattern_action(payload)})
+                return
+            if parsed.path == "/api/actions/pattern/delete":
+                _, _, settings = resolve_settings("backtest")
+                result = delete_backtest_result(settings.database_url, str(payload.get("backtest_result_id", "")))
+                self._json({"result": {"deleted": result}})
                 return
         except Exception as exc:
             self._json({"error": str(exc)}, status=500)

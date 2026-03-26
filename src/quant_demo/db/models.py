@@ -155,3 +155,41 @@ class AuditLogModel(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class CommonStrategyModel(Base):
+    __tablename__ = "common_strategies"
+    __table_args__ = (UniqueConstraint("strategy_key"),)
+
+    strategy_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    strategy_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_active: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    backtest_results: Mapped[list["StrategyBacktestResultModel"]] = relationship(back_populates="strategy")
+
+
+class StrategyBacktestResultModel(Base):
+    __tablename__ = "strategy_backtest_results"
+
+    backtest_result_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    strategy_id: Mapped[str] = mapped_column(ForeignKey("common_strategies.strategy_id"), nullable=False)
+    run_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    start_date: Mapped[str] = mapped_column(String(16), nullable=False)
+    end_date: Mapped[str] = mapped_column(String(16), nullable=False)
+    account: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=0)
+    total_return: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    annualized_return: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    max_drawdown: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    ending_equity: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    report_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    daily_action_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    daily_decision_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    strategy: Mapped[CommonStrategyModel] = relationship(back_populates="backtest_results")

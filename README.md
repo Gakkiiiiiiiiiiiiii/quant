@@ -37,7 +37,7 @@
 - 生产静态产物输出到 `frontend/joinquant-vue/dist/`，由 Python 本地服务直接托管。
 ## 默认实现说明
 
-- 数据库默认使用 `SQLite` 文件库，方便本地 Demo 直接运行；设计文档要求的 PostgreSQL DDL 已同步到 `sql/schema.sql`。
+- 数据库默认使用 `PostgreSQL`（见 `configs/*.yaml` 的 `database_url`），并在 `sql/schema.sql` 提供完整初始化 DDL。
 - 历史数据默认落到 `data/parquet/history.parquet`。若本机未安装 QMT/xtquant，则自动生成示例 ETF 数据，保障回测链路可运行。
 - QMT 实盘接入通过动态导入 `xtdata` / `xttrader`。如果 QMT 客户端尚未安装，系统仍可执行回测和仿真盘流程。
 - `api/app.py` 提供基于标准库 `http.server` 的演示接口，避免无网环境下额外安装 FastAPI；`ui/streamlit_app.py` 保持 Streamlit 展示入口。
