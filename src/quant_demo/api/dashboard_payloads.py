@@ -6,17 +6,20 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import yaml
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, delete, select
 
 from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient
 from quant_demo.core.config import AppSettings, load_app_settings
 from quant_demo.core.enums import Environment
 from quant_demo.core.exceptions import QmtUnavailableError
+from quant_demo.db.models import CommonStrategyModel, StrategyBacktestResultModel
+from quant_demo.db.session import create_session_factory, session_scope
 from quant_demo.marketdata.history_manager import history_status
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -161,6 +164,13 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    number = _safe_float(value)
+    if number is None:
+        return None
+    return Decimal(str(number))
 
 
 def resolve_profile_path(profile: str) -> Path:
@@ -350,6 +360,170 @@ def build_pattern_defaults() -> dict[str, Any]:
         "max_holdings": 10,
         "risk_degree": 0.95,
         "max_holding_days": 15,
+    }
+
+
+def _resolve_result_path(raw_path: str | None, base_dir: Path) -> str | None:
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    resolved = path if path.is_absolute() else (base_dir / path).resolve()
+    try:
+        return str(resolved.relative_to(ROOT.resolve())).replace("\\", "/")
+    except ValueError:
+        return str(resolved)
+
+
+def list_common_strategies_with_results(database_url: str) -> list[dict[str, Any]]:
+    try:
+        factory = create_session_factory(database_url)
+        with session_scope(factory) as session:
+            strategies = session.scalars(select(CommonStrategyModel).order_by(CommonStrategyModel.created_at.asc())).all()
+            result_rows = session.scalars(
+                select(StrategyBacktestResultModel).order_by(StrategyBacktestResultModel.created_at.desc())
+            ).all()
+    except Exception:
+        return []
+    grouped: dict[str, list[StrategyBacktestResultModel]] = {}
+    for row in result_rows:
+        grouped.setdefault(row.strategy_id, []).append(row)
+    payload: list[dict[str, Any]] = []
+    for strategy in strategies:
+        rows = grouped.get(strategy.strategy_id, [])
+        payload.append(
+            {
+                "strategy_id": strategy.strategy_id,
+                "strategy_key": strategy.strategy_key,
+                "display_name": strategy.display_name,
+                "is_active": bool(strategy.is_active),
+                "results": [
+                    {
+                        "backtest_result_id": item.backtest_result_id,
+                        "run_key": item.run_key,
+                        "mode": item.mode,
+                        "start_date": item.start_date,
+                        "end_date": item.end_date,
+                        "account": _safe_float(item.account),
+                        "total_return": _safe_float(item.total_return),
+                        "annualized_return": _safe_float(item.annualized_return),
+                        "max_drawdown": _safe_float(item.max_drawdown),
+                        "ending_equity": _safe_float(item.ending_equity),
+                        "created_at": item.created_at.isoformat(),
+                    }
+                    for item in rows
+                ],
+            }
+        )
+    return payload
+
+
+def persist_pattern_backtest_results(database_url: str, summary_rows: list[dict[str, Any]], base_dir: Path) -> None:
+    if not summary_rows:
+        return
+    try:
+        factory = create_session_factory(database_url)
+        with session_scope(factory) as session:
+            strategy = session.scalar(select(CommonStrategyModel).where(CommonStrategyModel.strategy_key == "b1"))
+            if strategy is None:
+                strategy = CommonStrategyModel(strategy_key="b1", display_name="形态策略 B1", is_active=1)
+                session.add(strategy)
+                session.flush()
+            strategy.updated_at = datetime.utcnow()
+            run_key = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            for row in summary_rows:
+                mode = str(row.get("mode") or "B1")
+                session.add(
+                    StrategyBacktestResultModel(
+                        strategy_id=strategy.strategy_id,
+                        run_key=f"{run_key}-{mode}",
+                        mode=mode,
+                        start_date=str(row.get("start_date") or ""),
+                        end_date=str(row.get("end_date") or ""),
+                        account=_to_decimal(row.get("account") or 0) or Decimal("0"),
+                        total_return=_to_decimal(row.get("total_return")),
+                        annualized_return=_to_decimal(row.get("annualized_return")),
+                        max_drawdown=_to_decimal(row.get("max_drawdown")),
+                        ending_equity=_to_decimal(row.get("ending_equity")),
+                        report_path=_resolve_result_path(row.get("report_path"), base_dir),
+                        risk_path=_resolve_result_path(row.get("risk_path"), base_dir),
+                        daily_action_path=_resolve_result_path(row.get("daily_action_path"), base_dir),
+                        daily_decision_path=_resolve_result_path(row.get("daily_decision_path"), base_dir),
+                        raw_payload=row,
+                    )
+                )
+    except Exception:
+        return
+
+
+def delete_backtest_result(database_url: str, backtest_result_id: str) -> int:
+    try:
+        factory = create_session_factory(database_url)
+        with session_scope(factory) as session:
+            statement = delete(StrategyBacktestResultModel).where(
+                StrategyBacktestResultModel.backtest_result_id == backtest_result_id
+            )
+            result = session.execute(statement)
+            return int(result.rowcount or 0)
+    except Exception:
+        return 0
+
+
+def build_b1_score_card(
+    symbol: str,
+    target_date: str,
+    score_file: Path | None = None,
+    lookback_days: int = 20,
+) -> dict[str, Any]:
+    resolved_score_file = score_file or (ROOT / "data" / "reports" / "b1_rank" / "b1_model_scores.parquet")
+    if not resolved_score_file.exists():
+        csv_fallback = resolved_score_file.with_suffix(".csv")
+        if not csv_fallback.exists():
+            return {"symbol": symbol, "target_date": target_date, "error": "b1_score_file_not_found"}
+        resolved_score_file = csv_fallback
+    if resolved_score_file.suffix.lower() == ".csv":
+        frame = pd.read_csv(resolved_score_file)
+    else:
+        frame = pd.read_parquet(resolved_score_file)
+    if frame.empty:
+        return {"symbol": symbol, "target_date": target_date, "error": "b1_score_frame_empty"}
+    if "date" not in frame.columns or "symbol" not in frame.columns:
+        return {"symbol": symbol, "target_date": target_date, "error": "b1_score_columns_missing"}
+    score_column = "model_score" if "model_score" in frame.columns else ("score" if "score" in frame.columns else "")
+    if not score_column:
+        return {"symbol": symbol, "target_date": target_date, "error": "b1_score_column_missing"}
+    frame = frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame[frame["symbol"].astype(str) == symbol].dropna(subset=["date"])
+    if frame.empty:
+        return {"symbol": symbol, "target_date": target_date, "error": "b1_symbol_not_found"}
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        return {"symbol": symbol, "target_date": target_date, "error": "b1_invalid_date"}
+    frame = frame[frame["date"] <= target].sort_values("date")
+    if frame.empty:
+        return {"symbol": symbol, "target_date": target_date, "error": "b1_date_out_of_range"}
+    latest_row = frame.iloc[-1]
+    start = latest_row["date"] - pd.Timedelta(days=max(lookback_days, 1) - 1)
+    window = frame[frame["date"] >= start]
+    score_value = _safe_float(latest_row.get(score_column))
+    rank_percentile = None
+    daily_slice = pd.read_csv(resolved_score_file) if resolved_score_file.suffix.lower() == ".csv" else pd.read_parquet(resolved_score_file)
+    daily_slice["date"] = pd.to_datetime(daily_slice.get("date"), errors="coerce")
+    daily_slice = daily_slice[daily_slice["date"] == latest_row["date"]]
+    if not daily_slice.empty and score_column in daily_slice.columns and score_value is not None:
+        ordered = pd.to_numeric(daily_slice[score_column], errors="coerce").dropna().sort_values()
+        if not ordered.empty:
+            rank_percentile = float((ordered <= score_value).sum() / len(ordered) * 100.0)
+    return {
+        "symbol": symbol,
+        "target_date": target_date,
+        "resolved_date": latest_row["date"].date().isoformat(),
+        "score": score_value,
+        "percentile": rank_percentile,
+        "series": [
+            {"date": item["date"].date().isoformat(), "score": _safe_float(item.get(score_column))}
+            for item in window.to_dict("records")
+        ],
     }
 
 
@@ -621,6 +795,7 @@ def build_dashboard_payload(profile: str = "backtest", config_path: str | None =
     pattern_decisions = pattern["daily_decisions"].copy()
     qlib_runtime = build_qlib_runtime_payload(profile_key)
     qlib_status = history_status(AppSettings.model_validate(qlib_runtime))
+    strategy_registry = list_common_strategies_with_results(settings.database_url)
 
     info = overview(data)
     connection = connection_state(settings, probe)
@@ -684,6 +859,7 @@ def build_dashboard_payload(profile: str = "backtest", config_path: str | None =
             "png_url": f"/api/file?path={workspace_relative(pattern['png_path'])}",
             "html_url": f"/api/file?path={workspace_relative(pattern['html_path'])}",
             "base_dir": pattern["base_dir"],
+            "strategy_registry": strategy_registry,
         },
         "data": {
             "assets": _frame_records(display_assets),
@@ -843,4 +1019,9 @@ def run_pattern_action(payload: dict[str, Any]) -> dict[str, Any]:
     )
     result["action"] = "user-pattern-all" if run_all else "user-pattern-selected"
     result["selection_label"] = selection_label
+    if result.get("ok"):
+        summary_path = USER_PATTERN_REPORT_DIR / "summary.json"
+        if summary_path.exists():
+            summary_rows = json.loads(summary_path.read_text(encoding="utf-8"))
+            persist_pattern_backtest_results(base_payload["database_url"], summary_rows, USER_PATTERN_REPORT_DIR)
     return result

@@ -3,6 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import select
+
+from quant_demo.db.models import CommonStrategyModel, StrategyBacktestResultModel
+from quant_demo.db.session import create_session_factory, session_scope
 
 from quant_demo.api import dashboard_payloads as dp
 from quant_demo.core.config import AppSettings
@@ -232,3 +236,52 @@ def test_run_pattern_action_builds_expected_modes(monkeypatch, tmp_path: Path) -
     assert 'B2' in captured['args']
     assert captured['config_payload']['history_start'] == '20260101'
     assert captured['config_payload']['history_end'] == '20260324'
+
+
+def test_b1_score_card_returns_series(tmp_path: Path) -> None:
+    score_path = tmp_path / "b1_model_scores.csv"
+    pd.DataFrame(
+        [
+            {"date": "2026-03-20", "symbol": "000001.SZ", "model_score": 60},
+            {"date": "2026-03-21", "symbol": "000001.SZ", "model_score": 70},
+            {"date": "2026-03-21", "symbol": "000002.SZ", "model_score": 40},
+        ]
+    ).to_csv(score_path, index=False)
+
+    payload = dp.build_b1_score_card("000001.SZ", "2026-03-22", score_file=score_path, lookback_days=5)
+
+    assert payload["resolved_date"] == "2026-03-21"
+    assert payload["score"] == 70.0
+    assert payload["percentile"] == 100.0
+    assert len(payload["series"]) == 2
+
+
+def test_list_and_delete_strategy_backtest_results() -> None:
+    database_url = "sqlite+pysqlite:///data/pytest_tmp/pattern_registry_test.db"
+    session_factory = create_session_factory(database_url)
+    with session_scope(session_factory) as session:
+        strategy = CommonStrategyModel(strategy_key="b1", display_name="形态策略 B1", is_active=1)
+        session.add(strategy)
+        session.flush()
+        session.add(
+            StrategyBacktestResultModel(
+                strategy_id=strategy.strategy_id,
+                run_key="run-1",
+                mode="B1",
+                start_date="2026-01-01",
+                end_date="2026-03-24",
+                account=500000,
+            )
+        )
+        session.flush()
+        result_id = session.scalar(
+            select(StrategyBacktestResultModel.backtest_result_id).where(StrategyBacktestResultModel.run_key == "run-1")
+        )
+        assert result_id is not None
+
+    listing = dp.list_common_strategies_with_results(database_url)
+    assert listing[0]["strategy_key"] == "b1"
+    assert len(listing[0]["results"]) == 1
+
+    deleted = dp.delete_backtest_result(database_url, str(result_id))
+    assert deleted == 1

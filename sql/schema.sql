@@ -118,3 +118,32 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     payload                jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at             timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS common_strategies (
+    strategy_id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_key           varchar(32) NOT NULL UNIQUE,
+    display_name           varchar(64) NOT NULL,
+    is_active              integer NOT NULL DEFAULT 1,
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS strategy_backtest_results (
+    backtest_result_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id            uuid NOT NULL REFERENCES common_strategies(strategy_id) ON DELETE CASCADE,
+    run_key                varchar(64) NOT NULL,
+    mode                   varchar(16) NOT NULL,
+    start_date             varchar(16) NOT NULL,
+    end_date               varchar(16) NOT NULL,
+    account                numeric(18, 6) NOT NULL DEFAULT 0,
+    total_return           numeric(18, 6) NULL,
+    annualized_return      numeric(18, 6) NULL,
+    max_drawdown           numeric(18, 6) NULL,
+    ending_equity          numeric(18, 6) NULL,
+    report_path            text NULL,
+    risk_path              text NULL,
+    daily_action_path      text NULL,
+    daily_decision_path    text NULL,
+    raw_payload            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at             timestamptz NOT NULL DEFAULT now()
+);

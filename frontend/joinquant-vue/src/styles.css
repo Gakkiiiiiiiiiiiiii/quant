@@ -330,6 +330,7 @@ textarea {
   border-radius: 18px;
   padding: 14px 14px 8px;
   background: linear-gradient(180deg, #ffffff, #f8fbff);
+  position: relative;
 }
 
 .line-chart__legend {
@@ -375,6 +376,51 @@ textarea {
 
 .line-chart__axis--bottom {
   text-anchor: middle;
+}
+
+.line-chart__crosshair {
+  stroke: rgba(30, 41, 59, 0.4);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+.line-chart__dot {
+  stroke: #fff;
+  stroke-width: 2;
+}
+
+.line-chart__tooltip {
+  position: absolute;
+  top: 48px;
+  transform: translateX(-50%);
+  min-width: 180px;
+  background: rgba(15, 23, 42, 0.92);
+  color: #fff;
+  border-radius: 10px;
+  padding: 10px 12px;
+  pointer-events: none;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.3);
+}
+
+.line-chart__tooltip-title {
+  font-size: 12px;
+  opacity: 0.85;
+  margin-bottom: 6px;
+}
+
+.line-chart__tooltip-row {
+  display: grid;
+  grid-template-columns: 10px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.line-chart__tooltip-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
 }
 
 .data-table {
