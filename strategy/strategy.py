@@ -86,6 +86,12 @@ B1_MODEL_SCORE_Q50 = 50.0
 B1_MODEL_SCORE_Q80 = 80.0
 B1_QUALITY_WEIGHT = 0.3
 B1_MODEL_WEIGHT = 0.7
+B1_EXIT_SCORE_ALIASES = {
+    "b1_exit_score_tp1": ("b1_exit_score_tp1", "exit_score_tp1", "score_tp1", "tp1_score", "model_tp1", "model_score_tp1"),
+    "b1_exit_score_tp2": ("b1_exit_score_tp2", "exit_score_tp2", "score_tp2", "tp2_score", "model_tp2", "model_score_tp2"),
+    "b1_exit_score_tp3": ("b1_exit_score_tp3", "exit_score_tp3", "score_tp3", "tp3_score", "model_tp3", "model_score_tp3"),
+    "b1_exit_score_tail": ("b1_exit_score_tail", "exit_score_tail", "score_tail", "tail_score", "model_tail", "model_score_tail"),
+}
 B1_RANK_FEATURE_COLUMNS = [
     "f_lt_slope_3",
     "f_lt_slope_5",
@@ -150,12 +156,25 @@ def _normalize_cross_sectional_percentile(series: pd.Series) -> pd.Series:
     return ranked.reindex(series.index)
 
 
+def _normalize_probability_series(series: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    valid = numeric.dropna()
+    if valid.empty:
+        return pd.Series(np.nan, index=series.index, dtype=float)
+    if valid.between(0.0, 1.0).all():
+        return numeric.clip(lower=0.0, upper=1.0)
+    if valid.between(0.0, 100.0).all():
+        return (numeric / 100.0).clip(lower=0.0, upper=1.0)
+    ranked = valid.rank(method="average", pct=True)
+    return ranked.reindex(series.index).astype(float)
+
+
 def load_b1_model_scores(score_path: str | Path | None) -> pd.DataFrame:
     if score_path is None:
-        return pd.DataFrame(columns=["instrument", "datetime", "model_score_raw"])
+        return pd.DataFrame(columns=["instrument", "datetime", "model_score_raw", *B1_EXIT_SCORE_ALIASES.keys()])
     path = Path(score_path)
     if not path.exists():
-        raise FileNotFoundError(f"B1 模型分数文件不存在: {path}")
+        raise FileNotFoundError(f"B1 ?????????: {path}")
     if path.suffix.lower() == ".parquet":
         frame = pd.read_parquet(path)
     else:
@@ -171,14 +190,26 @@ def load_b1_model_scores(score_path: str | Path | None) -> pd.DataFrame:
             if candidate in renamed.columns:
                 renamed = renamed.rename(columns={candidate: "model_score_raw"})
                 break
-    required = {"instrument", "datetime", "model_score_raw"}
+    for canonical, aliases in B1_EXIT_SCORE_ALIASES.items():
+        if canonical in renamed.columns:
+            continue
+        for candidate in aliases:
+            if candidate in renamed.columns:
+                renamed = renamed.rename(columns={candidate: canonical})
+                break
+    required = {"instrument", "datetime"}
     missing = sorted(required - set(renamed.columns))
     if missing:
-        raise ValueError(f"B1 模型分数文件缺少字段: {', '.join(missing)}")
-    payload = renamed.loc[:, ["instrument", "datetime", "model_score_raw"]].copy()
+        raise ValueError(f"B1 ??????????: {', '.join(missing)}")
+
+    score_columns = [column for column in ["model_score_raw", *B1_EXIT_SCORE_ALIASES.keys()] if column in renamed.columns]
+    if not score_columns:
+        raise ValueError("B1 ???????????????")
+    payload = renamed.loc[:, ["instrument", "datetime", *score_columns]].copy()
     payload["instrument"] = payload["instrument"].astype(str)
     payload["datetime"] = pd.to_datetime(payload["datetime"]).dt.normalize()
-    payload["model_score_raw"] = pd.to_numeric(payload["model_score_raw"], errors="coerce")
+    for column in score_columns:
+        payload[column] = pd.to_numeric(payload[column], errors="coerce")
     payload = payload.dropna(subset=["instrument", "datetime"]).drop_duplicates(["instrument", "datetime"], keep="last")
     return payload
 
@@ -203,6 +234,9 @@ def apply_b1_model_scores(
         enriched["score_source"] = "rule_only"
     if "b1_rank_active" not in enriched.columns:
         enriched["b1_rank_active"] = 0
+    for canonical in B1_EXIT_SCORE_ALIASES:
+        if canonical not in enriched.columns:
+            enriched[canonical] = np.nan
 
     if score_frame is None or score_frame.empty:
         enriched["score"] = enriched["priority_score"].astype(float)
@@ -211,16 +245,25 @@ def apply_b1_model_scores(
     lookup = score_frame.copy()
     lookup["instrument"] = lookup["instrument"].astype(str)
     lookup["datetime"] = pd.to_datetime(lookup["datetime"]).dt.normalize()
+    merge_columns = ["instrument", "datetime", *[column for column in ["model_score_raw", *B1_EXIT_SCORE_ALIASES.keys()] if column in lookup.columns]]
     merged = (
         enriched.reset_index()
-        .merge(lookup, on=["instrument", "datetime"], how="left", suffixes=("", "_ext"))
+        .merge(lookup.loc[:, merge_columns], on=["instrument", "datetime"], how="left", suffixes=("", "_ext"))
         .set_index(["instrument", "datetime"])
         .sort_index()
     )
-    merged["model_score_raw"] = pd.to_numeric(merged["model_score_raw_ext"], errors="coerce").combine_first(
-        pd.to_numeric(merged["model_score_raw"], errors="coerce")
-    )
-    merged = merged.drop(columns=["model_score_raw_ext"], errors="ignore")
+    if "model_score_raw_ext" in merged.columns:
+        merged["model_score_raw"] = pd.to_numeric(merged["model_score_raw_ext"], errors="coerce").combine_first(
+            pd.to_numeric(merged["model_score_raw"], errors="coerce")
+        )
+        merged = merged.drop(columns=["model_score_raw_ext"], errors="ignore")
+    for canonical in B1_EXIT_SCORE_ALIASES:
+        ext_column = f"{canonical}_ext"
+        if ext_column in merged.columns:
+            merged[canonical] = pd.to_numeric(merged[ext_column], errors="coerce").combine_first(
+                pd.to_numeric(merged[canonical], errors="coerce")
+            )
+            merged = merged.drop(columns=[ext_column], errors="ignore")
 
     active_mask = merged["b1"].eq(1) & merged["model_score_raw"].notna()
     if active_mask.any():
@@ -237,6 +280,16 @@ def apply_b1_model_scores(
         merged.loc[active_mask, "priority_score"] = merged.loc[active_mask, "final_score"]
         merged.loc[active_mask, "score_source"] = "model_blend"
         merged.loc[active_mask, "b1_rank_active"] = 1
+
+    for canonical in B1_EXIT_SCORE_ALIASES:
+        score_mask = merged[canonical].notna()
+        if score_mask.any():
+            merged.loc[score_mask, canonical] = (
+                merged.loc[score_mask, [canonical]]
+                .groupby(level="datetime")[canonical]
+                .transform(_normalize_probability_series)
+                .astype(float)
+            )
 
     merged["score"] = merged["priority_score"].astype(float)
     return merged
@@ -562,10 +615,13 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
         g["body_ratio"] = (c - o).abs() / (o.abs() + 1e-12)
         g["body_pct"] = (c / (o + 1e-12) - 1.0).abs()
         g["vol_ratio"] = v / (g["vol_ma5"] + 1e-12)
+        g["vol_rank_60"] = _rolling_rank(v.astype(float), 60)
         g["structure_range_6"] = g["hh6"] / (g["ll6"] + 1e-12) - 1.0
         g["range_pct_prev_close"] = (h - l) / (c.shift(1) + 1e-12)
         g["amount_proxy"] = g["amount"] if "amount" in g.columns else c * v
         g["amount_ma20"] = g["amount_proxy"].rolling(20, min_periods=20).mean()
+        g["upper_wick"] = (h - pd.concat([c, o], axis=1).max(axis=1)) / (c.shift(1) + 1e-12)
+        g["lower_wick"] = (pd.concat([c, o], axis=1).min(axis=1) - l) / (c.shift(1) + 1e-12)
         g["upper_shadow_ratio"] = (h - c) / (h - l + 1e-12)
         g["count_above_st_10"] = (c > g["st"]).rolling(10, min_periods=10).sum()
         down_day = c < o
@@ -651,46 +707,117 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
             & (g["range_pct_prev_close"] <= 0.055)
         )
 
-        acceleration_zone = (
-            (c >= g["st"] * 1.08)
-            & (c >= g["lt"] * 1.12)
-            & (g["hh20"] / (g["ll20"] + eps) >= 1.18)
-        )
-        huge_volume = (v >= g["vol_hh60"] * 0.95) | (v >= g["vol_ma20"] * 2.5)
-        big_bear = (c < g["open"]) & (((g["open"] - c) / (c.shift(1) + eps)) >= 0.04)
-        b1_exit_1 = acceleration_zone & huge_volume & big_bear
+        o = g["open"].astype(float)
+        prev_close = c.shift(1)
+        ret3 = g["ret3"] if "ret3" in g.columns else c.pct_change(3, fill_method=None)
+        ret5 = g["ret5"] if "ret5" in g.columns else c.pct_change(5, fill_method=None)
+        close_pos = g["close_pos"] if "close_pos" in g.columns else (c - l) / (h - l + eps)
+        upper_wick = g["upper_wick"] if "upper_wick" in g.columns else (h - pd.concat([o, c], axis=1).max(axis=1)) / (prev_close + eps)
+        vol_rank_60 = g["vol_rank_60"] if "vol_rank_60" in g.columns else _rolling_rank(v.astype(float), 60)
+        vol_to_ma20 = v / (g["vol_ma20"] + eps)
+        turnover_ratio = g["amount_proxy"] / (g["amount_ma20"] + eps)
+        body_pct = (c / (o + eps) - 1.0).abs()
 
-        prev_high = g["hh20"].shift(1)
-        secondary_high_zone = (h < prev_high * 1.01) & (h >= prev_high * 0.97)
-        giant_volume = v >= g["vol_ma20"] * 2.0
-        long_bear = (c < g["open"]) & (((g["open"] - c) / (c.shift(1) + eps)) >= 0.035)
-        b1_exit_2 = acceleration_zone.shift(1, fill_value=False) & secondary_high_zone & giant_volume & long_bear
+        accel_bear = (c < o) & (body_pct >= 0.05) & (close_pos <= 0.35)
+        accel_false_bear = (body_pct >= 0.04) & (close_pos <= 0.40) & (upper_wick >= 0.02)
+        accel_turnover_bear = (turnover_ratio >= 2.5) & (c < h * 0.96) & (upper_wick >= 0.025)
+        b1_accel_exhaust_day = (
+            ((ret3 >= 0.10) | (ret5 >= 0.16))
+            & (vol_to_ma20 >= 2.2)
+            & (vol_rank_60 >= 0.95)
+            & (accel_bear | accel_false_bear | accel_turnover_bear)
+        ).fillna(False)
+        b1_accel_exhaust_hard = (
+            b1_accel_exhaust_day
+            & ((c < g["st"]) | (l < g["lt"] * 0.995))
+        ).fillna(False)
+        b1_accel_exhaust_hard = (
+            b1_accel_exhaust_hard
+            | (
+                b1_accel_exhaust_day.shift(1, fill_value=False)
+                & (h <= h.shift(1) * 1.01)
+                & (c < c.shift(1))
+            )
+            | (
+                b1_accel_exhaust_day.shift(2, fill_value=False)
+                & (pd.concat([h.shift(1), h], axis=1).max(axis=1) <= h.shift(2) * 1.01)
+                & (pd.concat([c.shift(1), c], axis=1).min(axis=1) < c.shift(2))
+            )
+        ).fillna(False)
 
-        new_high_trigger = h.shift(2) >= g["hh20"].shift(2)
-        stair_volume_down = (
-            (c < c.shift(1))
+        prior_peak = g["hh20"].shift(1)
+        pre_accel = (c.shift(1) / (c.shift(6) + eps) - 1.0) >= 0.15
+        long_bear = (c < o) & (body_pct >= 0.05)
+        close_bad = close_pos <= 0.30
+        b1_secondary_peak_distribution = (
+            pre_accel
+            & (h >= prior_peak * 0.97)
+            & (c <= prior_peak * 1.01)
+            & (vol_to_ma20 >= 2.0)
+            & long_bear
+            & close_bad
+        ).fillna(False)
+
+        b1_stair_dist_3d = (
+            (h.shift(1) >= g["hh20"].shift(2) * 0.995)
+            & (h < h.shift(1))
+            & (h.shift(1) < h.shift(2))
+            & (c < c.shift(1))
             & (c.shift(1) < c.shift(2))
-            & (v > v.shift(1))
-            & (v.shift(1) > v.shift(2))
-            & ((c < g["open"]).rolling(3, min_periods=3).sum() >= 2)
+            & (v >= v.shift(1))
+            & (v.shift(1) >= v.shift(2))
+            & (close_pos <= 0.40)
+        ).fillna(False)
+        b1_stair_dist_4d = (b1_stair_dist_3d & (c < g["st"])).fillna(False)
+
+        bear_blow = ((vol_to_ma20 >= 2.0) & (close_pos <= 0.35) & (body_pct >= 0.04)).fillna(False)
+        prior_bear_blow_high = _last_event_value(h.shift(1), bear_blow.shift(1, fill_value=False))
+        prior_bear_blow_bars = (_barslast(bear_blow.shift(1, fill_value=False)) + 1.0).fillna(np.nan)
+        b1_double_top_distribution = (
+            bear_blow
+            & prior_bear_blow_high.notna()
+            & prior_bear_blow_bars.between(3.0, 20.0, inclusive="both")
+            & (((h / (prior_bear_blow_high + eps)) - 1.0).abs() <= 0.04)
+            & (h <= prior_bear_blow_high * 1.02)
+        ).fillna(False)
+
+        neg_mask = c < o
+        pos_mask = c > o
+        neg_count_6 = neg_mask.rolling(6, min_periods=6).sum().replace(0.0, np.nan)
+        pos_count_6 = pos_mask.rolling(6, min_periods=6).sum().replace(0.0, np.nan)
+        neg_body_mean = body_pct.where(neg_mask, 0.0).rolling(6, min_periods=6).sum() / neg_count_6
+        pos_body_mean = body_pct.where(pos_mask, 0.0).rolling(6, min_periods=6).sum() / pos_count_6
+        neg_vol_mean = v.where(neg_mask, 0.0).rolling(6, min_periods=6).sum() / neg_count_6
+        pos_vol_mean = v.where(pos_mask, 0.0).rolling(6, min_periods=6).sum() / pos_count_6
+        b1_weak_rebound_top = (
+            ((neg_body_mean / (pos_body_mean + eps)) >= 1.4)
+            & ((neg_vol_mean / (pos_vol_mean + eps)) >= 1.2)
+            & (c < c.rolling(5, min_periods=5).max().shift(1) * 1.01)
+        ).fillna(False)
+        b1_weak_rebound_top_count = b1_weak_rebound_top.astype(int).rolling(8, min_periods=1).sum()
+
+        b1_distribution_score = (
+            2.0 * b1_double_top_distribution.astype(float)
+            + 1.6 * b1_secondary_peak_distribution.astype(float)
+            + 1.3 * b1_accel_exhaust_day.astype(float)
+            + 1.0 * b1_stair_dist_3d.astype(float)
+            + 0.8 * b1_weak_rebound_top.astype(float)
         )
-        b1_exit_3 = new_high_trigger & stair_volume_down & (c < g["st"])
 
-        peak_near = ((h - g["hh25"].shift(5)).abs() / (g["hh25"].shift(5) + eps) <= 0.03)
-        giant_bear = (c < g["open"]) & (((g["open"] - c) / (c.shift(1) + eps)) >= 0.035) & (v >= g["vol_ma20"] * 1.8)
-        b1_exit_4 = acceleration_zone & peak_near & giant_bear & giant_bear.shift(5, fill_value=False)
-
-        near_top_zone = h >= g["hh20"] * 0.95
-        b1_exit_5 = (
-            near_top_zone
-            & (g["down_vol_8"] > g["up_vol_8"] * 1.5)
-            & (g["down_body_8"] > g["up_body_8"] * 1.2)
-            & (g["hh8"] / (g["ll8"] + eps) < 1.12)
-        )
-
-        b1_soft_exit_flag = b1_exit_1 | b1_exit_2 | b1_exit_4 | b1_exit_5
-        b1_hard_distribution_flag = b1_exit_3
-        b1_exit_signal = b1_soft_exit_flag | b1_hard_distribution_flag
+        b1_soft_exit_flag = (b1_stair_dist_3d | b1_weak_rebound_top).fillna(False)
+        b1_st_stop_flag = (b1_secondary_peak_distribution & (c < g["st"])).fillna(False)
+        b1_hard_distribution_flag = (
+            b1_double_top_distribution
+            | b1_accel_exhaust_hard
+            | b1_st_stop_flag
+        ).fillna(False)
+        b1_exit_signal = (
+            b1_accel_exhaust_day
+            | b1_secondary_peak_distribution
+            | b1_stair_dist_3d
+            | b1_double_top_distribution
+            | b1_weak_rebound_top
+        ).fillna(False)
         recent_distribution = b1_exit_signal.rolling(30, min_periods=1).sum() >= 1
         repair = (c > g["hh30"].shift(1) * 1.03) | (g["count_above_st_10"] >= 8)
         b1_pullback_distribution_forbidden = pullback_distribution_bear.rolling(10, min_periods=1).sum() >= 1
@@ -724,10 +851,7 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         ).fillna(False)
         b1_core = b1_candidate_v5
         b1_formula = b1_candidate_v5
-        b1_lt_hard_stop_flag = ((c < g["lt"] * 0.98) | ((c < g["lt"]).rolling(2, min_periods=2).sum() >= 2)).fillna(False)
-        b1_st_stop_flag = (
-            (c < g["st"]) & (v > g["vol_ma5"] * 1.2) & (c < c.shift(1))
-        ).fillna(False)
+        b1_lt_hard_stop_flag = (c < g["lt"]).fillna(False)
         b1_platform_established = (g["hh8"] / (g["ll8"] + eps) < 1.12).fillna(False)
         g["b1_platform_low"] = g["ll8"].astype(float)
 
@@ -818,6 +942,15 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         g["b1_signal_low"] = b1_signal_low.astype(float)
         g["b1_forbidden"] = b1_forbidden.astype(int)
         g["b1"] = b1_formula.astype(int)
+        g["b1_accel_exhaust_day"] = b1_accel_exhaust_day.astype(int)
+        g["b1_accel_exhaust_hard"] = b1_accel_exhaust_hard.astype(int)
+        g["b1_secondary_peak_distribution"] = b1_secondary_peak_distribution.astype(int)
+        g["b1_stair_dist_3d"] = b1_stair_dist_3d.astype(int)
+        g["b1_stair_dist_4d"] = b1_stair_dist_4d.astype(int)
+        g["b1_double_top_distribution"] = b1_double_top_distribution.astype(int)
+        g["b1_weak_rebound_top"] = b1_weak_rebound_top.astype(int)
+        g["b1_weak_rebound_top_count"] = b1_weak_rebound_top_count.astype(float)
+        g["b1_distribution_score"] = b1_distribution_score.astype(float)
         g["b1_soft_exit_flag"] = b1_soft_exit_flag.astype(int)
         g["b1_hard_distribution_flag"] = b1_hard_distribution_flag.astype(int)
         g["b1_lt_hard_stop_flag"] = b1_lt_hard_stop_flag.astype(int)
@@ -866,6 +999,10 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         g["rule_priority_score"] = g["priority_score"].astype(float)
         g["model_score_raw"] = np.nan
         g["model_score"] = np.nan
+        g["b1_exit_score_tp1"] = np.nan
+        g["b1_exit_score_tp2"] = np.nan
+        g["b1_exit_score_tp3"] = np.nan
+        g["b1_exit_score_tail"] = np.nan
         g["final_score"] = g["priority_score"].astype(float)
         g["score_source"] = "rule_only"
         g["b1_rank_active"] = 0
@@ -880,11 +1017,15 @@ def build_pattern_signals(df: pd.DataFrame) -> pd.DataFrame:
         "b1_trigger_raw", "b1_watch_days",
         "b1_trigger_entry", "b1_pullback_entry",
         "b1_core", "b1_confirm", "b1_probe_invalid", "b1_signal_high", "b1_signal_low", "b1_forbidden", "b1_exit_flag",
-        "b1_soft_exit_flag", "b1_hard_distribution_flag",
+        "b1_accel_exhaust_day", "b1_accel_exhaust_hard", "b1_secondary_peak_distribution",
+        "b1_stair_dist_3d", "b1_stair_dist_4d", "b1_double_top_distribution", "b1_weak_rebound_top", "b1_weak_rebound_top_count",
+        "b1_distribution_score", "b1_soft_exit_flag", "b1_hard_distribution_flag",
         "b1_lt_hard_stop_flag", "b1_st_stop_flag", "b1_platform_established", "b1_platform_low",
         "b1", "b2", "b3",
         "entry_flag", "exit_flag", "stop_price",
-        "priority_score", "rule_priority_score", "quality_score", "model_score_raw", "model_score", "final_score", "score_source", "b1_rank_active", "pattern",
+        "priority_score", "rule_priority_score", "quality_score", "model_score_raw", "model_score",
+        "b1_exit_score_tp1", "b1_exit_score_tp2", "b1_exit_score_tp3", "b1_exit_score_tail",
+        "final_score", "score_source", "b1_rank_active", "pattern",
     ]
     signal = out[cols].copy()
     signal["score"] = signal["priority_score"]  # 兼容 qlib signal 的 score 列

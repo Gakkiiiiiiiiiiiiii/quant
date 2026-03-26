@@ -226,24 +226,28 @@ def test_b1_recent_distribution_blocks_reentry_without_repair() -> None:
     strategy_module = _load_strategy_module()
     dates = pd.bdate_range("2024-01-02", periods=40)
     frame = _make_b1_v5_feature_frame(dates)
-    exit_row = ("000001.SZ", dates[10])
-    frame.loc[exit_row, ["open", "high", "low", "close", "volume", "st", "lt", "vol_ma20", "vol_hh60", "hh20", "ll20"]] = [
-        12.0,
-        12.2,
-        10.8,
-        11.0,
-        3000.0,
-        10.0,
-        9.0,
-        1000.0,
-        3200.0,
-        11.5,
-        9.0,
+    history_rows = [
+        (dates[29], 9.4),
+        (dates[30], 9.6),
+        (dates[31], 9.8),
+        (dates[32], 10.0),
+        (dates[33], 10.4),
+        (dates[34], 10.9),
     ]
+    for trade_date, close_value in history_rows:
+        row_key = ("000001.SZ", trade_date)
+        frame.loc[row_key, ["open", "high", "low", "close"]] = [close_value * 0.99, close_value * 1.02, close_value * 0.98, close_value]
+    exit_row = ("000001.SZ", dates[35])
+    frame.loc[exit_row, ["open", "high", "low", "close", "volume"]] = [12.0, 12.2, 10.8, 11.0, 3000.0]
 
-    signal = strategy_module.build_pattern_signals(frame)
+    ohlcv = frame.loc[:, ["open", "high", "low", "close", "volume"]].copy()
+    ohlcv["amount"] = 50_000_000.0
+    features = strategy_module.build_indicators(ohlcv)
+    features["vol_rank_60"] = 1.0
+    signal = strategy_module.build_pattern_signals(features)
     row = signal.loc[("000001.SZ", dates[-1])]
 
+    assert int(signal.loc[exit_row, "b1_accel_exhaust_day"]) == 1
     assert int(signal.loc[exit_row, "b1_exit_flag"]) == 1
     assert int(row["b1_forbidden"]) == 1
     assert int(row["b1"]) == 0
@@ -331,7 +335,7 @@ def test_exit_decision_uses_signal_bar_only() -> None:
     assert reason == "stop_loss"
 
 
-def test_b1_probe_action_accepts_lt_st_distribution_and_timeout() -> None:
+def test_b1_probe_action_uses_doc_exit_priority_and_timeout() -> None:
     backtest_script = _load_backtest_script()
 
     hold_action, hold_reason = backtest_script._decide_b1_probe_action(
@@ -346,12 +350,20 @@ def test_b1_probe_action_accepts_lt_st_distribution_and_timeout() -> None:
         pd.Series({"b1_probe_invalid": 0, "b1_lt_hard_stop_flag": 1}),
         {"pattern": "B1"},
     )
-    st_action, st_reason = backtest_script._decide_b1_probe_action(
-        pd.Series({"b1_probe_invalid": 0, "b1_st_stop_flag": 1}),
+    double_top_action, double_top_reason = backtest_script._decide_b1_probe_action(
+        pd.Series({"b1_probe_invalid": 0, "b1_double_top_distribution": 1}),
         {"pattern": "B1"},
     )
-    dist_action, dist_reason = backtest_script._decide_b1_probe_action(
-        pd.Series({"b1_probe_invalid": 0, "b1_soft_exit_flag": 1}),
+    accel_action, accel_reason = backtest_script._decide_b1_probe_action(
+        pd.Series({"b1_probe_invalid": 0, "b1_accel_exhaust_day": 1}),
+        {"pattern": "B1"},
+    )
+    secondary_hard_action, secondary_hard_reason = backtest_script._decide_b1_probe_action(
+        pd.Series({"b1_probe_invalid": 0, "close": 9.9, "st": 10.0, "b1_secondary_peak_distribution": 1}),
+        {"pattern": "B1"},
+    )
+    secondary_action, secondary_reason = backtest_script._decide_b1_probe_action(
+        pd.Series({"b1_probe_invalid": 0, "close": 10.2, "st": 10.0, "b1_secondary_peak_distribution": 1}),
         {"pattern": "B1"},
     )
     timeout_action, timeout_reason = backtest_script._decide_b1_probe_action(
@@ -365,10 +377,14 @@ def test_b1_probe_action_accepts_lt_st_distribution_and_timeout() -> None:
     assert invalid_reason == "b1_probe_invalid"
     assert lt_action == "full_exit"
     assert lt_reason == "b1_lt_hard_stop"
-    assert st_action == "full_exit"
-    assert st_reason == "b1_st_stop"
-    assert dist_action == "full_exit"
-    assert dist_reason == "b1_distribution_soft"
+    assert double_top_action == "full_exit"
+    assert double_top_reason == "b1_double_top_distribution"
+    assert accel_action == "full_exit"
+    assert accel_reason == "b1_accel_exhaust_probe_exit"
+    assert secondary_hard_action == "full_exit"
+    assert secondary_hard_reason == "b1_secondary_peak_hard"
+    assert secondary_action == "full_exit"
+    assert secondary_reason == "b1_secondary_peak_probe_exit"
     assert timeout_action == "full_exit"
     assert timeout_reason == "b1_probe_timeout"
 
@@ -379,26 +395,21 @@ def test_b1_exit_decision_uses_v2_defense_stops() -> None:
         {
             "close": 9.7,
             "st": 10.0,
+            "lt": 9.8,
             "b1_lt_hard_stop_flag": 1,
-            "b1_st_stop_flag": 0,
-            "b1_hard_distribution_flag": 0,
-            "b1_soft_exit_flag": 0,
         }
     )
     meta = {
         "buy_price": 10.0,
-        "hold_days": 3,
+        "shares": 1000,
+        "initial_shares": 1000,
         "position_stage": 0,
-        "entry_signal_low": 10.0,
-        "entry_signal_close": 10.2,
-        "entry_platform_established": True,
-        "entry_platform_low": 9.9,
+        "days_since_confirm": 2,
+        "bars_since_last_sell": 0,
         "max_high_since_entry": 10.3,
-        "min_low_since_entry": 9.8,
-        "last_soft_exit_signal_date": "",
     }
 
-    action, reason, next_stage = backtest_script._decide_b1_position_action(
+    action, reason, next_stage, target_ratio = backtest_script._decide_b1_position_action(
         signal_row,
         meta,
         signal_date=pd.Timestamp("2026-01-10"),
@@ -407,126 +418,137 @@ def test_b1_exit_decision_uses_v2_defense_stops() -> None:
     assert action == "full_exit"
     assert reason == "b1_lt_hard_stop"
     assert next_stage is None
+    assert target_ratio is None
 
 
-def test_b1_st_stop_requires_volume_expansion_and_weaker_close() -> None:
-    strategy_module = _load_strategy_module()
-    dates = pd.bdate_range("2024-01-02", periods=40)
-    frame = _make_b1_v5_feature_frame(dates)
-    frame.loc[("000001.SZ", dates[-2]), ["close", "st", "volume", "vol_ma5"]] = [10.00, 10.20, 1000.0, 1000.0]
-    frame.loc[("000001.SZ", dates[-1]), ["open", "close", "st", "volume", "vol_ma5"]] = [10.05, 10.02, 10.20, 1100.0, 1000.0]
-
-    signal = strategy_module.build_pattern_signals(frame)
-
-    assert int(signal.iloc[-1]["b1_st_stop_flag"]) == 0
-
-
-def test_b1_exit_decision_uses_v2_time_stop() -> None:
+def test_b1_secondary_peak_hard_requires_break_st() -> None:
     backtest_script = _load_backtest_script()
-    signal_row = pd.Series(
-        {
-            "close": 9.9,
-            "st": 10.0,
-            "b1_lt_hard_stop_flag": 0,
-            "b1_st_stop_flag": 0,
-            "b1_hard_distribution_flag": 0,
-            "b1_soft_exit_flag": 0,
-        }
-    )
     meta = {
         "buy_price": 10.0,
-        "hold_days": 8,
+        "shares": 1000,
+        "initial_shares": 1000,
         "position_stage": 0,
-        "entry_signal_low": 9.6,
-        "entry_signal_close": 10.0,
-        "entry_platform_established": False,
-        "entry_platform_low": 9.5,
-        "max_high_since_entry": 10.3,
-        "min_low_since_entry": 9.7,
-        "last_soft_exit_signal_date": "",
+        "days_since_confirm": 2,
+        "bars_since_last_sell": 0,
+        "max_high_since_entry": 10.8,
     }
 
-    action, reason, next_stage = backtest_script._decide_b1_position_action(
-        signal_row,
+    partial_action, partial_reason, partial_stage, partial_ratio = backtest_script._decide_b1_position_action(
+        pd.Series({"close": 10.2, "st": 10.0, "lt": 9.8, "b1_secondary_peak_distribution": 1}),
         meta,
-        signal_date=pd.Timestamp("2026-01-11"),
+        signal_date=pd.Timestamp("2026-01-10"),
+    )
+    hard_action, hard_reason, hard_stage, hard_ratio = backtest_script._decide_b1_position_action(
+        pd.Series({"close": 9.9, "st": 10.0, "lt": 9.8, "b1_secondary_peak_distribution": 1}),
+        meta,
+        signal_date=pd.Timestamp("2026-01-10"),
     )
 
-    assert action == "full_exit"
-    assert reason == "b1_time_stop_a"
-    assert next_stage is None
+    assert partial_action == "partial_exit"
+    assert partial_reason == "b1_secondary_peak_reduce_to_30"
+    assert partial_stage == 2
+    assert partial_ratio == 0.30
+    assert hard_action == "full_exit"
+    assert hard_reason == "b1_secondary_peak_hard"
+    assert hard_stage is None
+    assert hard_ratio is None
 
 
-def test_b1_v3_partial_exit_triggers_at_10_percent_mfe() -> None:
+def test_b1_accel_exhaust_day_reduces_position_to_half() -> None:
     backtest_script = _load_backtest_script()
     signal_row = pd.Series(
         {
             "close": 10.8,
             "st": 10.2,
-            "b1_lt_hard_stop_flag": 0,
-            "b1_st_stop_flag": 0,
-            "b1_hard_distribution_flag": 0,
-            "b1_soft_exit_flag": 0,
+            "lt": 9.9,
+            "b1_accel_exhaust_day": 1,
         }
     )
     meta = {
         "buy_price": 10.0,
-        "hold_days": 3,
+        "shares": 1000,
+        "initial_shares": 1000,
         "position_stage": 0,
-        "entry_signal_low": 9.6,
-        "entry_signal_close": 10.0,
-        "entry_platform_established": False,
-        "entry_platform_low": 9.5,
-        "max_high_since_entry": 11.2,
-        "min_low_since_entry": 9.9,
-        "last_soft_exit_signal_date": "",
+        "days_since_confirm": 2,
+        "bars_since_last_sell": 0,
+        "max_high_since_entry": 11.0,
     }
 
-    action, reason, next_stage = backtest_script._decide_b1_position_action(
+    action, reason, next_stage, target_ratio = backtest_script._decide_b1_position_action(
+        signal_row,
+        meta,
+        signal_date=pd.Timestamp("2026-01-11"),
+    )
+
+    assert action == "partial_exit"
+    assert reason == "b1_accel_exhaust_reduce_to_50"
+    assert next_stage == 1
+    assert target_ratio == 0.50
+
+
+def test_b1_model_tp1_gate_uses_stage_score_threshold() -> None:
+    backtest_script = _load_backtest_script()
+    signal_row = pd.Series(
+        {
+            "close": 10.8,
+            "st": 10.2,
+            "lt": 9.9,
+            "b1_exit_score_tp1": 0.75,
+        }
+    )
+    meta = {
+        "buy_price": 10.0,
+        "shares": 1000,
+        "initial_shares": 1000,
+        "position_stage": 0,
+        "days_since_confirm": 1,
+        "bars_since_last_sell": 0,
+        "max_high_since_entry": 11.2,
+    }
+
+    action, reason, next_stage, target_ratio = backtest_script._decide_b1_position_action(
         signal_row,
         meta,
         signal_date=pd.Timestamp("2026-01-10"),
     )
 
     assert action == "partial_exit"
-    assert reason == "b1_profit_take_10"
+    assert reason == "b1_model_tp1"
     assert next_stage == 1
+    assert target_ratio == 0.70
 
 
 def test_b1_v3_hard_exit_has_priority_over_partial_exit() -> None:
     backtest_script = _load_backtest_script()
     signal_row = pd.Series(
         {
-            "close": 9.7,
+            "close": 10.4,
             "st": 10.0,
-            "b1_lt_hard_stop_flag": 1,
-            "b1_st_stop_flag": 0,
-            "b1_hard_distribution_flag": 0,
-            "b1_soft_exit_flag": 1,
+            "lt": 9.8,
+            "b1_accel_exhaust_day": 1,
+            "b1_double_top_distribution": 1,
         }
     )
     meta = {
         "buy_price": 10.0,
-        "hold_days": 3,
-        "position_stage": 1,
-        "entry_signal_low": 9.6,
-        "entry_signal_close": 10.0,
-        "entry_platform_established": False,
-        "entry_platform_low": 9.5,
+        "shares": 1000,
+        "initial_shares": 1000,
+        "position_stage": 0,
+        "days_since_confirm": 2,
+        "bars_since_last_sell": 0,
         "max_high_since_entry": 12.0,
-        "min_low_since_entry": 9.5,
-        "last_soft_exit_signal_date": "",
     }
 
-    action, reason, next_stage = backtest_script._decide_b1_position_action(
+    action, reason, next_stage, target_ratio = backtest_script._decide_b1_position_action(
         signal_row,
         meta,
         signal_date=pd.Timestamp("2026-01-11"),
     )
 
     assert action == "full_exit"
-    assert reason == "b1_lt_hard_stop"
+    assert reason == "b1_double_top_distribution"
     assert next_stage is None
+    assert target_ratio is None
 
 
 def test_resolve_trade_price_prefers_open_execution() -> None:
@@ -613,10 +635,11 @@ def test_b1_existing_position_sells_on_same_day_close_signal() -> None:
             "b1_signal_low": [9.9, 10.0, 10.2, 9.7, 9.6],
             "b1_forbidden": [0, 0, 0, 0, 0],
             "b1_exit_flag": [0, 0, 0, 1, 0],
+            "b1_secondary_peak_distribution": [0, 0, 0, 1, 0],
             "b1_soft_exit_flag": [0, 0, 0, 0, 0],
             "b1_hard_distribution_flag": [0, 0, 0, 0, 0],
             "b1_lt_hard_stop_flag": [0, 0, 0, 0, 0],
-            "b1_st_stop_flag": [0, 0, 0, 1, 0],
+            "b1_st_stop_flag": [0, 0, 0, 0, 0],
             "b1_platform_established": [0, 0, 0, 0, 0],
             "b1_platform_low": [9.8, 9.8, 9.8, 9.8, 9.8],
             "b1": [1, 0, 0, 0, 0],
@@ -646,7 +669,7 @@ def test_b1_existing_position_sells_on_same_day_close_signal() -> None:
     assert len(ledger) == 1
     row = ledger.iloc[0]
     assert row["SELL日期"] == "2026-01-08"
-    assert row["卖出原因"] == "b1_st_stop"
+    assert row["卖出原因"] == "b1_secondary_peak_hard"
     assert row["卖出价格"] == round(9.85 * 0.995, 4)
 
 

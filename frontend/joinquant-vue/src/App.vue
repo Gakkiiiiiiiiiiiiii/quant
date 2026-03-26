@@ -91,6 +91,25 @@ function formatDatetime(value) {
   return String(value).replace('T', ' ').replace('.000Z', '')
 }
 
+function normalizeCurvePoints(points) {
+  const normalized = points
+    .map((point) => ({
+      ...point,
+      value: Number(point.value),
+    }))
+    .filter((point) => Number.isFinite(point.value))
+
+  if (normalized.length === 0 || normalized[0].value === 0) {
+    return []
+  }
+
+  const baseValue = normalized[0].value
+  return normalized.map((point) => ({
+    ...point,
+    value: point.value / baseValue - 1,
+  }))
+}
+
 function hydrateForms(payload) {
   const defaults = payload.strategy_defaults || {}
   strategyForm.strategy_label = defaults.label || ''
@@ -241,22 +260,30 @@ const performanceMetrics = computed(() => [
 ])
 
 const equitySeries = computed(() => {
+  const strategyPoints = assets.value
+    .filter((item) => (item.total_asset ?? item.account) !== null && (item.total_asset ?? item.account) !== undefined)
+    .map((item) => ({
+      label: formatDatetime(item.snapshot_time || item.datetime).slice(0, 10),
+      value: Number(item.total_asset ?? item.account),
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label))
+  const benchmarkPoints = benchmarkCurve.value
+    .filter((item) => item.benchmark_equity !== null && item.benchmark_equity !== undefined)
+    .map((item) => ({
+      label: formatDatetime(item.trading_date || item.datetime).slice(0, 10),
+      value: Number(item.benchmark_equity),
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label))
+
   const strategySeries = {
     name: primaryMode.value || '策略曲线',
     color: '#2e62ad',
-    points: assets.value
-      .filter((item) => (item.total_asset ?? item.account) !== null && (item.total_asset ?? item.account) !== undefined)
-      .map((item) => ({
-        label: formatDatetime(item.snapshot_time || item.datetime).slice(0, 10),
-        value: Number(item.total_asset ?? item.account),
-      })),
+    points: normalizeCurvePoints(strategyPoints),
   }
   const benchmarkSeries = {
     name: 'Benchmark',
     color: '#f59e0b',
-    points: benchmarkCurve.value
-      .filter((item) => item.benchmark_equity !== null && item.benchmark_equity !== undefined)
-      .map((item) => ({ label: formatDatetime(item.trading_date || item.datetime).slice(0, 10), value: Number(item.benchmark_equity) })),
+    points: normalizeCurvePoints(benchmarkPoints),
   }
   return [strategySeries, benchmarkSeries].filter((item) => item.points.length > 0)
 })
@@ -274,9 +301,18 @@ const patternSeries = computed(() => {
     if (!groups.has(key)) {
       groups.set(key, [])
     }
-    groups.get(key).push({ label: formatDatetime(item.datetime).slice(0, 10), value: item.equity })
+    groups.get(key).push({
+      label: formatDatetime(item.datetime).slice(0, 10),
+      value: Number(item.equity),
+    })
   })
-  return Array.from(groups.entries()).map(([name, points]) => ({ name, color: palette[name] || '#334155', points }))
+  return Array.from(groups.entries())
+    .map(([name, points]) => ({
+      name,
+      color: palette[name] || '#334155',
+      points: normalizeCurvePoints(points.sort((left, right) => left.label.localeCompare(right.label))),
+    }))
+    .filter((item) => item.points.length > 0)
 })
 
 const tradeRows = computed(() => {
@@ -406,7 +442,7 @@ onMounted(() => {
               </div>
             </div>
             <MetricStrip :items="overviewMetrics" />
-            <LineChart :series="equitySeries" :height="360" />
+            <LineChart :series="equitySeries" :height="360" :as-percent="true" />
           </div>
           <div class="panel-card">
             <div class="panel-card__header">
@@ -415,7 +451,7 @@ onMounted(() => {
                 <p>{{ primaryMode }} 与 Benchmark 的最新对比。</p>
               </div>
             </div>
-            <LineChart :series="patternSeries" :height="300" />
+            <LineChart :series="patternSeries" :height="300" :as-percent="true" />
             <DataTable :rows="patternSummary" :max-height="260" empty-text="暂无形态策略回测结果" />
           </div>
         </template>
@@ -617,3 +653,5 @@ onMounted(() => {
     </main>
   </div>
 </template>
+
+

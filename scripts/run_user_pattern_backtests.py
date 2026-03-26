@@ -725,9 +725,64 @@ def _resolve_trade_price(row: pd.Series | None, price_field: str, fallback: floa
     return float(price)
 
 
+B1_EXIT_MODEL_THRESHOLDS = {"tp1": 0.70, "tp2": 0.65, "tp3": 0.60, "tail": 0.55}
+
+
 def _b1_stage_target_ratio(stage: int) -> float:
-    targets = {1: 0.70, 2: 0.40, 3: 0.10}
+    targets = {0: 1.0, 1: 0.70, 2: 0.40, 3: 0.10, 4: 0.0}
     return float(targets.get(int(stage), 0.0))
+
+
+def _b1_stage_from_ratio(remaining_ratio: float) -> int:
+    ratio = max(float(remaining_ratio), 0.0)
+    if ratio <= 1e-6:
+        return 4
+    if ratio <= 0.10 + 1e-6:
+        return 3
+    if ratio <= 0.40 + 1e-6:
+        return 2
+    if ratio <= 0.70 + 1e-6:
+        return 1
+    return 0
+
+
+def _b1_remaining_ratio(meta: dict[str, object] | None) -> float:
+    if not meta:
+        return 0.0
+    initial_shares = max(int(meta.get("initial_shares", meta.get("shares", 0))), 1)
+    return max(int(meta.get("shares", 0)), 0) / initial_shares
+
+
+def _b1_refresh_position_stage(meta: dict[str, object]) -> dict[str, object]:
+    meta["position_stage"] = _b1_stage_from_ratio(_b1_remaining_ratio(meta))
+    return meta
+
+
+def _b1_partial_exit_plan(meta: dict[str, object], target_remaining_ratio: float) -> tuple[int, float] | None:
+    current_ratio = _b1_remaining_ratio(meta)
+    target_ratio = min(max(float(target_remaining_ratio), 0.0), current_ratio)
+    if current_ratio <= target_ratio + 1e-6:
+        return None
+    return _b1_stage_from_ratio(target_ratio), target_ratio
+
+
+def _b1_sell_fraction_target(meta: dict[str, object], fraction: float, *, floor: float = 0.0) -> float:
+    current_ratio = _b1_remaining_ratio(meta)
+    return max(current_ratio - float(fraction), float(floor))
+
+
+def _b1_exit_score(signal_row: pd.Series | None, stage_name: str) -> float:
+    if signal_row is None:
+        return float("nan")
+    candidates = [f"b1_exit_score_{stage_name}", f"exit_score_{stage_name}", f"score_{stage_name}"]
+    for column in candidates:
+        try:
+            value = float(signal_row.get(column, float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if pd.notna(value):
+            return value
+    return float("nan")
 
 
 def _b1_counts_as_main_position(meta: dict[str, object] | None) -> bool:
@@ -880,16 +935,23 @@ def _last_buy_date(meta: dict[str, object]):
 def _decide_b1_probe_action(signal_row: pd.Series | None, meta: dict[str, object]) -> tuple[str, str]:
     if signal_row is None:
         return "full_exit", "signal_missing"
+    signal_close = float(signal_row.get("close", float("nan")))
+    signal_st = float(signal_row.get("st", float("nan")))
+    signal_lt = float(signal_row.get("lt", float("nan")))
     if bool(signal_row.get("b1_probe_invalid", 0)):
         return "full_exit", "b1_probe_invalid"
-    if bool(signal_row.get("b1_lt_hard_stop_flag", 0)):
+    if bool(signal_row.get("b1_lt_hard_stop_flag", 0)) or (pd.notna(signal_close) and pd.notna(signal_lt) and signal_close < signal_lt):
         return "full_exit", "b1_lt_hard_stop"
-    if bool(signal_row.get("b1_st_stop_flag", 0)):
-        return "full_exit", "b1_st_stop"
-    if bool(signal_row.get("b1_hard_distribution_flag", 0)):
-        return "full_exit", "b1_distribution_hard"
-    if bool(signal_row.get("b1_soft_exit_flag", 0)):
-        return "full_exit", "b1_distribution_soft"
+    if bool(signal_row.get("b1_double_top_distribution", 0)):
+        return "full_exit", "b1_double_top_distribution"
+    if bool(signal_row.get("b1_accel_exhaust_hard", 0)):
+        return "full_exit", "b1_accel_exhaust_hard"
+    if bool(signal_row.get("b1_secondary_peak_distribution", 0)) and pd.notna(signal_st) and signal_close < signal_st:
+        return "full_exit", "b1_secondary_peak_hard"
+    if bool(signal_row.get("b1_accel_exhaust_day", 0)):
+        return "full_exit", "b1_accel_exhaust_probe_exit"
+    if bool(signal_row.get("b1_secondary_peak_distribution", 0)):
+        return "full_exit", "b1_secondary_peak_probe_exit"
     try:
         watch_days = float(signal_row.get("b1_watch_days", float("nan")))
     except (TypeError, ValueError):
@@ -904,66 +966,78 @@ def _decide_b1_position_action(
     meta: dict[str, object],
     *,
     signal_date,
-) -> tuple[str, str, int | None]:
+) -> tuple[str, str, int | None, float | None]:
     if signal_row is None:
-        return "full_exit", "signal_missing", None
+        return "full_exit", "signal_missing", None, None
 
-    signal_close = float(signal_row.get("close", float("inf")))
-    signal_st = float(signal_row.get("st", 0.0))
-    if bool(signal_row.get("b1_lt_hard_stop_flag", 0)):
-        return "full_exit", "b1_lt_hard_stop", None
-    if bool(signal_row.get("b1_st_stop_flag", 0)):
-        return "full_exit", "b1_st_stop", None
-    if bool(meta.get("entry_platform_established", False)):
-        platform_low = float(meta.get("entry_platform_low", float("nan")))
-        if pd.notna(platform_low) and signal_close < platform_low * 0.99:
-            return "full_exit", "b1_platform_stop", None
-    signal_low = float(meta.get("entry_signal_low", float("nan")))
-    if pd.notna(signal_low) and signal_close < signal_low * 0.99:
-        return "full_exit", "b1_signal_low_stop", None
-
-    hold_days = int(meta.get("hold_days", 0))
-    entry_signal_close = float(meta.get("entry_signal_close", float("nan")))
-    max_high_since_entry = float(meta.get("max_high_since_entry", float("nan")))
-    min_low_since_entry = float(meta.get("min_low_since_entry", float("nan")))
-    if (
-        hold_days >= 8
-        and pd.notna(entry_signal_close)
-        and pd.notna(max_high_since_entry)
-        and max_high_since_entry < entry_signal_close * 1.05
-        and signal_close < signal_st
-    ):
-        return "full_exit", "b1_time_stop_a", None
-    if (
-        hold_days >= 12
-        and pd.notna(entry_signal_close)
-        and pd.notna(max_high_since_entry)
-        and pd.notna(min_low_since_entry)
-        and max_high_since_entry < entry_signal_close * 1.08
-        and min_low_since_entry > entry_signal_close * 0.95
-    ):
-        return "full_exit", "b1_time_stop_b", None
-    if bool(signal_row.get("b1_hard_distribution_flag", 0)):
-        return "full_exit", "b1_distribution_hard", None
-
-    stage = int(meta.get("position_stage", 0))
+    signal_close = float(signal_row.get("close", float("nan")))
+    signal_st = float(signal_row.get("st", float("nan")))
+    signal_lt = float(signal_row.get("lt", float("nan")))
+    current_ratio = _b1_remaining_ratio(meta)
+    stage = _b1_stage_from_ratio(current_ratio)
+    days_since_confirm = int(meta.get("days_since_confirm", 0))
+    bars_since_last_sell = int(meta.get("bars_since_last_sell", 0))
     buy_price = float(meta.get("buy_price", float("nan")))
-    mfe = (max_high_since_entry / buy_price - 1.0) if pd.notna(max_high_since_entry) and pd.notna(buy_price) and buy_price > 0 else 0.0
-    soft_signal = bool(signal_row.get("b1_soft_exit_flag", 0))
-    signal_date_text = pd.Timestamp(signal_date).date().isoformat() if signal_date is not None else ""
-    soft_signal_new = soft_signal and signal_date_text != str(meta.get("last_soft_exit_signal_date", ""))
+    max_high_since_entry = float(meta.get("max_high_since_entry", float("nan")))
+    mfe_since_entry = (max_high_since_entry / buy_price - 1.0) if pd.notna(max_high_since_entry) and pd.notna(buy_price) and buy_price > 0 else 0.0
+    weak_rebound_count = int(float(signal_row.get("b1_weak_rebound_top_count", 0.0) or 0.0))
 
-    if stage == 0 and mfe >= 0.10:
-        return "partial_exit", "b1_profit_take_10", 1
-    if stage == 1 and (soft_signal_new or mfe >= 0.20):
-        reason = "b1_soft_exit_1" if soft_signal_new else "b1_profit_take_20"
-        return "partial_exit", reason, 2
-    if stage == 2 and (soft_signal_new or mfe >= 0.30):
-        reason = "b1_soft_exit_2" if soft_signal_new else "b1_profit_take_30"
-        return "partial_exit", reason, 3
-    if stage >= 3 and soft_signal_new:
-        return "full_exit", "b1_soft_tail_exit", None
-    return "hold", "", None
+    def _partial(reason: str, target_ratio: float) -> tuple[str, str, int | None, float | None]:
+        plan = _b1_partial_exit_plan(meta, target_ratio)
+        if plan is None:
+            return "hold", "", None, None
+        next_stage, normalized_target = plan
+        return "partial_exit", reason, next_stage, normalized_target
+
+    if bool(signal_row.get("b1_probe_invalid", 0)):
+        return "full_exit", "b1_probe_invalid", None, None
+    if bool(signal_row.get("b1_lt_hard_stop_flag", 0)) or (pd.notna(signal_close) and pd.notna(signal_lt) and signal_close < signal_lt):
+        return "full_exit", "b1_lt_hard_stop", None, None
+    if bool(signal_row.get("b1_double_top_distribution", 0)):
+        return "full_exit", "b1_double_top_distribution", None, None
+    if bool(signal_row.get("b1_accel_exhaust_hard", 0)):
+        return "full_exit", "b1_accel_exhaust_hard", None, None
+    if bool(signal_row.get("b1_secondary_peak_distribution", 0)) and pd.notna(signal_st) and signal_close < signal_st:
+        return "full_exit", "b1_secondary_peak_hard", None, None
+
+    if bool(signal_row.get("b1_accel_exhaust_day", 0)):
+        if stage == 0:
+            return _partial("b1_accel_exhaust_reduce_to_50", 0.50)
+        if stage == 1:
+            return _partial("b1_accel_exhaust_reduce_to_30", 0.30)
+        return _partial("b1_accel_exhaust_reduce_to_tail", 0.10)
+
+    if bool(signal_row.get("b1_secondary_peak_distribution", 0)):
+        if stage == 0:
+            return _partial("b1_secondary_peak_reduce_to_30", 0.30)
+        return _partial("b1_secondary_peak_reduce_to_tail", 0.10)
+
+    if bool(signal_row.get("b1_stair_dist_3d", 0)):
+        if stage == 0:
+            return _partial("b1_stair_dist_tp1", _b1_sell_fraction_target(meta, 0.30, floor=0.10))
+        if stage == 1 and pd.notna(signal_st) and signal_close < signal_st:
+            return _partial("b1_stair_dist_tp2", _b1_sell_fraction_target(meta, 0.30, floor=0.10))
+
+    if bool(signal_row.get("b1_weak_rebound_top", 0)):
+        if stage == 0:
+            return _partial("b1_weak_rebound_tp1", _b1_sell_fraction_target(meta, 0.30, floor=0.10))
+        if stage in {1, 2} and weak_rebound_count >= 2:
+            return _partial(f"b1_weak_rebound_tp{stage + 1}", _b1_sell_fraction_target(meta, 0.30, floor=0.10))
+
+    score_tp1 = _b1_exit_score(signal_row, "tp1")
+    score_tp2 = _b1_exit_score(signal_row, "tp2")
+    score_tp3 = _b1_exit_score(signal_row, "tp3")
+    score_tail = _b1_exit_score(signal_row, "tail")
+
+    if stage == 0 and days_since_confirm >= 1 and mfe_since_entry >= 0.06 and pd.notna(score_tp1) and score_tp1 >= B1_EXIT_MODEL_THRESHOLDS["tp1"]:
+        return _partial("b1_model_tp1", _b1_sell_fraction_target(meta, 0.30, floor=0.10))
+    if stage == 1 and bars_since_last_sell >= 1 and mfe_since_entry >= 0.10 and pd.notna(score_tp2) and score_tp2 >= B1_EXIT_MODEL_THRESHOLDS["tp2"]:
+        return _partial("b1_model_tp2", _b1_sell_fraction_target(meta, 0.30, floor=0.10))
+    if stage == 2 and bars_since_last_sell >= 1 and mfe_since_entry >= 0.14 and pd.notna(score_tp3) and score_tp3 >= B1_EXIT_MODEL_THRESHOLDS["tp3"]:
+        return _partial("b1_model_tp3", _b1_sell_fraction_target(meta, 0.30, floor=0.10))
+    if stage == 3 and pd.notna(score_tail) and score_tail >= B1_EXIT_MODEL_THRESHOLDS["tail"]:
+        return "full_exit", "b1_model_tail_exit", None, None
+    return "hold", "", None, None
 
 
 def _decide_exit_from_signal(
@@ -976,7 +1050,7 @@ def _decide_exit_from_signal(
         return True, "signal_missing"
     pattern = str(meta.get("pattern", ""))
     if pattern == "B1":
-        action, reason, _ = _decide_b1_position_action(signal_row, meta, signal_date=None)
+        action, reason, _, _ = _decide_b1_position_action(signal_row, meta, signal_date=None)
         return action == "full_exit", reason
     if bool(signal_row.get("exit_flag", 0)):
         return True, "signal_exit"
@@ -1166,7 +1240,7 @@ def simulate_pattern_backtest(
             score_value = float(meta.get("pending_exit_score", meta.get("last_score", meta.get("entry_score", 0.0))))
             if pending_action == "partial_exit":
                 next_stage = int(meta.get("pending_exit_next_stage", meta.get("position_stage", 0)))
-                target_remaining_ratio = _b1_stage_target_ratio(next_stage)
+                target_remaining_ratio = float(meta.get("pending_exit_target_ratio", _b1_stage_target_ratio(next_stage)) or 0.0)
                 initial_shares = int(meta.get("initial_shares", meta.get("shares", 0)))
                 target_remaining_shares = max(int(round(initial_shares * target_remaining_ratio)), 0)
                 sell_shares = max(int(meta.get("shares", 0)) - target_remaining_shares, 0)
@@ -1192,12 +1266,13 @@ def simulate_pattern_backtest(
                     ledger_rows.append(ledger_row)
                     executed_sell_symbols.append(code)
                     meta["shares"] = int(meta.get("shares", 0)) - sell_shares
-                    meta["position_stage"] = next_stage
-                    if str(meta.get("pending_exit_reason", "")).startswith("b1_soft_exit"):
-                        meta["last_soft_exit_signal_date"] = str(meta.get("pending_exit_signal_date", ""))
+                    meta["last_reduction_date"] = trade_date
+                    meta["bars_since_last_sell"] = 0
+                    meta = _b1_refresh_position_stage(meta)
                 meta.pop("pending_exit_action", None)
                 meta.pop("pending_exit_reason", None)
                 meta.pop("pending_exit_next_stage", None)
+                meta.pop("pending_exit_target_ratio", None)
                 meta.pop("pending_exit_signal_date", None)
                 meta.pop("pending_exit_score", None)
                 holdings[code] = meta
@@ -1276,7 +1351,11 @@ def simulate_pattern_backtest(
                 if add_shares <= 0:
                     meta["b1_phase"] = "confirmed"
                     meta["position_ratio"] = target_ratio
-                    holdings[code] = meta
+                    meta["confirm_date"] = trade_date
+                    meta["days_since_confirm"] = 0
+                    meta["last_reduction_date"] = None
+                    meta["bars_since_last_sell"] = 0
+                    holdings[code] = _b1_refresh_position_stage(meta)
                     continue
                 add_amount = add_shares * buy_price
                 add_fee = _trade_cost(add_amount, open_cost, min_cost)
@@ -1303,9 +1382,13 @@ def simulate_pattern_backtest(
                 meta["buy_price"] = weighted_buy_price
                 meta["position_ratio"] = target_ratio
                 meta["b1_phase"] = "confirmed"
+                meta["confirm_date"] = trade_date
+                meta["days_since_confirm"] = 0
+                meta["last_reduction_date"] = None
+                meta["bars_since_last_sell"] = 0
                 meta["last_buy_date"] = trade_date
                 meta["entry_score"] = max(float(meta.get("entry_score", 0.0)), _read_priority_score(previous_signal_df, code, float(meta.get("entry_score", 0.0))))
-                holdings[code] = meta
+                holdings[code] = _b1_refresh_position_stage(meta)
                 pre_open_buy_codes.append(code)
 
         candidate_df = _select_candidates(previous_signal_df, mode, set(keep_codes), blocked_codes=blocked_symbols)
@@ -1374,10 +1457,9 @@ def simulate_pattern_backtest(
             )
             executed_sell_symbols.append(code)
             meta["shares"] = int(meta.get("shares", 0)) - sell_shares
-            meta["position_stage"] = int(order.get("next_stage", meta.get("position_stage", 0)))
-            if str(order.get("reason", "")).startswith("b1_soft_exit"):
-                meta["last_soft_exit_signal_date"] = pd.Timestamp(order.get("signal_date")).date().isoformat() if order.get("signal_date") is not None else ""
-            holdings[code] = meta
+            meta["last_reduction_date"] = trade_date
+            meta["bars_since_last_sell"] = 0
+            holdings[code] = _b1_refresh_position_stage(meta)
 
         for code in sell_codes:
             meta = holdings.pop(code)
@@ -1485,7 +1567,6 @@ def simulate_pattern_backtest(
                 "initial_shares": tentative_shares,
                 "position_stage": 0,
                 "b1_phase": "probe" if mode == "B1" else "confirmed",
-                "last_soft_exit_signal_date": "",
                 "buy_date": trade_date,
                 "last_buy_date": trade_date,
                 "signal_date": previous_signal_date,
@@ -1501,6 +1582,10 @@ def simulate_pattern_backtest(
                 "entry_score": _read_priority_score(previous_signal_df, code, 0.0),
                 "position_ratio": float(b1_buy_plan_map.get(code, {}).get("target_ratio", 0.0)) if mode == "B1" else 0.0,
                 "base_position_ratio": float(_resolve_b1_position_ratio(user_module, previous_signal_df.loc[code])) if mode == "B1" and code in previous_signal_df.index else 0.0,
+                "confirm_date": None if mode == "B1" else trade_date,
+                "days_since_confirm": 0,
+                "last_reduction_date": None,
+                "bars_since_last_sell": 0,
                 "hold_days": 1,
                 "last_close": float(row.get("close", buy_price)),
                 "max_high_since_entry": float(row.get("high", buy_price)),
@@ -1524,6 +1609,14 @@ def simulate_pattern_backtest(
                 )
             if pd.Timestamp(meta.get("buy_date")).normalize() != trade_date:
                 meta["hold_days"] = int(meta.get("hold_days", 0)) + 1
+            if str(meta.get("pattern", "")) == "B1" and str(meta.get("b1_phase", "confirmed")) == "confirmed":
+                confirm_date = meta.get("confirm_date")
+                if confirm_date is not None and pd.Timestamp(confirm_date).normalize() != trade_date:
+                    meta["days_since_confirm"] = int(meta.get("days_since_confirm", 0)) + 1
+                last_reduction_date = meta.get("last_reduction_date")
+                if last_reduction_date is not None and pd.Timestamp(last_reduction_date).normalize() != trade_date:
+                    meta["bars_since_last_sell"] = int(meta.get("bars_since_last_sell", 0)) + 1
+                meta = _b1_refresh_position_stage(meta)
             holdings[code] = meta
 
         if mode == "B1":
@@ -1534,8 +1627,9 @@ def simulate_pattern_backtest(
                 if str(meta.get("b1_phase", "confirmed")) == "probe":
                     action, sell_reason = _decide_b1_probe_action(signal_row, meta)
                     next_stage = None
+                    target_remaining_ratio = None
                 else:
-                    action, sell_reason, next_stage = _decide_b1_position_action(
+                    action, sell_reason, next_stage, target_remaining_ratio = _decide_b1_position_action(
                         signal_row,
                         meta,
                         signal_date=trade_date,
@@ -1548,6 +1642,7 @@ def simulate_pattern_backtest(
                     meta["pending_exit_action"] = action
                     meta["pending_exit_reason"] = sell_reason or "signal_exit"
                     meta["pending_exit_next_stage"] = int(next_stage or 0)
+                    meta["pending_exit_target_ratio"] = float(target_remaining_ratio) if target_remaining_ratio is not None else None
                     meta["pending_exit_signal_date"] = trade_date.date().isoformat()
                     meta["pending_exit_score"] = _read_priority_score(execution_df, code, float(meta.get("last_score", meta.get("entry_score", 0.0))))
                     holdings[code] = meta
@@ -1557,7 +1652,7 @@ def simulate_pattern_backtest(
                 raw_sell_price = float(row.get("close", meta.get("last_close", meta.get("buy_price", 0.0)))) if row is not None else float(meta.get("last_close", meta.get("buy_price", 0.0)))
                 score_value = _read_priority_score(execution_df, code, float(meta.get("last_score", meta.get("entry_score", 0.0))))
                 if action == "partial_exit":
-                    target_remaining_ratio = _b1_stage_target_ratio(int(next_stage or 0))
+                    target_remaining_ratio = float(target_remaining_ratio if target_remaining_ratio is not None else _b1_stage_target_ratio(int(next_stage or meta.get("position_stage", 0))))
                     initial_shares = int(meta.get("initial_shares", meta.get("shares", 0)))
                     target_remaining_shares = max(int(round(initial_shares * target_remaining_ratio)), 0)
                     sell_shares = max(int(meta.get("shares", 0)) - target_remaining_shares, 0)
@@ -1584,10 +1679,9 @@ def simulate_pattern_backtest(
                     ledger_rows.append(ledger_row)
                     executed_sell_symbols.append(code)
                     meta["shares"] = int(meta.get("shares", 0)) - sell_shares
-                    meta["position_stage"] = int(next_stage or meta.get("position_stage", 0))
-                    if str(sell_reason or "").startswith("b1_soft_exit"):
-                        meta["last_soft_exit_signal_date"] = trade_date.date().isoformat()
-                    holdings[code] = meta
+                    meta["last_reduction_date"] = trade_date
+                    meta["bars_since_last_sell"] = 0
+                    holdings[code] = _b1_refresh_position_stage(meta)
                     if int(meta.get("shares", 0)) <= 0:
                         holdings.pop(code, None)
                 else:
