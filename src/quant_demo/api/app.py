@@ -96,7 +96,8 @@ class DemoApiHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/api/bootstrap", "/api/dashboard"}:
             profile = query.get("profile", ["backtest"])[0]
             config_path = query.get("config", [self.config_path])[0]
-            self._json(build_dashboard_payload(profile=profile, config_path=config_path))
+            pattern_report_dir = query.get("pattern_report_dir", [""])[0] or None
+            self._json(build_dashboard_payload(profile=profile, config_path=config_path, pattern_report_dir=pattern_report_dir))
             return
         if parsed.path == "/api/logs":
             self._json({"logs": load_runtime_logs()})

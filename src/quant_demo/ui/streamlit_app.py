@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,14 +39,20 @@ USER_PATTERN_OPTIONS = {
     "形态策略 B1": "B1",
     "形态策略 B2": "B2",
     "形态策略 B3": "B3",
-    "三策略对比": "ALL",
+    "形态策略 砖型图": "BRICK",
+    "四策略对比": "ALL",
 }
+PATTERN_COMPARE_MODES = ["B1", "B2", "B3", "BRICK"]
 USER_PATTERN_REPORT_DIR = ROOT / "data" / "reports" / "user_pattern_backtests"
 USER_PATTERN_STRATEGY_FILE = ROOT / "strategy" / "strategy.py"
 UI_RUNTIME = ROOT / "runtime" / "ui_runtime"
 DEMO_LOG_DIR = ROOT / "runtime" / "demo_logs"
 SEVERITY_COLORS = {"critical": "#b91c1c", "warning": "#d97706", "info": "#0f766e"}
 MODE_COLORS = {"backtest": "#1d4ed8", "paper": "#d97706", "live": "#0f766e"}
+BACKTEST_PROGRESS_RE = re.compile(
+    r"\[(?P<mode>[^\]]+)\]\s+backtest\s+(?P<current>\d+)/(?P<total>\d+)\s+date=(?P<date>\S+)\s+hold=(?P<hold>\d+)\s+buy=(?P<buy>\d+)\s+sell=(?P<sell>\d+)"
+)
+BACKTEST_PHASE_RE = re.compile(r"\[(?P<mode>[^\]]+)\]\s+backtest\s+(?P<current>\d+)/(?P<total>\d+)(?:\s+phase=(?P<phase>.+))?")
 
 
 @dataclass(slots=True)
@@ -307,12 +314,89 @@ def build_qlib_runtime_config() -> Path:
     return config_path
 
 
+def _parse_live_progress(line: str) -> tuple[int, str] | None:
+    stripped = str(line or "").strip()
+    match = BACKTEST_PROGRESS_RE.search(stripped)
+    if match is not None:
+        total = max(int(match.group("total")), 1)
+        current = min(int(match.group("current")), total)
+        percent = int(current * 100 / total)
+        text = (
+            f"{match.group('mode')} 回测进度 {current}/{total} | "
+            f"日期 {match.group('date')} | 持仓 {match.group('hold')} | "
+            f"买入 {match.group('buy')} | 卖出 {match.group('sell')}"
+        )
+        return percent, text
+    phase_match = BACKTEST_PHASE_RE.search(stripped)
+    if phase_match is None:
+        return None
+    total = max(int(phase_match.group("total")), 1)
+    current = min(int(phase_match.group("current")), total)
+    percent = int(current * 100 / total)
+    phase = str(phase_match.group("phase") or "执行中").strip()
+    return percent, f"{phase_match.group('mode')} 回测进度 {current}/{total} | {phase}"
+
+
 def run_cmd(script_name: str, args: list[str]) -> dict[str, Any]:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
     cmd = [sys.executable, script_name, *args]
-    done = subprocess.run(cmd, cwd=ROOT, capture_output=True, check=False, env=env)
-    return {"command": " ".join(cmd), "stdout": _decode(done.stdout).strip(), "stderr": _decode(done.stderr).strip(), "returncode": done.returncode, "ok": done.returncode == 0}
+    DEMO_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = DEMO_LOG_DIR / "ui.stdout.log"
+    command_text = " ".join(cmd)
+    progress_box = st.empty()
+    output_box = st.empty()
+    output_lines: list[str] = []
+    tail_lines: list[str] = []
+    progress_box.info(f"任务启动中: {script_name}")
+    process = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] $ {command_text}\n")
+        handle.flush()
+        while True:
+            raw_line = process.stdout.readline() if process.stdout is not None else ""
+            if not raw_line and process.poll() is not None:
+                break
+            if not raw_line:
+                time.sleep(0.1)
+                continue
+            line = raw_line.rstrip()
+            output_lines.append(line)
+            tail_lines.append(line)
+            if len(tail_lines) > 80:
+                tail_lines = tail_lines[-80:]
+            handle.write(line + "\n")
+            handle.flush()
+            progress_payload = _parse_live_progress(line)
+            if progress_payload is not None:
+                percent, text = progress_payload
+                progress_box.progress(percent, text=text)
+            output_box.code("\n".join(tail_lines), language="text")
+    returncode = process.wait()
+    if process.stdout is not None:
+        process.stdout.close()
+    if returncode == 0:
+        progress_box.progress(100, text=f"{script_name} 执行完成")
+    else:
+        progress_box.error(f"{script_name} 执行失败，返回码 {returncode}")
+    return {
+        "command": command_text,
+        "stdout": "\n".join(output_lines).strip(),
+        "stderr": "",
+        "returncode": returncode,
+        "ok": returncode == 0,
+    }
 
 
 def run_action(action: str, payload: dict[str, Any]) -> None:
@@ -418,7 +502,7 @@ def run_user_pattern_action(run_all: bool) -> None:
     ensure_user_pattern_state()
     config_path = build_user_pattern_runtime_config()
     selected = USER_PATTERN_OPTIONS[st.session_state["user_pattern_label"]]
-    modes = ["B1", "B2", "B3"] if run_all or selected == "ALL" else [selected]
+    modes = PATTERN_COMPARE_MODES if run_all or selected == "ALL" else [selected]
     result = run_cmd(
         "scripts/run_user_pattern_backtests.py",
         [
@@ -430,6 +514,7 @@ def run_user_pattern_action(run_all: bool) -> None:
             "--max-holdings", str(int(st.session_state["user_pattern_max_holdings"])),
             "--risk-degree", str(float(st.session_state["user_pattern_risk_degree"])),
             "--max-holding-days", str(int(st.session_state["user_pattern_max_holding_days"])),
+            "--progress",
             "--modes", *modes,
             "--output-dir", str(USER_PATTERN_REPORT_DIR),
         ],
@@ -443,7 +528,7 @@ def run_user_pattern_action(run_all: bool) -> None:
 def render_user_pattern_panel() -> None:
     artifacts = load_user_pattern_results(str(USER_PATTERN_REPORT_DIR))
     summary = artifacts["summary"]
-    st.markdown('<div class="panel-title">Pattern Research</div><div class="panel-subtitle">Run B1, B2, B3 individually or compare all three equity curves.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="panel-title">Pattern Research</div><div class="panel-subtitle">Run B1, B2, B3, 砖型图 individually or compare all equity curves.</div>', unsafe_allow_html=True)
     st.markdown('<div class="control">', unsafe_allow_html=True)
     st.caption(f"Report Dir: {artifacts['base_dir']}")
     if summary.empty:
@@ -456,23 +541,28 @@ def render_user_pattern_panel() -> None:
     html_path = Path(artifacts["html_path"])
     if html_path.exists():
         st.caption(f"Interactive HTML: {html_path}")
+    result = st.session_state.get("last_user_pattern_result")
+    if result:
+        with st.expander("查看形态回测任务输出", expanded=not result.get("ok")):
+            st.code(result.get("command", ""), language="bash")
+            st.text(result.get("stdout") or result.get("stderr") or "无输出")
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 def render_pattern_overview() -> None:
-    """在首页主看板直接展示三策略收益曲线。"""
+    """在首页主看板直接展示形态策略收益曲线。"""
     artifacts = load_user_pattern_results(str(USER_PATTERN_REPORT_DIR))
     summary = artifacts["summary"]
     comparison = artifacts["comparison"]
     st.markdown(
-        '<div class="panel-title">Pattern Equity Board</div><div class="panel-subtitle">B1, B2, B3 and benchmark equity curves directly on the main dashboard.</div>',
+        '<div class="panel-title">Pattern Equity Board</div><div class="panel-subtitle">B1, B2, B3, 砖型图 and benchmark equity curves directly on the main dashboard.</div>',
         unsafe_allow_html=True,
     )
     if comparison.empty:
         st.info("No pattern equity curve yet. Run a pattern backtest first.")
         return
 
-    view = comparison[comparison["series"].isin(["B1", "B2", "B3", "Benchmark"])].copy()
+    view = comparison[comparison["series"].isin([*PATTERN_COMPARE_MODES, "Benchmark"])].copy()
     if view.empty:
         st.info("Pattern comparison data is empty.")
         return
@@ -487,6 +577,7 @@ def render_pattern_overview() -> None:
             "B1": "#1d4ed8",
             "B2": "#d97706",
             "B3": "#0f766e",
+            "BRICK": "#b91c1c",
             "Benchmark": "#64748b",
         },
     )
@@ -504,7 +595,7 @@ def render_pattern_overview() -> None:
     if summary.empty:
         return
 
-    score = summary[summary["mode"].isin(["B1", "B2", "B3"])].copy()
+    score = summary[summary["mode"].isin(PATTERN_COMPARE_MODES)].copy()
     if score.empty:
         return
     score = score.sort_values("total_return", ascending=False)

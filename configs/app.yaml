@@ -22,8 +22,8 @@ qlib_source_dir: runtime/qlib_source
 qlib_provider_dir: runtime/qlib_data/cn_data
 qlib_dataset_dir: runtime/qlib_data/source
 qlib_region: cn
-qlib_benchmark: SH000300
-qlib_benchmark_symbol: 000300.SH
+qlib_benchmark: SH000852
+qlib_benchmark_symbol: 000852.SH
 qlib_n_drop: 1
 qlib_force_rebuild: false
 risk:

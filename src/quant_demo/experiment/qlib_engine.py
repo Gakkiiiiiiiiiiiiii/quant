@@ -44,11 +44,19 @@ class QlibBacktestEngine:
         self._ensure_qlib_importable()
 
     def run(self, initial_cash: Decimal) -> tuple[Path, EvaluationResult, pd.DataFrame]:
+        self._emit_progress(1, 5, "加载历史")
         history = self._load_history_with_benchmark()
+        self._emit_progress(2, 5, "重建 Qlib Provider")
         self._rebuild_provider(history)
+        self._emit_progress(3, 5, "构建信号")
         signal = self._build_signal_frame(history)
+        self._emit_progress(4, 5, "执行 Qlib 回测")
         report_normal, positions_normal = self._run_backtest(signal, float(initial_cash))
+        self._emit_progress(5, 5, "写入回测结果")
         return self._persist_results(report_normal, positions_normal, initial_cash)
+
+    def _emit_progress(self, current: int, total: int, phase: str) -> None:
+        print(f"[Qlib] backtest {current}/{total} phase={phase}", flush=True)
 
     def _load_history_with_benchmark(self) -> pd.DataFrame:
         gateway = create_gateway(self.app_settings)

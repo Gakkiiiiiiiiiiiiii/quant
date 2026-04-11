@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,9 @@ from quant_demo.core.config import AppSettings
 from quant_demo.marketdata.ingestion import history_metadata_path, load_history_dataframe, load_history_metadata, merge_history_frames
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def resolve_history_symbols(settings: AppSettings) -> list[str]:
     gateway = create_gateway(settings)
     quote_client = gateway.quote_client
@@ -20,7 +24,14 @@ def resolve_history_symbols(settings: AppSettings) -> list[str]:
         symbols = resolver(settings.symbols)
     else:
         symbols = [item for item in settings.symbols if item]
-    return sorted(dict.fromkeys(symbols))
+    resolved = sorted(dict.fromkeys(symbols))
+    LOGGER.info(
+        "已解析历史标的: count=%s sector=%s limit=%s",
+        len(resolved),
+        settings.history_universe_sector,
+        settings.history_universe_limit,
+    )
+    return resolved
 
 
 def history_status(settings: AppSettings) -> dict[str, Any]:
@@ -89,10 +100,23 @@ def refresh_history(settings: AppSettings, mode: str = "auto") -> dict[str, Any]
     quote_client = gateway.quote_client
     symbols = resolve_history_symbols(settings)
     history_path = Path(settings.history_parquet)
+    LOGGER.info(
+        "进入历史刷新: mode=%s history_path=%s symbols=%s source=%s",
+        mode,
+        history_path,
+        len(symbols),
+        settings.history_source,
+    )
 
     if not isinstance(quote_client, XtQuantQuoteClient):
         frame = quote_client.load_history(symbols, history_path)
         metadata = load_history_metadata(history_path)
+        LOGGER.info(
+            "本地历史加载完成: rows=%s symbols=%s latest=%s",
+            len(frame),
+            int(frame["symbol"].nunique()) if not frame.empty else 0,
+            str(frame["trading_date"].max()) if not frame.empty else "",
+        )
         return {
             "mode": "local",
             "row_count": len(frame),
@@ -103,6 +127,15 @@ def refresh_history(settings: AppSettings, mode: str = "auto") -> dict[str, Any]
 
     frame, details = quote_client.update_history(symbols, history_path, mode=mode)
     metadata = load_history_metadata(history_path)
+    LOGGER.info(
+        "QMT 历史刷新完成: selected_mode=%s rows=%s symbols=%s fetched_batches=%s fetched_rows=%s latest=%s",
+        details.get("mode", mode),
+        len(frame),
+        int(frame["symbol"].nunique()) if not frame.empty else 0,
+        details.get("fetched_batches", 0),
+        details.get("fetched_rows", 0),
+        str(frame["trading_date"].max()) if not frame.empty else "",
+    )
     return {
         "mode": details.get("mode", mode),
         "row_count": len(frame),

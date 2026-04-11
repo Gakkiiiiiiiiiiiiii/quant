@@ -97,6 +97,31 @@ class QmtBridgeClient:
         frame["trading_date"] = pd.to_datetime(frame["trading_date"]).dt.date
         return frame.sort_values(["trading_date", "symbol"]).reset_index(drop=True)
 
+    def get_financial_data(
+        self,
+        symbols: list[str],
+        tables: list[str],
+        start_time: str,
+        end_time: str,
+        report_type: str = "announce_time",
+    ) -> dict[str, Any]:
+        if not symbols or not tables:
+            return {}
+        payload = self._run(
+            "financial-data",
+            "--symbols",
+            ",".join(symbols),
+            "--tables",
+            ",".join(tables),
+            "--start-time",
+            start_time,
+            "--end-time",
+            end_time,
+            "--report-type",
+            report_type,
+        )
+        return payload.get("data", {})
+
     def get_account_snapshot(self) -> dict[str, Any]:
         return self._run("account")
 

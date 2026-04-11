@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,9 @@ from quant_demo.marketdata.ingestion import (
     write_history_dataframe,
     write_history_metadata,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class QuoteClient:
@@ -64,23 +69,52 @@ class XtQuantQuoteClient(QuoteClient):
         resolved_symbols = self.resolve_symbols(symbols)
         signature = self._history_signature(resolved_symbols)
         selected_mode = self._resolve_mode(output, signature, mode)
+        LOGGER.info(
+            "准备刷新 QMT 历史: requested_mode=%s selected_mode=%s output=%s symbols=%s start=%s end=%s",
+            mode,
+            selected_mode,
+            output,
+            len(resolved_symbols),
+            self.settings.history_start,
+            self.settings.history_end or "latest",
+        )
         if selected_mode == "cached":
+            LOGGER.info("命中历史缓存，直接复用: output=%s", output)
             return load_history_dataframe(output), {"mode": "cached", "fetched_batches": 0, "fetched_rows": 0}
         if selected_mode == "full":
             frame = self._fetch_history(resolved_symbols, self.settings.history_start, self.settings.history_end)
             write_history_dataframe(frame, output)
             write_history_metadata(output, {**signature, "row_count": len(frame), "cache_mode": "full"})
+            LOGGER.info(
+                "全量刷新写盘完成: output=%s rows=%s batches=%s",
+                output,
+                len(frame),
+                self._batch_count(resolved_symbols),
+            )
             return load_history_dataframe(output), {"mode": "full", "fetched_batches": self._batch_count(resolved_symbols), "fetched_rows": len(frame)}
 
         existing = load_history_dataframe(output)
         next_start = self._next_start_time(existing)
+        LOGGER.info(
+            "增量刷新准备完成: existing_rows=%s latest=%s next_start=%s",
+            len(existing),
+            str(existing["trading_date"].max()) if not existing.empty else "",
+            next_start,
+        )
         if self._range_finished(next_start, self.settings.history_end):
             write_history_metadata(output, {**signature, "row_count": len(existing), "cache_mode": "incremental"})
+            LOGGER.info("增量区间已结束，无需抓取: output=%s", output)
             return existing, {"mode": "incremental", "fetched_batches": 0, "fetched_rows": 0}
         incoming = self._fetch_history(resolved_symbols, next_start, self.settings.history_end)
         merged = merge_history_frames(existing, incoming)
         write_history_dataframe(merged, output)
         write_history_metadata(output, {**signature, "row_count": len(merged), "cache_mode": "incremental", "incremental_start": next_start})
+        LOGGER.info(
+            "增量刷新写盘完成: output=%s incoming_rows=%s merged_rows=%s",
+            output,
+            len(incoming),
+            len(merged),
+        )
         return load_history_dataframe(output), {"mode": "incremental", "fetched_batches": self._batch_count(resolved_symbols), "fetched_rows": len(incoming)}
 
     def resolve_symbols(self, symbols: list[str] | None = None) -> list[str]:
@@ -111,24 +145,57 @@ class XtQuantQuoteClient(QuoteClient):
 
     def _fetch_history(self, symbols: list[str], start_time: str, end_time: str) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
-        for batch in self._iter_batches(symbols):
+        batches = self._iter_batches(symbols)
+        total_batches = len(batches)
+        cumulative_rows = 0
+        LOGGER.info(
+            "开始抓取 QMT 历史批次: batches=%s batch_size=%s start=%s end=%s",
+            total_batches,
+            max(1, self.settings.history_batch_size),
+            start_time or self.settings.history_start,
+            end_time or "latest",
+        )
+        for index, batch in enumerate(batches, start=1):
             if not batch:
                 continue
-            frames.append(
-                self.bridge.get_history(
-                    symbols=batch,
-                    period=self.settings.history_period,
-                    start_time=start_time,
-                    end_time=end_time,
-                    dividend_type=self.settings.history_adjustment,
-                    fill_data=self.settings.history_fill_data,
-                )
+            started_at = time.perf_counter()
+            batch_frame = self.bridge.get_history(
+                symbols=batch,
+                period=self.settings.history_period,
+                start_time=start_time,
+                end_time=end_time,
+                dividend_type=self.settings.history_adjustment,
+                fill_data=self.settings.history_fill_data,
             )
+            elapsed = time.perf_counter() - started_at
+            batch_rows = len(batch_frame)
+            cumulative_rows += batch_rows
+            batch_latest = str(batch_frame["trading_date"].max()) if not batch_frame.empty else ""
+            batch_earliest = str(batch_frame["trading_date"].min()) if not batch_frame.empty else ""
+            LOGGER.info(
+                "QMT 历史批次进度: %s/%s symbols=%s rows=%s cumulative_rows=%s earliest=%s latest=%s elapsed=%.2fs",
+                index,
+                total_batches,
+                len(batch),
+                batch_rows,
+                cumulative_rows,
+                batch_earliest,
+                batch_latest,
+                elapsed,
+            )
+            frames.append(batch_frame)
         if not frames:
             return pd.DataFrame(columns=["trading_date", "symbol", "open", "high", "low", "close", "volume", "amount"])
         frame = pd.concat(frames, ignore_index=True)
         frame["trading_date"] = pd.to_datetime(frame["trading_date"]).dt.date
         frame = frame[pd.to_datetime(frame["trading_date"]).dt.dayofweek < 5]
+        LOGGER.info(
+            "QMT 历史抓取汇总完成: raw_rows=%s filtered_rows=%s earliest=%s latest=%s",
+            cumulative_rows,
+            len(frame),
+            str(frame["trading_date"].min()) if not frame.empty else "",
+            str(frame["trading_date"].max()) if not frame.empty else "",
+        )
         return frame.sort_values(["trading_date", "symbol"]).reset_index(drop=True)
 
     def _resolve_mode(self, output_path: Path, signature: dict[str, Any], requested_mode: str) -> str:

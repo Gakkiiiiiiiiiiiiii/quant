@@ -33,14 +33,25 @@ STRATEGIES = {
     "股票打分": ROOT / "configs" / "strategy" / "stock_ranking.yaml",
     "第一版策略": ROOT / "configs" / "strategy" / "first_alpha_v1.yaml",
     "聚宽风格": ROOT / "configs" / "strategy" / "joinquant_style.yaml",
+    "聚宽微盘 Alpha": ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml",
 }
 USER_PATTERN_OPTIONS = {
     "形态策略 B1": "B1",
     "形态策略 B2": "B2",
     "形态策略 B3": "B3",
-    "三策略对比": "ALL",
+    "形态策略 砖型图": "BRICK",
+    "四策略对比": "ALL",
 }
+PATTERN_COMPARE_MODES = ["B1", "B2", "B3", "BRICK"]
+PATTERN_STRATEGY_META = {
+    "B1": ("b1", "形态策略 B1"),
+    "B2": ("b2", "形态策略 B2"),
+    "B3": ("b3", "形态策略 B3"),
+    "BRICK": ("brick", "形态策略 砖型图"),
+}
+REPORTS_ROOT = ROOT / "data" / "reports"
 USER_PATTERN_REPORT_DIR = ROOT / "data" / "reports" / "user_pattern_backtests"
+DEFAULT_PATTERN_REPORT_DIR_NAME = "user_pattern_backtests_b1sample_cover20230101_20260328"
 USER_PATTERN_STRATEGY_FILE = ROOT / "strategy" / "strategy.py"
 UI_RUNTIME = ROOT / "runtime" / "ui_runtime"
 DEMO_LOG_DIR = ROOT / "runtime" / "demo_logs"
@@ -57,6 +68,20 @@ class DashboardData:
     rules: pd.DataFrame
     report_text: str
     benchmark_curve: pd.DataFrame
+
+
+def _empty_dashboard_data() -> DashboardData:
+    return DashboardData(
+        assets=pd.DataFrame(),
+        positions=pd.DataFrame(),
+        orders=pd.DataFrame(),
+        trades=pd.DataFrame(),
+        risk=pd.DataFrame(),
+        audit=pd.DataFrame(),
+        rules=pd.DataFrame(),
+        report_text="暂无日终报告。",
+        benchmark_curve=pd.DataFrame(),
+    )
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -86,9 +111,13 @@ def _tail(path: Path | None, lines: int = 80) -> str:
     return "\n".join(text.splitlines()[-lines:]) or "日志为空。"
 
 
-def _report_path(report_dir: str) -> Path:
+def _report_root(report_dir: str) -> Path:
     path = Path(report_dir)
-    return (ROOT / path if not path.is_absolute() else path) / "daily_report.md"
+    return ROOT / path if not path.is_absolute() else path
+
+
+def _report_path(report_dir: str) -> Path:
+    return _report_root(report_dir) / "daily_report.md"
 
 
 def _sql(connection, query: str, dates: list[str] | None = None) -> pd.DataFrame:
@@ -173,6 +202,159 @@ def _to_decimal(value: Any) -> Decimal | None:
     return Decimal(str(number))
 
 
+def _format_money_text(value: Any) -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "--"
+    return f"{number:,.2f}"
+
+
+def _format_ratio_text(value: Any) -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "--"
+    return f"{number * 100:.2f}%"
+
+
+def _build_joinquant_microcap_report_text(
+    summary: dict[str, Any],
+    equity: pd.DataFrame,
+    trades: pd.DataFrame,
+) -> str:
+    latest = equity.iloc[-1] if not equity.empty else {}
+    benchmark_return = None
+    benchmark_label = str(summary.get("benchmark_name") or summary.get("benchmark_symbol") or "Benchmark")
+    if not equity.empty and "benchmark_equity" in equity.columns:
+        benchmark_start = _safe_float(equity.iloc[0].get("benchmark_equity"))
+        benchmark_end = _safe_float(latest.get("benchmark_equity"))
+        if benchmark_start:
+            benchmark_return = (benchmark_end - benchmark_start) / benchmark_start
+    lines = [
+        "# 聚宽微盘 Alpha 回测报告",
+        "",
+        f"策略标识: {summary.get('strategy', 'joinquant_microcap_alpha')}",
+        f"回测区间: {summary.get('history_start', '--')} 至 {summary.get('history_end', '--')}",
+        f"期末权益: {_format_money_text(latest.get('equity'))}",
+        f"期末现金: {_format_money_text(latest.get('cash'))}",
+        f"总收益: {_format_ratio_text(summary.get('total_return'))}",
+        f"年化收益: {_format_ratio_text(summary.get('annualized_return'))}",
+        f"最大回撤: {_format_ratio_text(summary.get('max_drawdown'))}",
+        f"累计换手: {_format_money_text(summary.get('turnover'))}",
+        f"回测基准: {benchmark_label}",
+        f"基准收益: {_format_ratio_text(benchmark_return)}",
+        f"成交笔数: {len(trades)}",
+    ]
+    hedge_symbol = str(summary.get("hedge_symbol") or "").strip()
+    if hedge_symbol:
+        lines.extend(
+            [
+                f"月历对冲: {summary.get('hedge_name') or hedge_symbol}",
+                f"弱势月对冲表: {summary.get('seasonal_hedge_schedule') or {}}",
+            ]
+        )
+    execution_assumptions = summary.get("execution_assumptions")
+    if isinstance(execution_assumptions, dict) and execution_assumptions:
+        lines.extend(
+            [
+                "",
+                "## 成交假设",
+                f"- 买入滑点: {execution_assumptions.get('buy_slippage_bps', '--')} bps",
+                f"- 卖出滑点: {execution_assumptions.get('sell_slippage_bps', '--')} bps",
+                f"- 单日成交上限: 过去20日平均成交量的 {execution_assumptions.get('max_trade_volume_ratio_pct', '--')}%",
+            ]
+        )
+    known_limitations = summary.get("known_limitations")
+    if isinstance(known_limitations, list) and known_limitations:
+        lines.extend(["", "## 已知限制"])
+        lines.extend(f"- {item}" for item in known_limitations)
+    return "\n".join(lines)
+
+
+def _load_joinquant_microcap_report(report_dir: str) -> DashboardData | None:
+    report_root = _report_root(report_dir)
+    summary_path = report_root / "joinquant_microcap_summary.json"
+    equity_path = report_root / "joinquant_microcap_equity.csv"
+    trade_path = report_root / "joinquant_microcap_trades.csv"
+    if not equity_path.exists():
+        return None
+
+    try:
+        equity = pd.read_csv(equity_path)
+    except Exception:
+        return None
+    if equity.empty or "equity" not in equity.columns:
+        return None
+
+    if "trading_date" in equity.columns:
+        equity["trading_date"] = pd.to_datetime(equity["trading_date"], errors="coerce")
+
+    assets = equity.rename(columns={"trading_date": "snapshot_time", "equity": "total_asset"}).copy()
+    assets["account_id"] = "joinquant_microcap_alpha"
+    if {"total_asset", "cash"}.issubset(assets.columns):
+        assets["market_value"] = pd.to_numeric(assets["total_asset"], errors="coerce") - pd.to_numeric(assets["cash"], errors="coerce")
+    if "total_pnl" not in assets.columns:
+        start_asset = _safe_float(assets.iloc[0].get("total_asset"))
+        assets["total_pnl"] = pd.NA
+        if start_asset is not None:
+            assets["total_pnl"] = pd.to_numeric(assets["total_asset"], errors="coerce") - start_asset
+
+    benchmark_curve = pd.DataFrame()
+    if {"trading_date", "benchmark_equity"}.issubset(equity.columns):
+        benchmark_curve = equity[["trading_date", "benchmark_equity"]].copy()
+
+    trades = pd.DataFrame()
+    if trade_path.exists():
+        try:
+            trades = pd.read_csv(trade_path)
+            if "trading_date" in trades.columns:
+                trades["trading_date"] = pd.to_datetime(trades["trading_date"], errors="coerce")
+        except Exception:
+            trades = pd.DataFrame()
+
+    orders = pd.DataFrame()
+    if not trades.empty:
+        orders = trades.rename(
+            columns={
+                "trading_date": "created_at",
+                "shares": "qty",
+                "price": "avg_price",
+            }
+        ).copy()
+        orders["updated_at"] = orders["created_at"]
+        orders["filled_qty"] = orders["qty"]
+        orders["status"] = "filled"
+        orders["order_id"] = range(1, len(orders) + 1)
+
+    summary: dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                summary = payload
+        except Exception:
+            summary = {}
+
+    report_text = _build_joinquant_microcap_report_text(summary, equity, trades)
+    return DashboardData(
+        assets=assets,
+        positions=pd.DataFrame(),
+        orders=orders,
+        trades=trades,
+        risk=pd.DataFrame(),
+        audit=pd.DataFrame(),
+        rules=pd.DataFrame(),
+        report_text=report_text,
+        benchmark_curve=benchmark_curve,
+    )
+
+
+def _is_joinquant_microcap_dashboard(data: DashboardData) -> bool:
+    if data.assets.empty or "account_id" not in data.assets.columns:
+        return False
+    account_id = str(data.assets.iloc[-1].get("account_id") or "")
+    return account_id == "joinquant_microcap_alpha"
+
+
 def resolve_profile_path(profile: str) -> Path:
     key = (profile or "backtest").strip().lower()
     return CONFIGS.get(key, CONFIGS["backtest"])
@@ -189,6 +371,9 @@ def resolve_settings(profile: str = "backtest", config_path: str | None = None) 
 
 
 def load_dashboard_data(database_url: str, report_dir: str) -> DashboardData:
+    microcap_data = _load_joinquant_microcap_report(report_dir)
+    if microcap_data is not None:
+        return microcap_data
     engine = create_engine(database_url, future=True)
     with engine.connect() as conn:
         assets = _sql(
@@ -203,22 +388,22 @@ def load_dashboard_data(database_url: str, report_dir: str) -> DashboardData:
         )
         orders = _sql(
             conn,
-            "select order_id,broker_order_id,symbol,side,qty,filled_qty,status,avg_price,created_at,updated_at from orders order by created_at desc",
+            "select order_id,broker_order_id,symbol,side,qty,filled_qty,status,avg_price,created_at,updated_at from orders order by created_at desc limit 500",
             ["created_at", "updated_at"],
         )
         trades = _sql(
             conn,
-            "select trade_id,order_id,symbol,side,fill_qty,fill_price,commission,trade_time from trades order by trade_time desc",
+            "select trade_id,order_id,symbol,side,fill_qty,fill_price,commission,trade_time from trades order by trade_time desc limit 500",
             ["trade_time"],
         )
         risk = _sql(
             conn,
-            "select risk_decision_id,order_intent_id,status,rule_results,decided_at from risk_decisions order by decided_at desc",
+            "select risk_decision_id,order_intent_id,status,rule_results,decided_at from risk_decisions order by decided_at desc limit 500",
             ["decided_at"],
         )
         audit = _sql(
             conn,
-            "select audit_log_id,object_type,object_id,message,payload,created_at from audit_logs order by created_at desc",
+            "select audit_log_id,object_type,object_id,message,payload,created_at from audit_logs order by created_at desc limit 500",
             ["created_at"],
         )
     report_file = _report_path(report_dir)
@@ -254,9 +439,11 @@ def overview(data: DashboardData) -> dict[str, Any]:
     total_asset = float(latest["total_asset"]) if latest is not None else None
     cash = float(latest["cash"]) if latest is not None else None
     turnover = float(latest["turnover"]) if latest is not None else None
-    drawdown = float(latest["max_drawdown"]) if latest is not None else None
-    market_value = float(data.positions["market_value"].sum()) if not data.positions.empty else 0.0
-    unrealized_pnl = float(data.positions["unrealized_pnl"].sum()) if not data.positions.empty else 0.0
+    drawdown = float(pd.to_numeric(data.assets["max_drawdown"], errors="coerce").min()) if not data.assets.empty and "max_drawdown" in data.assets.columns else (float(latest["max_drawdown"]) if latest is not None and "max_drawdown" in latest.index else None)
+    latest_market_value = _safe_float(latest["market_value"]) if latest is not None and "market_value" in latest.index else None
+    latest_total_pnl = _safe_float(latest["total_pnl"]) if latest is not None and "total_pnl" in latest.index else None
+    market_value = float(data.positions["market_value"].sum()) if not data.positions.empty else float(latest_market_value or 0.0)
+    unrealized_pnl = float(data.positions["unrealized_pnl"].sum()) if not data.positions.empty else float(latest_total_pnl or 0.0)
     total_return = None
     if not data.assets.empty:
         start_asset = float(data.assets.iloc[0]["total_asset"])
@@ -279,7 +466,13 @@ def overview(data: DashboardData) -> dict[str, Any]:
     }
 
 
-def connection_state(settings: AppSettings, probe: dict[str, Any] | None) -> dict[str, str]:
+def connection_state(settings: AppSettings, probe: dict[str, Any] | None, data: DashboardData | None = None) -> dict[str, str]:
+    if data is not None and _is_joinquant_microcap_dashboard(data):
+        return {
+            "label": "聚宽微盘回测视图",
+            "color": "#0f766e",
+            "detail": "当前页面展示 joinquant_microcap_alpha 的本地回测产物。",
+        }
     if settings.environment != Environment.LIVE:
         return {"label": "离线数据库视图", "color": "#64748b", "detail": "当前未连接 QMT，只展示历史数据。"}
     if not probe or probe.get("error"):
@@ -294,7 +487,7 @@ def connection_state(settings: AppSettings, probe: dict[str, Any] | None) -> dic
 
 def alerts(settings: AppSettings, info: dict[str, Any], data: DashboardData, probe: dict[str, Any] | None) -> list[dict[str, str]]:
     items = []
-    conn = connection_state(settings, probe)
+    conn = connection_state(settings, probe, data)
     items.append({"severity": "info" if conn["color"] == "#0f766e" else "warning", "title": conn["label"], "detail": conn["detail"]})
     if info["rejected"] > 0:
         items.append({"severity": "warning", "title": "存在风控拒绝", "detail": f"累计 {info['rejected']} 条风控拒绝，建议检查风控规则。"})
@@ -353,7 +546,7 @@ def build_qlib_runtime_payload(profile: str = "backtest", overrides: dict[str, A
 
 def build_pattern_defaults() -> dict[str, Any]:
     return {
-        "selection_label": "三策略对比",
+        "selection_label": "四策略对比",
         "start_date": "2023-01-01",
         "end_date": date.today().isoformat(),
         "account": 500000,
@@ -372,6 +565,61 @@ def _resolve_result_path(raw_path: str | None, base_dir: Path) -> str | None:
         return str(resolved.relative_to(ROOT.resolve())).replace("\\", "/")
     except ValueError:
         return str(resolved)
+
+
+def resolve_pattern_report_dir(raw_path: str | Path | None = None, *, require_summary: bool = True) -> Path:
+    if raw_path is None or str(raw_path).strip() == "":
+        candidate = USER_PATTERN_REPORT_DIR.resolve()
+    else:
+        path = Path(str(raw_path).strip())
+        if path.is_absolute():
+            candidate = path.resolve()
+        elif len(path.parts) == 1:
+            candidate = (REPORTS_ROOT / path).resolve()
+        else:
+            candidate = (ROOT / path).resolve()
+    root_resolved = ROOT.resolve()
+    if candidate != root_resolved and root_resolved not in candidate.parents:
+        raise ValueError(f"Pattern report dir is outside workspace: {candidate}")
+    if require_summary and not (candidate / "summary.json").exists():
+        raise FileNotFoundError(f"Pattern report summary.json not found: {candidate}")
+    return candidate
+
+
+def list_pattern_report_dirs() -> list[dict[str, Any]]:
+    candidates: list[Path] = []
+    if USER_PATTERN_REPORT_DIR.exists():
+        candidates.append(USER_PATTERN_REPORT_DIR.resolve())
+    if REPORTS_ROOT.exists():
+        for item in REPORTS_ROOT.iterdir():
+            if item.is_dir():
+                candidates.append(item.resolve())
+    seen: set[Path] = set()
+    rows: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        summary_path = candidate / "summary.json"
+        if not summary_path.exists():
+            continue
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        frame = pd.DataFrame(payload if isinstance(payload, list) else [payload])
+        if frame.empty or "mode" not in frame.columns:
+            continue
+        rows.append(
+            {
+                "label": candidate.name,
+                "value": workspace_relative(candidate),
+                "summary_count": int(len(frame)),
+                "updated_at": datetime.fromtimestamp(candidate.stat().st_mtime).isoformat(),
+            }
+        )
+    rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return rows
 
 
 def list_common_strategies_with_results(database_url: str) -> list[dict[str, Any]]:
@@ -423,15 +671,20 @@ def persist_pattern_backtest_results(database_url: str, summary_rows: list[dict[
     try:
         factory = create_session_factory(database_url)
         with session_scope(factory) as session:
-            strategy = session.scalar(select(CommonStrategyModel).where(CommonStrategyModel.strategy_key == "b1"))
-            if strategy is None:
-                strategy = CommonStrategyModel(strategy_key="b1", display_name="形态策略 B1", is_active=1)
-                session.add(strategy)
-                session.flush()
-            strategy.updated_at = datetime.utcnow()
             run_key = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            strategy_cache: dict[str, CommonStrategyModel] = {}
             for row in summary_rows:
                 mode = str(row.get("mode") or "B1")
+                strategy_key, display_name = PATTERN_STRATEGY_META.get(mode, (mode.lower(), f"形态策略 {mode}"))
+                strategy = strategy_cache.get(strategy_key)
+                if strategy is None:
+                    strategy = session.scalar(select(CommonStrategyModel).where(CommonStrategyModel.strategy_key == strategy_key))
+                    if strategy is None:
+                        strategy = CommonStrategyModel(strategy_key=strategy_key, display_name=display_name, is_active=1)
+                        session.add(strategy)
+                        session.flush()
+                    strategy_cache[strategy_key] = strategy
+                strategy.updated_at = datetime.utcnow()
                 session.add(
                     StrategyBacktestResultModel(
                         strategy_id=strategy.strategy_id,
@@ -586,9 +839,7 @@ def _load_pattern_frame(
 
 
 def load_user_pattern_results(report_dir: str | Path = USER_PATTERN_REPORT_DIR) -> dict[str, Any]:
-    base = Path(report_dir)
-    if not base.is_absolute():
-        base = ROOT / base
+    base = resolve_pattern_report_dir(report_dir, require_summary=False)
     summary_path = base / "summary.json"
     comparison_path = base / "equity_comparison.csv"
     summary = pd.DataFrame()
@@ -784,21 +1035,44 @@ def workspace_relative(path: str | Path) -> str:
     return str(resolved.relative_to(ROOT.resolve())).replace("\\", "/")
 
 
-def build_dashboard_payload(profile: str = "backtest", config_path: str | None = None) -> dict[str, Any]:
+def _default_pattern_report_dir_value(pattern_dir_options: list[dict[str, Any]]) -> str:
+    preferred_value = f"data/reports/{DEFAULT_PATTERN_REPORT_DIR_NAME}"
+    for option in pattern_dir_options:
+        if str(option.get("value") or "") == preferred_value:
+            return preferred_value
+    if not pattern_dir_options:
+        return ""
+    return str(pattern_dir_options[0].get("value") or "")
+
+
+def build_dashboard_payload(
+    profile: str = "backtest",
+    config_path: str | None = None,
+    pattern_report_dir: str | None = None,
+) -> dict[str, Any]:
     profile_key, resolved_config, settings = resolve_settings(profile, config_path)
-    data = load_dashboard_data(settings.database_url, settings.report_dir)
-    probe = load_live_probe(resolved_config, settings) if settings.environment == Environment.LIVE else {}
-    pattern = load_user_pattern_results(USER_PATTERN_REPORT_DIR)
+    pattern_dir_options = list_pattern_report_dirs()
+    default_pattern_dir = pattern_report_dir
+    if not default_pattern_dir and pattern_dir_options:
+        default_pattern_dir = _default_pattern_report_dir_value(pattern_dir_options)
+    try:
+        selected_pattern_dir = resolve_pattern_report_dir(default_pattern_dir, require_summary=False)
+    except Exception:
+        selected_pattern_dir = USER_PATTERN_REPORT_DIR.resolve()
+    pattern = load_user_pattern_results(selected_pattern_dir)
     pattern_summary = pattern["summary"].copy()
     pattern_comparison = pattern["comparison"].copy()
     pattern_actions = pattern["daily_actions"].copy()
     pattern_decisions = pattern["daily_decisions"].copy()
+    primary_record = _select_primary_pattern_record(pattern_summary)
+    data = load_dashboard_data(settings.database_url, settings.report_dir)
+    probe = load_live_probe(resolved_config, settings) if settings.environment == Environment.LIVE else {}
+    strategy_registry = list_common_strategies_with_results(settings.database_url)
     qlib_runtime = build_qlib_runtime_payload(profile_key)
     qlib_status = history_status(AppSettings.model_validate(qlib_runtime))
-    strategy_registry = list_common_strategies_with_results(settings.database_url)
 
     info = overview(data)
-    connection = connection_state(settings, probe)
+    connection = connection_state(settings, probe, data)
     alert_items = alerts(settings, info, data, probe)
     display_assets = data.assets
     display_positions = data.positions
@@ -810,7 +1084,6 @@ def build_dashboard_payload(profile: str = "backtest", config_path: str | None =
     display_report_text = data.report_text
     display_benchmark_curve = data.benchmark_curve
 
-    primary_record = _select_primary_pattern_record(pattern_summary)
     if primary_record is not None:
         primary_mode = str(primary_record.get("mode") or "B1")
         pattern_summary = _filter_pattern_frame(pattern_summary, "mode", {primary_mode})
@@ -821,18 +1094,8 @@ def build_dashboard_payload(profile: str = "backtest", config_path: str | None =
         pattern_report = _load_pattern_csv(pattern_base, primary_record.get("report_path"), date_columns=["datetime"])
         pattern_risk_raw = _load_pattern_csv(pattern_base, primary_record.get("risk_path"))
         pattern_risk = _build_pattern_risk_frame(pattern_risk_raw, primary_mode)
-        info = _build_pattern_overview(primary_record, pattern_report, pattern_actions)
-        connection = _build_pattern_connection(primary_record)
-        alert_items = _build_pattern_alerts(settings, info, primary_record)
-        display_assets = pattern_report
-        display_positions = pd.DataFrame()
-        display_orders = pd.DataFrame()
-        display_trades = pd.DataFrame()
         display_risk = pattern_risk
-        display_audit = pd.DataFrame()
         display_rules = pattern_risk
-        display_report_text = _build_pattern_report_text(primary_record, pattern_risk, pattern_actions)
-        display_benchmark_curve = _build_pattern_benchmark_curve(pattern_report)
 
     return {
         "profile": profile_key,
@@ -851,6 +1114,8 @@ def build_dashboard_payload(profile: str = "backtest", config_path: str | None =
         "pattern": {
             "defaults": build_pattern_defaults(),
             "options": USER_PATTERN_OPTIONS,
+            "report_dirs": pattern_dir_options,
+            "selected_report_dir": workspace_relative(selected_pattern_dir),
             "summary": _frame_records(pattern_summary),
             "comparison": _frame_records(pattern_comparison),
             "daily_actions": _frame_records(pattern_actions),
@@ -885,14 +1150,44 @@ def build_dashboard_payload(profile: str = "backtest", config_path: str | None =
 def run_cmd(script_name: str, args: list[str]) -> dict[str, Any]:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
     cmd = [sys.executable, script_name, *args]
-    done = subprocess.run(cmd, cwd=ROOT, capture_output=True, check=False, env=env)
+    DEMO_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = DEMO_LOG_DIR / "api.stdout.log"
+    process = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    output_lines: list[str] = []
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[{datetime.now().isoformat()}] $ {' '.join(cmd)}\n")
+        handle.flush()
+        while True:
+            raw_line = process.stdout.readline() if process.stdout is not None else ""
+            if not raw_line and process.poll() is not None:
+                break
+            if not raw_line:
+                continue
+            line = raw_line.rstrip()
+            output_lines.append(line)
+            handle.write(line + "\n")
+            handle.flush()
+    returncode = process.wait()
+    if process.stdout is not None:
+        process.stdout.close()
     return {
         "command": " ".join(cmd),
-        "stdout": _decode(done.stdout).strip(),
-        "stderr": _decode(done.stderr).strip(),
-        "returncode": done.returncode,
-        "ok": done.returncode == 0,
+        "stdout": "\n".join(output_lines).strip(),
+        "stderr": "",
+        "returncode": returncode,
+        "ok": returncode == 0,
     }
 
 
@@ -972,6 +1267,8 @@ def run_pattern_action(payload: dict[str, Any]) -> dict[str, Any]:
     run_all = bool(payload.get("run_all")) or selected == "ALL"
     start_date = str(payload.get("start_date") or defaults["start_date"])
     end_date = str(payload.get("end_date") or defaults["end_date"])
+    report_dir_value = payload.get("pattern_report_dir") or USER_PATTERN_REPORT_DIR
+    report_dir = resolve_pattern_report_dir(report_dir_value, require_summary=False)
     base_payload = _read_yaml(CONFIGS["backtest"])
     base_payload["app_name"] = "user-pattern-ui"
     base_payload["environment"] = "backtest"
@@ -983,7 +1280,7 @@ def run_pattern_action(payload: dict[str, Any]) -> dict[str, Any]:
     base_payload["history_end"] = end_date.replace("-", "")
     base_payload["history_universe_sector"] = "沪深京A股"
     base_payload["history_universe_limit"] = 0
-    base_payload["report_dir"] = "data/reports/user_pattern_backtests"
+    base_payload["report_dir"] = workspace_relative(report_dir)
     base_payload["qlib_provider_dir"] = "runtime/qlib_data/user_pattern_cn_data"
     base_payload["qlib_dataset_dir"] = "runtime/qlib_data/user_pattern_source"
     base_payload["qlib_force_rebuild"] = False
@@ -991,7 +1288,7 @@ def run_pattern_action(payload: dict[str, Any]) -> dict[str, Any]:
     UI_RUNTIME.mkdir(parents=True, exist_ok=True)
     config_path = UI_RUNTIME / "user_pattern_app.yaml"
     _write_yaml(config_path, base_payload)
-    modes = ["B1", "B2", "B3"] if run_all else [selected]
+    modes = PATTERN_COMPARE_MODES if run_all else [selected]
     result = run_cmd(
         "scripts/run_user_pattern_backtests.py",
         [
@@ -1011,17 +1308,19 @@ def run_pattern_action(payload: dict[str, Any]) -> dict[str, Any]:
             str(float(payload.get("risk_degree", defaults["risk_degree"]))),
             "--max-holding-days",
             str(int(payload.get("max_holding_days", defaults["max_holding_days"]))),
+            "--progress",
             "--modes",
             *modes,
             "--output-dir",
-            str(USER_PATTERN_REPORT_DIR),
+            str(report_dir),
         ],
     )
     result["action"] = "user-pattern-all" if run_all else "user-pattern-selected"
     result["selection_label"] = selection_label
-    if result.get("ok"):
+    database_url = str(base_payload.get("database_url") or "").strip()
+    if result.get("ok") and database_url:
         summary_path = USER_PATTERN_REPORT_DIR / "summary.json"
         if summary_path.exists():
             summary_rows = json.loads(summary_path.read_text(encoding="utf-8"))
-            persist_pattern_backtest_results(base_payload["database_url"], summary_rows, USER_PATTERN_REPORT_DIR)
+            persist_pattern_backtest_results(database_url, summary_rows, USER_PATTERN_REPORT_DIR)
     return result

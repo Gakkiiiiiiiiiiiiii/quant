@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from tqdm.auto import tqdm
 
 from _bootstrap import ROOT, SRC
 
@@ -18,6 +19,20 @@ from quant_demo.core.config import load_app_settings, load_strategy_settings
 from quant_demo.db.session import create_session_factory
 from quant_demo.experiment.evaluator import Evaluator
 from quant_demo.experiment.qlib_engine import QlibBacktestEngine
+
+
+PATTERN_ENTRY_COLUMNS = {
+    "B1": "b1",
+    "B2": "b2",
+    "B3": "b3",
+    "BRICK": "brick",
+}
+PATTERN_ENV_COLUMNS = {
+    "B1": "b1_env_ok",
+    "BRICK": "brick_env_ok",
+}
+DEFAULT_PATTERN_MODES = ["B1", "B2", "B3", "BRICK"]
+BRICK_REDUCE_FRACTION = 1.0 / 3.0
 
 
 def load_user_module(module_path: Path):
@@ -65,10 +80,12 @@ def configure_user_module(user_module, app_settings) -> None:
                 exit_now = True
             elif pattern == "B1":
                 exit_now = bool(row.get("b1_exit_flag", row.get("exit_flag", 0)))
+            elif pattern == "BRICK":
+                exit_now = bool(row.get("brick_sell_flag", row.get("exit_flag", 0)))
             else:
                 exit_now = bool(row.get("exit_flag", 0))
 
-            if row is not None and not exit_now and pattern != "B1":
+            if row is not None and not exit_now and pattern not in {"B1", "BRICK"}:
                 stop_price = meta.get("stop_price")
                 if stop_price is not None and float(row.get("close", float("inf"))) < float(stop_price):
                     exit_now = True
@@ -91,6 +108,8 @@ def configure_user_module(user_module, app_settings) -> None:
 
         if self.cfg.mode == "B1":
             candidate_df = candidate_df[candidate_df["b1"] == 1]
+        elif self.cfg.mode == "BRICK":
+            candidate_df = candidate_df[candidate_df["brick"] == 1]
         elif self.cfg.mode == "B2":
             candidate_df = candidate_df[candidate_df["b2"] == 1]
         elif self.cfg.mode == "B3":
@@ -570,6 +589,23 @@ def _empty_signal_frame(signal_frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(columns=signal_frame.columns).set_index(pd.Index([], name="instrument"))
 
 
+def _apply_mode_candidate_selector(user_module, mode: str, candidate_df: pd.DataFrame) -> pd.DataFrame:
+    if candidate_df.empty:
+        return candidate_df.copy()
+    if mode == "B1":
+        selector_name = "select_b1_probe_candidates" if _b1_use_probe_entry(user_module) else "select_b1_entry_candidates"
+        selector = getattr(user_module, selector_name, None)
+        if not callable(selector):
+            selector = getattr(user_module, "select_b1_probe_candidates", None)
+        if callable(selector):
+            return selector(candidate_df)
+        return candidate_df
+    selector = getattr(user_module, f"select_{mode.lower()}_entry_candidates", None)
+    if callable(selector):
+        return selector(candidate_df)
+    return candidate_df
+
+
 def _select_candidates(day_df: pd.DataFrame, mode: str, excluded_codes: set[str], blocked_codes: set[str] | None = None) -> pd.DataFrame:
     if day_df.empty:
         return day_df.copy()
@@ -577,14 +613,12 @@ def _select_candidates(day_df: pd.DataFrame, mode: str, excluded_codes: set[str]
     candidate_df = day_df.loc[day_df.index.difference(sorted(set(excluded_codes) | blocked))].copy()
     if "volume" in candidate_df.columns:
         candidate_df = candidate_df[candidate_df["volume"].fillna(0) > 0]
-    if mode == "B1":
-        candidate_df = candidate_df[candidate_df["b1"] == 1]
-        if "b1_env_ok" in candidate_df.columns:
-            candidate_df = candidate_df[candidate_df["b1_env_ok"] == 1]
-    elif mode == "B2":
-        candidate_df = candidate_df[candidate_df["b2"] == 1]
-    elif mode == "B3":
-        candidate_df = candidate_df[candidate_df["b3"] == 1]
+    signal_column = PATTERN_ENTRY_COLUMNS.get(mode)
+    if signal_column:
+        candidate_df = candidate_df[candidate_df[signal_column] == 1]
+        env_column = PATTERN_ENV_COLUMNS.get(mode)
+        if env_column and env_column in candidate_df.columns:
+            candidate_df = candidate_df[candidate_df[env_column] == 1]
     else:
         candidate_df = candidate_df[candidate_df["entry_flag"] == 1]
     if candidate_df.empty:
@@ -793,6 +827,10 @@ def _b1_counts_as_main_position(meta: dict[str, object] | None) -> bool:
     return int(meta.get("position_stage", 0)) == 0 and int(meta.get("shares", 0)) > 0
 
 
+def _b1_use_probe_entry(user_module) -> bool:
+    return bool(getattr(user_module, "B1_USE_PROBE_ENTRY", True))
+
+
 def _resolve_b1_position_ratio(user_module, row: pd.Series) -> float:
     helper = getattr(user_module, "resolve_b1_position_ratio", None)
     if callable(helper):
@@ -839,7 +877,11 @@ def _plan_b1_new_entries(
 ) -> list[dict[str, object]]:
     if candidate_df.empty:
         return []
-    selector = getattr(user_module, "select_b1_probe_candidates", None)
+    use_probe_entry = _b1_use_probe_entry(user_module)
+    selector_name = "select_b1_probe_candidates" if use_probe_entry else "select_b1_entry_candidates"
+    selector = getattr(user_module, selector_name, None)
+    if not callable(selector):
+        selector = getattr(user_module, "select_b1_probe_candidates", None)
     if callable(selector):
         candidate_df = selector(candidate_df)
     if candidate_df.empty:
@@ -863,7 +905,8 @@ def _plan_b1_new_entries(
         if symbol in keep_codes:
             continue
         row = candidate_df.loc[code]
-        target_ratio = max(_resolve_b1_probe_ratio(user_module, row), min_ratio)
+        target_ratio_base = _resolve_b1_probe_ratio(user_module, row) if use_probe_entry else _resolve_b1_position_ratio(user_module, row)
+        target_ratio = max(target_ratio_base, min_ratio)
         target_value = float(total_equity_before_buy) * target_ratio
         if target_value > remaining_value + 1e-6:
             continue
@@ -1040,6 +1083,27 @@ def _decide_b1_position_action(
     return "hold", "", None, None
 
 
+def _decide_brick_position_action(signal_row: pd.Series | None, meta: dict[str, object]) -> tuple[str, str, float | None]:
+    if signal_row is None:
+        return "full_exit", "signal_missing", None
+    if bool(signal_row.get("brick_sell_flag", 0)):
+        return "full_exit", "brick_red_to_green", None
+    if bool(signal_row.get("brick_reduce_flag", 0)) and not bool(meta.get("brick_reduced_on_four_red", False)):
+        return "partial_exit", "brick_four_red_reduce", float(BRICK_REDUCE_FRACTION)
+    return "hold", "", None
+
+
+def _brick_partial_sell_shares(meta: dict[str, object], fraction: float, lot_size: int) -> int:
+    shares = max(int(meta.get("shares", 0)), 0)
+    if shares <= 0:
+        return 0
+    raw_shares = shares * max(float(fraction), 0.0)
+    rounded = int(raw_shares // lot_size) * lot_size if lot_size > 0 else int(raw_shares)
+    if rounded <= 0:
+        return 0
+    return min(rounded, shares)
+
+
 def _decide_exit_from_signal(
     signal_row: pd.Series | None,
     meta: dict[str, object],
@@ -1051,6 +1115,9 @@ def _decide_exit_from_signal(
     pattern = str(meta.get("pattern", ""))
     if pattern == "B1":
         action, reason, _, _ = _decide_b1_position_action(signal_row, meta, signal_date=None)
+        return action == "full_exit", reason
+    if pattern == "BRICK":
+        action, reason, _ = _decide_brick_position_action(signal_row, meta)
         return action == "full_exit", reason
     if bool(signal_row.get("exit_flag", 0)):
         return True, "signal_exit"
@@ -1170,6 +1237,7 @@ def simulate_pattern_backtest(
     min_swap_score_gap: float,
     b1_score_file: str | None = None,
     lot_size: int = 100,
+    show_progress: bool = False,
 ) -> dict[str, object]:
     from qlib.contrib.evaluate import risk_analysis
 
@@ -1196,6 +1264,7 @@ def simulate_pattern_backtest(
     signal_frame["datetime"] = pd.to_datetime(signal_frame["datetime"]).dt.normalize()
     b1_env_ok, b1_env_symbol = _build_b1_env_filter(app_settings, warmup_start, end_time)
     signal_frame["b1_env_ok"] = signal_frame["datetime"].map(b1_env_ok).fillna(False).astype(int)
+    signal_frame["brick_env_ok"] = signal_frame["datetime"].map(b1_env_ok).fillna(False).astype(int)
     signal_frame = signal_frame.sort_values(["datetime", "priority_score", "instrument"], ascending=[True, False, True])
     grouped_frames = {
         trading_date: frame.set_index("instrument", drop=False)
@@ -1215,8 +1284,15 @@ def simulate_pattern_backtest(
     cumulative_turnover = 0.0
     cumulative_cost = 0.0
     previous_account = float(account)
-
-    for trade_date in trade_dates:
+    progress = tqdm(
+        trade_dates,
+        total=len(trade_dates),
+        desc=f"{mode} backtest",
+        dynamic_ncols=True,
+        leave=True,
+        disable=not show_progress,
+    )
+    for step_index, trade_date in enumerate(progress, start=1):
         execution_df = grouped_frames.get(trade_date, _empty_signal_frame(signal_frame))
         date_position = trade_date_positions.get(trade_date)
         previous_signal_date = all_trade_dates[date_position - 1] if date_position is not None and date_position > 0 else None
@@ -1306,6 +1382,25 @@ def simulate_pattern_backtest(
         for code, meta in list(holdings.items()):
             if mode == "B1" and str(meta.get("pattern", "")) == "B1":
                 keep_codes.append(code)
+            elif str(meta.get("pattern", "")) == "BRICK":
+                signal_row = previous_signal_df.loc[code] if code in previous_signal_df.index else None
+                action, sell_reason, sell_fraction = _decide_brick_position_action(signal_row, meta)
+                if action == "full_exit":
+                    sell_codes.append(code)
+                    sell_reasons[code] = sell_reason or "brick_red_to_green"
+                else:
+                    keep_codes.append(code)
+                    if action == "partial_exit":
+                        sell_shares = _brick_partial_sell_shares(meta, float(sell_fraction or BRICK_REDUCE_FRACTION), lot_size)
+                        if sell_shares > 0:
+                            partial_sell_orders.append(
+                                {
+                                    "code": code,
+                                    "reason": sell_reason or "brick_four_red_reduce",
+                                    "sell_shares": sell_shares,
+                                    "mode": "BRICK",
+                                }
+                            )
             else:
                 signal_row = previous_signal_df.loc[code] if code in previous_signal_df.index else None
                 exit_now, sell_reason = _decide_exit_from_signal(
@@ -1392,7 +1487,8 @@ def simulate_pattern_backtest(
                 pre_open_buy_codes.append(code)
 
         candidate_df = _select_candidates(previous_signal_df, mode, set(keep_codes), blocked_codes=blocked_symbols)
-        if mode == "B1":
+        candidate_df = _apply_mode_candidate_selector(user_module, mode, candidate_df)
+        if mode in {"B1", "BRICK"}:
             target_keep_codes = list(keep_codes)
             planned_buy_codes: list[str] = []
             target_codes = target_keep_codes[:]
@@ -1459,6 +1555,8 @@ def simulate_pattern_backtest(
             meta["shares"] = int(meta.get("shares", 0)) - sell_shares
             meta["last_reduction_date"] = trade_date
             meta["bars_since_last_sell"] = 0
+            if str(order.get("mode", "")) == "BRICK":
+                meta["brick_reduced_on_four_red"] = True
             holdings[code] = _b1_refresh_position_stage(meta)
 
         for code in sell_codes:
@@ -1526,6 +1624,16 @@ def simulate_pattern_backtest(
             )
             candidate_codes = [str(item["code"]) for item in b1_buy_plans]
             b1_buy_plan_map = {str(item["code"]): item for item in b1_buy_plans}
+        elif mode == "BRICK":
+            available_slots = max(int(max_holdings) - len(keep_codes), 0)
+            planned_buy_codes = [str(code) for code in candidate_df.head(available_slots).index.tolist()]
+            candidate_codes = _limit_new_buys(
+                buy_codes=planned_buy_codes,
+                total_equity_before_buy=total_equity_before_buy,
+                current_value=current_value,
+                risk_degree=risk_degree,
+                min_position_ratio=min_position_ratio,
+            )
         else:
             candidate_codes = _limit_new_buys(
                 buy_codes=planned_buy_codes,
@@ -1541,6 +1649,7 @@ def simulate_pattern_backtest(
             if code not in execution_df.index:
                 continue
             row = execution_df.loc[code]
+            use_probe_entry = mode == "B1" and _b1_use_probe_entry(user_module)
             raw_buy_price = _resolve_trade_price(row, buy_price_field, float(row.get("open", 0.0)))
             buy_price = _apply_slippage(raw_buy_price, side="buy", slippage_rate=slippage_rate)
             if buy_price <= 0:
@@ -1566,7 +1675,7 @@ def simulate_pattern_backtest(
                 "shares": tentative_shares,
                 "initial_shares": tentative_shares,
                 "position_stage": 0,
-                "b1_phase": "probe" if mode == "B1" else "confirmed",
+                "b1_phase": "probe" if use_probe_entry else "confirmed",
                 "buy_date": trade_date,
                 "last_buy_date": trade_date,
                 "signal_date": previous_signal_date,
@@ -1582,7 +1691,8 @@ def simulate_pattern_backtest(
                 "entry_score": _read_priority_score(previous_signal_df, code, 0.0),
                 "position_ratio": float(b1_buy_plan_map.get(code, {}).get("target_ratio", 0.0)) if mode == "B1" else 0.0,
                 "base_position_ratio": float(_resolve_b1_position_ratio(user_module, previous_signal_df.loc[code])) if mode == "B1" and code in previous_signal_df.index else 0.0,
-                "confirm_date": None if mode == "B1" else trade_date,
+                "brick_reduced_on_four_red": False,
+                "confirm_date": None if use_probe_entry else trade_date,
                 "days_since_confirm": 0,
                 "last_reduction_date": None,
                 "bars_since_last_sell": 0,
@@ -1748,6 +1858,22 @@ def simulate_pattern_backtest(
             }
         )
         previous_account = end_account
+        if show_progress:
+            progress.set_postfix(
+                date=trade_date.date().isoformat(),
+                hold=len(hold_codes),
+                buy=len(buy_codes),
+                sell=len(executed_sell_symbols),
+            )
+            if not sys.stderr.isatty():
+                print(
+                    f"[{mode}] backtest {step_index}/{len(trade_dates)} "
+                    f"date={trade_date.date().isoformat()} "
+                    f"hold={len(hold_codes)} buy={len(buy_codes)} sell={len(executed_sell_symbols)}",
+                    flush=True,
+                )
+
+    progress.close()
 
     for code, meta in holdings.items():
         remaining_shares = int(meta.get("shares", 0))
@@ -1907,8 +2033,10 @@ def main() -> None:
     parser.add_argument("--min-position-ratio", type=float, default=0.04)
     parser.add_argument("--swap-score-gap", type=float, default=15.0)
     parser.add_argument("--b1-score-file", default="")
-    parser.add_argument("--modes", nargs="+", default=["B1", "B2", "B3"])
+    parser.add_argument("--modes", nargs="+", default=DEFAULT_PATTERN_MODES)
     parser.add_argument("--output-dir", default=str(ROOT / "data" / "reports" / "user_pattern_backtests"))
+    parser.add_argument("--progress", dest="progress", action="store_true", default=True)
+    parser.add_argument("--no-progress", dest="progress", action="store_false")
     args = parser.parse_args()
 
     provider_uri, app_settings = ensure_provider(args.config, args.provider_strategy)
@@ -1942,6 +2070,7 @@ def main() -> None:
             min_position_ratio=args.min_position_ratio,
             min_swap_score_gap=args.swap_score_gap,
             b1_score_file=args.b1_score_file or None,
+            show_progress=bool(args.progress),
         )
         report_df = result["report"].sort_index().copy()
         report_path = output_dir / f"{mode.lower()}_report.csv"

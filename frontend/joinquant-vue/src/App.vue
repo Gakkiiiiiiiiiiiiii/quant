@@ -12,8 +12,19 @@ const tradeTabs = [
   { key: 'pattern_decisions', label: '每日决策' },
   { key: 'rules', label: '风险指标' },
 ]
+const sectionMeta = {
+  收益概述: { code: '01', note: '权益、超额与关键指标' },
+  交易详情: { code: '02', note: '成交、决策与报告' },
+  '每日持仓&收益': { code: '03', note: '资产轨迹与仓位快照' },
+  日志输出: { code: '04', note: '系统、测试与接口日志' },
+  性能分析: { code: '05', note: '状态、告警与持仓画像' },
+  策略代码: { code: '06', note: '策略模板与运行入口' },
+  'Qlib 全市场': { code: '07', note: '历史数据与全市场回测' },
+  形态实验室: { code: '08', note: '实验策略与可视化产物' },
+}
 
 const profile = ref('backtest')
+const selectedPatternReportDir = ref('')
 const activeSection = ref('收益概述')
 const activeTradeTab = ref('pattern_actions')
 const selectedLogSource = ref('QMT 客户端')
@@ -54,7 +65,7 @@ const qlibForm = reactive({
 })
 
 const patternForm = reactive({
-  selection_label: '三策略对比',
+  selection_label: '四策略对比',
   start_date: '2023-01-01',
   end_date: '2026-03-24',
   account: 500000,
@@ -84,11 +95,45 @@ function formatRatio(value) {
   return `${(Number(value) * 100).toFixed(2)}%`
 }
 
+function formatInteger(value) {
+  if (value === null || value === undefined || value === '') {
+    return '--'
+  }
+  return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+}
+
+function formatSignedMoney(value) {
+  if (value === null || value === undefined || value === '') {
+    return '--'
+  }
+  const number = Number(value)
+  if (!Number.isFinite(number)) {
+    return '--'
+  }
+  return number.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
 function formatDatetime(value) {
   if (!value) {
     return '--'
   }
   return String(value).replace('T', ' ').replace('.000Z', '')
+}
+
+function parseDateValue(value) {
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return null
+  }
+  return parsed.getTime()
+}
+
+function toneFromValue(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) {
+    return ''
+  }
+  return number >= 0 ? 'positive' : 'negative'
 }
 
 function normalizeCurvePoints(points) {
@@ -136,13 +181,14 @@ function hydrateForms(payload) {
   qlibForm.lot_size = strategyForm.lot_size
 
   const patternDefaults = payload.pattern?.defaults || {}
-  patternForm.selection_label = patternDefaults.selection_label || '三策略对比'
+  patternForm.selection_label = patternDefaults.selection_label || '四策略对比'
   patternForm.start_date = patternDefaults.start_date || '2023-01-01'
   patternForm.end_date = patternDefaults.end_date || '2026-03-24'
   patternForm.account = Number(patternDefaults.account || 500000)
   patternForm.max_holdings = Number(patternDefaults.max_holdings || 10)
   patternForm.risk_degree = Number(patternDefaults.risk_degree || 0.95)
   patternForm.max_holding_days = Number(patternDefaults.max_holding_days || 15)
+  selectedPatternReportDir.value = payload.pattern?.selected_report_dir || ''
 }
 
 async function fetchBootstrap({ preserveForms = false } = {}) {
@@ -150,7 +196,10 @@ async function fetchBootstrap({ preserveForms = false } = {}) {
   state.refreshing = Boolean(state.payload)
   state.error = ''
   try {
-    const payload = await apiGet('/api/bootstrap', { profile: profile.value })
+    const payload = await apiGet('/api/bootstrap', {
+      profile: profile.value,
+      pattern_report_dir: selectedPatternReportDir.value,
+    })
     state.payload = payload
     state.refreshedAt = Date.now()
     if (!preserveForms) {
@@ -204,6 +253,7 @@ async function runPattern(runAll) {
   try {
     const response = await apiPost('/api/actions/pattern', {
       ...patternForm,
+      pattern_report_dir: selectedPatternReportDir.value,
       run_all: runAll,
     })
     actionState.pattern = response.result
@@ -226,16 +276,20 @@ const pattern = computed(() => state.payload?.pattern || { summary: [], comparis
 const primaryMode = computed(() => pattern.value.primary_mode || 'B1')
 const profileOptions = computed(() => state.payload?.meta?.profiles || [])
 const strategyOptions = computed(() => state.payload?.meta?.strategies || [])
+const patternDirOptions = computed(() => pattern.value.report_dirs || [])
+const activeSectionMeta = computed(() => sectionMeta[activeSection.value] || { code: '--', note: '' })
 
 const logText = computed(() => logs.value[selectedLogSource.value] || '暂无日志')
 const rules = computed(() => dashboardData.value.rules || [])
 const patternActions = computed(() => dashboardData.value.pattern_actions || pattern.value.daily_actions || [])
 const patternDecisions = computed(() => dashboardData.value.pattern_decisions || pattern.value.daily_decisions || [])
+const genericTrades = computed(() => dashboardData.value.trades || [])
 const positions = computed(() => dashboardData.value.positions || [])
 const assets = computed(() => dashboardData.value.assets || [])
 const benchmarkCurve = computed(() => dashboardData.value.benchmark_curve || [])
 const patternSummary = computed(() => pattern.value.summary || [])
 const patternComparison = computed(() => pattern.value.comparison || [])
+const isMicrocapBacktest = computed(() => assets.value.some((item) => item.account_id === 'joinquant_microcap_alpha'))
 const patternImageUrl = computed(() => {
   if (!pattern.value.png_url) {
     return ''
@@ -243,9 +297,74 @@ const patternImageUrl = computed(() => {
   const joiner = pattern.value.png_url.includes('?') ? '&' : '?'
   return `${pattern.value.png_url}${joiner}ts=${state.refreshedAt}`
 })
+const assetDateRange = computed(() => {
+  if (assets.value.length === 0) {
+    return '--'
+  }
+  const points = assets.value
+    .map((item) => formatDatetime(item.snapshot_time || item.datetime).slice(0, 10))
+    .filter((item) => item && item !== '--')
+  if (points.length === 0) {
+    return '--'
+  }
+  return `${points[0]} → ${points[points.length - 1]}`
+})
+const benchmarkReturn = computed(() => {
+  const points = benchmarkCurve.value
+    .map((item) => Number(item.benchmark_equity))
+    .filter((value) => Number.isFinite(value))
+  if (points.length < 2 || points[0] === 0) {
+    return null
+  }
+  return points[points.length - 1] / points[0] - 1
+})
+const excessReturn = computed(() => {
+  const total = Number(overview.value.total_return)
+  const benchmark = Number(benchmarkReturn.value)
+  if (!Number.isFinite(total) || !Number.isFinite(benchmark)) {
+    return null
+  }
+  return total - benchmark
+})
+const recentTradePreview = computed(() => {
+  return [...genericTrades.value]
+    .sort((left, right) => (parseDateValue(right.trading_date) || 0) - (parseDateValue(left.trading_date) || 0))
+    .slice(0, 8)
+})
+const overviewTradeColumns = computed(() => ([
+  { key: 'trading_date', label: '交易日', width: 104 },
+  { key: 'symbol', label: '代码', width: 92, code: true },
+  { key: 'side', label: '方向', width: 70, align: 'center' },
+  { key: 'shares', label: '股数', width: 78, align: 'right', formatter: formatInteger },
+  { key: 'amount', label: '成交额', width: 110, align: 'right', formatter: formatSignedMoney },
+]))
+const overviewHeroFacts = computed(() => ([
+  {
+    label: '策略收益',
+    value: formatRatio(overview.value.total_return),
+    tone: toneFromValue(overview.value.total_return),
+    foot: `Benchmark ${formatRatio(benchmarkReturn.value)}`,
+  },
+  {
+    label: '超额收益',
+    value: formatRatio(excessReturn.value),
+    tone: toneFromValue(excessReturn.value),
+    foot: '相对基准',
+  },
+  {
+    label: '当前仓位',
+    value: formatRatio(overview.value.exposure),
+    foot: `现金 ${formatMoney(overview.value.cash)}`,
+  },
+  {
+    label: '回测区间',
+    value: assetDateRange.value,
+    foot: isMicrocapBacktest.value ? '10万资金 / 微盘 Alpha' : (connection.value.label || '--'),
+  },
+]))
 
 const overviewMetrics = computed(() => [
-  { label: '策略收益', value: formatRatio(overview.value.total_return), tone: Number(overview.value.total_return) >= 0 ? 'positive' : 'negative' },
+  { label: '策略收益', value: formatRatio(overview.value.total_return), tone: toneFromValue(overview.value.total_return) },
   { label: '最大回撤', value: formatRatio(overview.value.drawdown), tone: 'negative' },
   { label: '累计换手', value: formatMoney(overview.value.turnover) },
   { label: '订单数', value: String(overview.value.order_count ?? 0) },
@@ -276,7 +395,7 @@ const equitySeries = computed(() => {
     .sort((left, right) => left.label.localeCompare(right.label))
 
   const strategySeries = {
-    name: primaryMode.value || '策略曲线',
+    name: isMicrocapBacktest.value ? '聚宽微盘 Alpha' : (primaryMode.value || '策略曲线'),
     color: '#2e62ad',
     points: normalizeCurvePoints(strategyPoints),
   }
@@ -315,6 +434,64 @@ const patternSeries = computed(() => {
     .filter((item) => item.points.length > 0)
 })
 
+const actionColumns = computed(() => ([
+  { key: '日期', label: '买入日', sticky: true, width: 108 },
+  { key: 'SELL日期', label: '卖出日', width: 108 },
+  { key: '股票代码', label: '代码', sticky: true, width: 104, code: true },
+  { key: '标的名称', label: '名称', sticky: true, width: 112 },
+  { key: '策略(B1 B2 B3)', label: '策略', width: 76, align: 'center' },
+  { key: '买入评分', label: '买分', width: 84, align: 'right' },
+  { key: '卖出评分', label: '卖分', width: 84, align: 'right' },
+  { key: 'BUY金额', label: '买入额', width: 112, align: 'right', formatter: formatSignedMoney },
+  { key: 'BUY股数', label: '股数', width: 84, align: 'right', formatter: formatInteger },
+  { key: '买入价格', label: '买价', width: 84, align: 'right' },
+  { key: '卖出价格', label: '卖价', width: 84, align: 'right' },
+  { key: '卖出原因', label: '卖出原因', minWidth: 168, maxWidth: 220, wrap: true, code: true },
+  { key: '这个标的这次操作的盈亏金额', label: '盈亏', width: 112, align: 'right', formatter: formatSignedMoney, tone: 'pnl' },
+  { key: '收益率', label: '收益率', width: 92, align: 'right', formatter: formatRatio, tone: 'return' },
+]))
+
+const decisionColumns = computed(() => ([
+  { key: 'trading_date', label: '交易日', sticky: true, width: 108 },
+  { key: 'mode', label: '策略', sticky: true, width: 76, align: 'center' },
+  { key: 'signal_count', label: '信号', width: 76, align: 'right', formatter: formatInteger },
+  { key: 'buy_count', label: '买入', width: 76, align: 'right', formatter: formatInteger },
+  { key: 'sell_count', label: '卖出', width: 76, align: 'right', formatter: formatInteger },
+  { key: 'hold_count', label: '持仓', width: 76, align: 'right', formatter: formatInteger },
+  { key: 'candidate_symbols', label: '候选标的', minWidth: 240, maxWidth: 320, wrap: true, code: true },
+  { key: 'buy_symbols', label: '买入标的', minWidth: 200, maxWidth: 280, wrap: true, code: true },
+  { key: 'sell_symbols', label: '卖出标的', minWidth: 200, maxWidth: 280, wrap: true, code: true },
+  { key: 'hold_symbols', label: '持仓标的', minWidth: 220, maxWidth: 320, wrap: true, code: true },
+]))
+
+const ruleColumns = computed(() => ([
+  { key: 'mode', label: '策略', width: 76, align: 'center' },
+  { key: 'metric', label: '指标', minWidth: 160, maxWidth: 220, wrap: true, code: true },
+  { key: 'value', label: '数值', width: 120, align: 'right' },
+]))
+
+const genericTradeColumns = computed(() => ([
+  { key: 'trading_date', label: '交易日', sticky: true, width: 108 },
+  { key: 'symbol', label: '代码', sticky: true, width: 104, code: true },
+  { key: 'instrument_name', label: '名称', sticky: true, width: 120 },
+  { key: 'side', label: '方向', width: 76, align: 'center' },
+  { key: 'shares', label: '股数', width: 84, align: 'right', formatter: formatInteger },
+  { key: 'price', label: '价格', width: 84, align: 'right' },
+  { key: 'amount', label: '成交额', width: 112, align: 'right', formatter: formatSignedMoney },
+  { key: 'fee', label: '费用', width: 96, align: 'right', formatter: formatSignedMoney },
+  { key: 'reason', label: '原因', minWidth: 180, maxWidth: 260, wrap: true, code: true },
+]))
+
+const tradeColumns = computed(() => {
+  if (activeTradeTab.value === 'pattern_actions') {
+    return actionColumns.value
+  }
+  if (activeTradeTab.value === 'pattern_decisions') {
+    return decisionColumns.value
+  }
+  return ruleColumns.value
+})
+
 const tradeRows = computed(() => {
   if (activeTradeTab.value === 'pattern_actions') {
     return patternActions.value
@@ -334,6 +511,10 @@ const tradeTableEmptyText = computed(() => {
   }
   return '暂无风险指标'
 })
+
+const hasPatternTradeData = computed(() => (
+  !isMicrocapBacktest.value && (patternActions.value.length > 0 || patternDecisions.value.length > 0 || rules.value.length > 0)
+))
 
 watch(profile, () => {
   fetchBootstrap()
@@ -370,15 +551,32 @@ onMounted(() => {
 <template>
   <div class="app-shell">
     <header class="jq-topbar">
-      <div>
+      <div class="jq-topbar__main">
         <div class="jq-topbar__eyebrow">JoinQuant Inspired Workspace</div>
         <h1>JoinQuant 风格量化平台</h1>
-        <div class="jq-topbar__sub">Vue 版前端，当前只展示 {{ primaryMode }} 策略的本地回测产物。</div>
+        <div class="jq-topbar__sub">Vue 版前端，默认展示当前回测产物，并保留形态实验室与全市场入口。</div>
+        <div class="jq-topbar__chips">
+          <span class="hero-chip hero-chip--brand">{{ isMicrocapBacktest ? '聚宽微盘 Alpha' : (primaryMode || '策略面板') }}</span>
+          <span class="hero-chip">{{ connection.label || '--' }}</span>
+          <span class="hero-chip">区间 {{ assetDateRange }}</span>
+        </div>
       </div>
       <div class="jq-topbar__meta">
-        <span>模式: {{ settings.environment || profile }}</span>
-        <span>最新快照: {{ formatDatetime(overview.latest_time) }}</span>
-        <span>生成时间: {{ formatDatetime(state.payload?.generated_at) }}</span>
+        <article class="hero-stat hero-stat--primary">
+          <span>总资产</span>
+          <strong>{{ formatMoney(overview.total_asset) }}</strong>
+          <small>最新快照 {{ formatDatetime(overview.latest_time).slice(0, 10) }}</small>
+        </article>
+        <article class="hero-stat">
+          <span>最大回撤</span>
+          <strong>{{ formatRatio(overview.drawdown) }}</strong>
+          <small>当前仓位 {{ formatRatio(overview.exposure) }}</small>
+        </article>
+        <article class="hero-stat">
+          <span>生成时间</span>
+          <strong>{{ formatDatetime(state.payload?.generated_at).slice(0, 16) }}</strong>
+          <small>模式 {{ settings.environment || profile }}</small>
+        </article>
       </div>
     </header>
 
@@ -397,6 +595,12 @@ onMounted(() => {
             <option :value="10">10 秒</option>
             <option :value="20">20 秒</option>
             <option :value="30">30 秒</option>
+          </select>
+        </label>
+        <label>
+          <span>结果目录</span>
+          <select v-model="selectedPatternReportDir" @change="fetchBootstrap({ preserveForms: true })">
+            <option v-for="item in patternDirOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
           </select>
         </label>
       </div>
@@ -420,6 +624,7 @@ onMounted(() => {
 
     <main v-else class="page-layout">
       <aside class="side-nav">
+        <div class="side-nav__eyebrow">Workspace</div>
         <button
           v-for="section in sections"
           :key="section"
@@ -427,32 +632,68 @@ onMounted(() => {
           :class="{ 'is-active': activeSection === section }"
           @click="activeSection = section"
         >
-          {{ section }}
+          <span class="side-nav__item-mark">{{ sectionMeta[section].code }}</span>
+          <span class="side-nav__item-copy">
+            <strong>{{ section }}</strong>
+            <small>{{ sectionMeta[section].note }}</small>
+          </span>
         </button>
-        <div class="side-nav__hint">当前页面已收口到 {{ primaryMode }} 策略，概览、交易、报告与曲线均来自同一套回测产物。</div>
+        <div class="side-nav__hint">概览页默认展示当前回测结果，形态实验室仍可单独查看 {{ primaryMode }} 的实验产物。</div>
       </aside>
 
       <section class="content-stage">
         <template v-if="activeSection === '收益概述'">
-          <div class="panel-card">
-            <div class="panel-card__header">
-              <div>
-                <h2>收益概述</h2>
-                <p>策略净值、Benchmark 与关键收益指标。</p>
+          <section class="overview-hero">
+            <div class="overview-hero__copy">
+              <div class="overview-hero__kicker">{{ activeSectionMeta.code }} / {{ isMicrocapBacktest ? 'Microcap Alpha Board' : `${primaryMode} Strategy Board` }}</div>
+              <h2>{{ isMicrocapBacktest ? '聚宽微盘 Alpha 回测总览' : `${primaryMode} 策略总览` }}</h2>
+              <p>
+                {{ isMicrocapBacktest
+                  ? '主图展示策略与 Benchmark 的累计收益，右侧收口到最近成交，首屏优先给出结果而不是表单。'
+                  : '当前版式强调收益曲线、策略状态和实验入口的层级关系，减少信息抢占。'
+                }}
+              </p>
+            </div>
+            <div class="overview-hero__facts">
+              <article v-for="item in overviewHeroFacts" :key="item.label" class="overview-fact">
+                <span>{{ item.label }}</span>
+                <strong :class="item.tone || ''">{{ item.value }}</strong>
+                <small>{{ item.foot }}</small>
+              </article>
+            </div>
+          </section>
+          <div class="overview-grid">
+            <div class="panel-card panel-card--main">
+              <div class="panel-card__header">
+                <div>
+                  <h2>收益概述</h2>
+                  <p>策略净值、Benchmark 与关键收益指标。</p>
+                </div>
+              </div>
+              <MetricStrip :items="overviewMetrics" />
+              <LineChart :series="equitySeries" :height="520" :as-percent="true" />
+            </div>
+            <div class="panel-card panel-card--side">
+              <div v-if="isMicrocapBacktest">
+                <div class="panel-card__header">
+                  <div>
+                    <h2>近期成交</h2>
+                    <p>首屏展示最近的调仓记录，避免把重要信息压到明细页。</p>
+                  </div>
+                </div>
+                <DataTable :rows="recentTradePreview" :columns="overviewTradeColumns" :max-height="430" empty-text="暂无成交记录" />
+              </div>
+              <div v-else>
+                <div class="panel-card__header">
+                  <div>
+                    <h2>形态策略看板</h2>
+                    <p>{{ primaryMode }} 与 Benchmark 的最新对比。</p>
+                  </div>
+                </div>
+                <LineChart :series="patternSeries" :height="320" :as-percent="true" />
+                <DataTable :rows="patternSummary" :max-height="220" empty-text="暂无形态策略回测结果" />
               </div>
             </div>
-            <MetricStrip :items="overviewMetrics" />
-            <LineChart :series="equitySeries" :height="360" :as-percent="true" />
-          </div>
-          <div class="panel-card">
-            <div class="panel-card__header">
-              <div>
-                <h2>形态策略看板</h2>
-                <p>{{ primaryMode }} 与 Benchmark 的最新对比。</p>
-              </div>
-            </div>
-            <LineChart :series="patternSeries" :height="300" :as-percent="true" />
-            <DataTable :rows="patternSummary" :max-height="260" empty-text="暂无形态策略回测结果" />
           </div>
         </template>
 
@@ -461,9 +702,9 @@ onMounted(() => {
             <div class="panel-card__header panel-card__header--tabs">
               <div>
                 <h2>交易详情</h2>
-                <p>{{ primaryMode }} 回测的逐日交易记录、决策与风险指标。</p>
+                <p>{{ hasPatternTradeData ? `${primaryMode} 回测的逐日交易记录、决策与风险指标。` : '当前回测的成交明细与日终报告。' }}</p>
               </div>
-              <div class="mini-tabs">
+              <div v-if="hasPatternTradeData" class="mini-tabs">
                 <button
                   v-for="tab in tradeTabs"
                   :key="tab.key"
@@ -475,7 +716,20 @@ onMounted(() => {
                 </button>
               </div>
             </div>
-            <DataTable :rows="tradeRows" :max-height="560" :empty-text="tradeTableEmptyText" />
+            <DataTable
+              v-if="hasPatternTradeData"
+              :rows="tradeRows"
+              :columns="tradeColumns"
+              :max-height="560"
+              :empty-text="tradeTableEmptyText"
+            />
+            <DataTable
+              v-else
+              :rows="genericTrades"
+              :columns="genericTradeColumns"
+              :max-height="560"
+              empty-text="暂无成交记录"
+            />
             <div class="markdown-report">
               <h3>日终报告</h3>
               <pre>{{ dashboardData.report_text || '暂无日终报告。' }}</pre>
@@ -626,6 +880,10 @@ onMounted(() => {
               </div>
               <a v-if="pattern.html_url" class="text-link" :href="pattern.html_url" target="_blank" rel="noreferrer">打开交互图</a>
             </div>
+            <div class="toolbar-stat">
+              <span>当前目录</span>
+              <strong>{{ pattern.selected_report_dir || '--' }}</strong>
+            </div>
             <div class="form-grid form-grid--pattern">
               <label>
                 <span>策略选择</span>
@@ -642,7 +900,7 @@ onMounted(() => {
             </div>
             <div class="action-row">
               <button class="btn btn--primary" :disabled="actionState.busy === 'pattern'" @click="runPattern(false)">运行当前策略</button>
-              <button class="btn" :disabled="actionState.busy === 'pattern'" @click="runPattern(true)">运行三策略对比</button>
+              <button class="btn" :disabled="actionState.busy === 'pattern'" @click="runPattern(true)">运行四策略对比</button>
             </div>
             <DataTable :rows="patternSummary" :max-height="260" empty-text="暂无形态策略结果" />
             <img v-if="patternImageUrl" class="pattern-image" :src="patternImageUrl" alt="形态策略权益对比图" />

@@ -222,6 +222,21 @@ def test_b1_formula_signal_matches_user_rule() -> None:
     assert pd.isna(row["stop_price"])
 
 
+def test_b1_soft_formula_allows_st_below_lt_when_price_stays_near_lt() -> None:
+    strategy_module = _load_strategy_module()
+    dates = pd.bdate_range("2024-01-02", periods=40)
+    frame = _make_b1_v5_feature_frame(dates)
+    lt_value = float(frame.loc[("000001.SZ", dates[-1]), "lt"])
+    frame.loc[("000001.SZ", dates[-1]), "st"] = lt_value * 0.995
+
+    signal = strategy_module.build_pattern_signals(frame)
+    row = signal.loc[("000001.SZ", dates[-1])]
+
+    assert int(row["b1_candidate_v5"]) == 0
+    assert int(row["b1_candidate_soft"]) == 1
+    assert int(row["b1"]) == 1
+
+
 def test_b1_recent_distribution_blocks_reentry_without_repair() -> None:
     strategy_module = _load_strategy_module()
     dates = pd.bdate_range("2024-01-02", periods=40)
@@ -567,7 +582,7 @@ def test_resolve_b1_position_ratio_uses_v5_bands() -> None:
     assert strategy_module.resolve_b1_position_ratio(pd.Series({"priority_score": 140.0, "quality_score": 72.0, "b1_confirm": 1})) == 0.18
 
 
-def test_plan_b1_new_entries_uses_probe_ratio_and_main_slots() -> None:
+def test_plan_b1_new_entries_uses_full_ratio_and_main_slots() -> None:
     backtest_script = _load_backtest_script()
     strategy_module = _load_strategy_module()
     candidate_df = pd.DataFrame(
@@ -596,7 +611,7 @@ def test_plan_b1_new_entries_uses_probe_ratio_and_main_slots() -> None:
     )
 
     assert [item["code"] for item in planned] == ["C"]
-    assert round(float(planned[0]["target_ratio"]), 4) == 0.05
+    assert round(float(planned[0]["target_ratio"]), 4) == 0.15
 
 
 def test_b1_existing_position_sells_on_same_day_close_signal() -> None:

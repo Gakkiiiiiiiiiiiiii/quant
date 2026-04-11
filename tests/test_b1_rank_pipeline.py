@@ -35,6 +35,15 @@ def _load_backtest_script():
     return _load_module("test_user_pattern_rank_backtest_script", script_dir / "run_user_pattern_backtests.py")
 
 
+def _load_build_rank_script():
+    script_dir = ROOT / "scripts"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    if str(ROOT / "src") not in sys.path:
+        sys.path.insert(0, str(ROOT / "src"))
+    return _load_module("test_build_b1_rank_script", script_dir / "build_b1_rank_scores.py")
+
+
 def _make_feature_frame(dates: pd.DatetimeIndex) -> pd.DataFrame:
     n = len(dates)
     index = pd.MultiIndex.from_product([["000001.SZ"], dates], names=["instrument", "datetime"])
@@ -120,7 +129,7 @@ def test_resolve_b1_position_ratio_prefers_model_score_bins() -> None:
     assert strategy_module.resolve_b1_position_ratio(pd.Series({"model_score": 80.0, "priority_score": 0.0})) == 0.18
 
 
-def test_plan_b1_new_entries_filters_to_probe_topk_and_score_floor() -> None:
+def test_plan_b1_new_entries_keeps_all_scores_when_entry_floor_disabled() -> None:
     backtest_script = _load_backtest_script()
     strategy_module = _load_strategy_module()
     candidate_df = pd.DataFrame(
@@ -145,7 +154,8 @@ def test_plan_b1_new_entries_filters_to_probe_topk_and_score_floor() -> None:
         min_position_ratio=0.04,
     )
 
-    assert [item["code"] for item in planned] == ["A", "B"]
+    assert [item["code"] for item in planned] == ["A", "B", "C", "D"]
+    assert round(float(planned[0]["target_ratio"]), 4) == 0.18
 
 
 def test_allow_b1_confirm_uses_model_threshold_when_present() -> None:
@@ -178,3 +188,74 @@ def test_build_b1_rank_event_frame_deduplicates_unresolved_candidates() -> None:
     events = strategy_module.build_b1_rank_event_frame(features, signal, dedup_window=8)
 
     assert events["datetime"].dt.normalize().tolist() == [dates[20]]
+
+
+def test_build_b1_rank_candidate_frame_keeps_latest_unlabeled_candidate() -> None:
+    strategy_module = _load_strategy_module()
+    dates = pd.bdate_range("2024-01-02", periods=40)
+    features = _make_feature_frame(dates)
+    signal = pd.DataFrame(
+        {
+            "b1": 0,
+        },
+        index=features.index,
+    )
+    signal.loc[("000001.SZ", dates[-1]), "b1"] = 1
+
+    candidates = strategy_module.build_b1_rank_candidate_frame(features, signal)
+
+    assert candidates["datetime"].dt.normalize().tolist() == [dates[-1]]
+    assert "f_st_lt_band_code" in candidates.columns
+
+
+def test_load_sample_specs_parses_name_and_date_pairs(tmp_path: Path) -> None:
+    build_script = _load_build_rank_script()
+    sample_path = tmp_path / "b1_sample.md"
+    sample_path.write_text(
+        "\n".join(
+            [
+                "说明文字",
+                "华纳药厂 2025.05.12",
+                "优刻得 2026.01.21",
+                "无效行 不是日期",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    specs = build_script._load_sample_specs(sample_path)
+
+    assert [item["sample_name"] for item in specs] == ["华纳药厂", "优刻得"]
+    assert [item["sample_date"] for item in specs] == [pd.Timestamp("2025-05-12"), pd.Timestamp("2026-01-21")]
+
+
+def test_score_candidates_from_sample_library_prefers_sample_like_rows() -> None:
+    build_script = _load_build_rank_script()
+    feature_columns = ["f_a", "f_b"]
+    sample_frame = pd.DataFrame(
+        {
+            "instrument": ["A", "B"],
+            "datetime": [pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-03")],
+            "f_a": [1.0, 1.1],
+            "f_b": [2.0, 2.1],
+        }
+    )
+    candidate_frame = pd.DataFrame(
+        {
+            "instrument": ["LIKE", "MID", "FAR"],
+            "datetime": [pd.Timestamp("2026-01-06")] * 3,
+            "f_a": [1.05, 0.2, -2.0],
+            "f_b": [2.05, 0.6, -1.8],
+        }
+    )
+
+    predictions, profile = build_script._score_candidates_from_sample_library(
+        sample_frame,
+        candidate_frame,
+        feature_columns,
+        top_k=2,
+    )
+
+    score_map = predictions.set_index("instrument")["model_score_raw"].to_dict()
+    assert score_map["LIKE"] > score_map["MID"] > score_map["FAR"]
+    assert set(profile["feature"]) == {"f_a", "f_b"}

@@ -15,6 +15,7 @@ class AuditReportService:
         path.mkdir(parents=True, exist_ok=True)
 
         last_asset = session.scalar(select(AssetSnapshotModel).order_by(AssetSnapshotModel.snapshot_time.desc()))
+        max_drawdown = session.scalar(select(func.min(AssetSnapshotModel.max_drawdown)))
         order_count = session.scalar(select(func.count()).select_from(OrderModel)) or 0
         trade_count = session.scalar(select(func.count()).select_from(TradeModel)) or 0
         risk_reject_count = session.scalar(
@@ -35,7 +36,7 @@ class AuditReportService:
                     f"最新总资产：{float(last_asset.total_asset):.2f}",
                     f"最新现金：{float(last_asset.cash):.2f}",
                     f"累计换手：{float(last_asset.turnover):.2f}",
-                    f"最大回撤：{float(last_asset.max_drawdown):.4f}",
+                    f"最大回撤：{float(max_drawdown if max_drawdown is not None else last_asset.max_drawdown):.4f}",
                 ]
             )
         report_path = path / report_name

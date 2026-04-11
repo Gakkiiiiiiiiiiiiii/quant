@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -91,6 +92,66 @@ def _make_dashboard_data() -> dp.DashboardData:
     )
 
 
+def test_load_joinquant_microcap_report_builds_dashboard_data(tmp_path: Path) -> None:
+    report_dir = tmp_path / 'reports'
+    report_dir.mkdir()
+    (report_dir / 'joinquant_microcap_summary.json').write_text(
+        '{"strategy":"joinquant_microcap_alpha","history_start":"20200101","history_end":"2026-04-03","total_return":1.2,"annualized_return":0.3,"max_drawdown":-0.2,"turnover":12345.6}',
+        encoding='utf-8',
+    )
+    (report_dir / 'joinquant_microcap_equity.csv').write_text(
+        'trading_date,equity,cash,turnover,benchmark_equity,fees,max_drawdown\n'
+        '2026-04-02,100000,10000,1000,100000,10,0\n'
+        '2026-04-03,120000,15000,12345.6,105000,20,-0.2\n',
+        encoding='utf-8',
+    )
+    (report_dir / 'joinquant_microcap_trades.csv').write_text(
+        'trading_date,symbol,instrument_name,side,shares,price,amount,fee,reason\n'
+        '2026-04-03,000001.SZ,平安银行,BUY,100,12.34,1234,5,rebalance_buy\n',
+        encoding='utf-8',
+    )
+
+    data = dp._load_joinquant_microcap_report(str(report_dir))
+
+    assert data is not None
+    assert float(data.assets.iloc[-1]['total_asset']) == 120000.0
+    assert float(data.assets.iloc[-1]['market_value']) == 105000.0
+    assert len(data.trades) == 1
+    assert float(data.benchmark_curve.iloc[-1]['benchmark_equity']) == 105000.0
+    assert dp.overview(data)['market_value'] == 105000.0
+    assert '聚宽微盘 Alpha 回测报告' in data.report_text
+
+
+def test_overview_uses_full_period_max_drawdown_instead_of_last_row() -> None:
+    data = _make_dashboard_data()
+    data.assets = pd.DataFrame(
+        [
+            {
+                'account_id': 'demo',
+                'snapshot_time': pd.Timestamp('2026-03-23'),
+                'total_asset': 105000.0,
+                'cash': 45000.0,
+                'frozen_cash': 0.0,
+                'total_pnl': 5000.0,
+                'turnover': 10.0,
+                'max_drawdown': -0.22,
+            },
+            {
+                'account_id': 'demo',
+                'snapshot_time': pd.Timestamp('2026-03-24'),
+                'total_asset': 100000.0,
+                'cash': 40000.0,
+                'frozen_cash': 0.0,
+                'total_pnl': 1200.0,
+                'turnover': 11.5,
+                'max_drawdown': -0.08,
+            },
+        ]
+    )
+
+    assert dp.overview(data)['drawdown'] == -0.22
+
+
 def test_build_dashboard_payload_collects_expected_sections(monkeypatch, tmp_path: Path) -> None:
     settings = _make_settings(tmp_path)
     config_path = tmp_path / 'app.yaml'
@@ -112,6 +173,7 @@ def test_build_dashboard_payload_collects_expected_sections(monkeypatch, tmp_pat
     monkeypatch.setattr(dp, 'load_runtime_logs', lambda: {UI_LOG: 'ready'})
     monkeypatch.setattr(dp, 'load_live_probe', lambda *_args, **_kwargs: {})
     monkeypatch.setattr(dp, 'history_status', lambda _settings: {'latest_trading_date': '2026-03-24', 'row_count': 10, 'symbol_count': 2})
+    monkeypatch.setattr(dp, 'list_pattern_report_dirs', lambda: [{'label': 'mock-pattern', 'value': 'data/reports/mock-pattern', 'summary_count': 1, 'updated_at': '2026-03-24T00:00:00'}])
     monkeypatch.setattr(dp, 'workspace_relative', lambda path: Path(path).name)
     monkeypatch.setattr(
         dp,
@@ -154,21 +216,23 @@ def test_build_dashboard_payload_collects_expected_sections(monkeypatch, tmp_pat
         },
     )
 
-    payload = dp.build_dashboard_payload('backtest', str(config_path))
+    payload = dp.build_dashboard_payload('backtest', str(config_path), pattern_report_dir='data/reports/mock-pattern')
 
     assert payload['profile'] == 'backtest'
-    assert payload['overview']['total_asset'] == 123456.78
-    assert payload['overview']['cash'] == 88888.89
-    assert payload['overview']['market_value'] == 34567.89
+    assert payload['overview']['total_asset'] == 100000.0
+    assert payload['overview']['cash'] == 40000.0
+    assert payload['overview']['market_value'] == 12000.0
     assert payload['overview']['trade_count'] == 1
-    assert payload['data']['positions'] == []
+    assert payload['data']['positions'][0]['symbol'] == '000001.SZ'
     assert payload['data']['pattern_actions'][0][COL_SYMBOL] == '000001.SZ'
     assert len(payload['data']['pattern_actions']) == 1
     assert payload['pattern']['daily_decisions'][0]['mode'] == 'B1'
     assert payload['pattern']['summary'][0]['mode'] == 'B1'
+    assert payload['pattern']['selected_report_dir'] == 'mock-pattern'
+    assert payload['pattern']['report_dirs'][0]['label'] == 'mock-pattern'
     assert [item['series'] for item in payload['pattern']['comparison']] == ['B1', 'Benchmark']
-    assert payload['data']['report_text'].startswith('# \u5f62\u6001\u7b56\u7565\u56de\u6d4b\u62a5\u544a')
-    assert payload['connection']['label'] == 'B1 \u56de\u6d4b\u89c6\u56fe'
+    assert payload['data']['report_text'] == 'report'
+    assert payload['connection']['label'] == '\u79bb\u7ebf\u6570\u636e\u5e93\u89c6\u56fe'
     assert payload['qlib']['status']['latest_trading_date'] == '2026-03-24'
     assert payload['logs'][UI_LOG] == 'ready'
 
@@ -227,6 +291,7 @@ def test_run_pattern_action_builds_expected_modes(monkeypatch, tmp_path: Path) -
             'max_holdings': 7,
             'risk_degree': 0.9,
             'max_holding_days': 11,
+            'pattern_report_dir': 'data/reports/user_pattern_backtests_recent6m',
         }
     )
 
@@ -236,6 +301,45 @@ def test_run_pattern_action_builds_expected_modes(monkeypatch, tmp_path: Path) -
     assert 'B2' in captured['args']
     assert captured['config_payload']['history_start'] == '20260101'
     assert captured['config_payload']['history_end'] == '20260324'
+    assert captured['config_payload']['report_dir'] == 'data/reports/user_pattern_backtests_recent6m'
+    assert str(captured['args'][-1]).endswith('data\\reports\\user_pattern_backtests_recent6m')
+
+
+def test_list_pattern_report_dirs_returns_compatible_dirs(monkeypatch, tmp_path: Path) -> None:
+    reports_root = tmp_path / 'reports'
+    reports_root.mkdir()
+    valid_a = reports_root / 'pattern-a'
+    valid_b = reports_root / 'pattern-b'
+    invalid = reports_root / 'not-pattern'
+    valid_a.mkdir()
+    valid_b.mkdir()
+    invalid.mkdir()
+    (valid_a / 'summary.json').write_text('[{"mode":"B1","report_path":"a.csv"}]', encoding='utf-8')
+    (valid_b / 'summary.json').write_text('[{"mode":"B2","report_path":"b.csv"}]', encoding='utf-8')
+    (invalid / 'summary.json').write_text('{"foo":"bar"}', encoding='utf-8')
+    os.utime(valid_a, (1_710_000_000, 1_710_000_000))
+    os.utime(valid_b, (1_720_000_000, 1_720_000_000))
+
+    monkeypatch.setattr(dp, 'REPORTS_ROOT', reports_root)
+    monkeypatch.setattr(dp, 'USER_PATTERN_REPORT_DIR', valid_a)
+    monkeypatch.setattr(dp, 'workspace_relative', lambda path: Path(path).name)
+
+    rows = dp.list_pattern_report_dirs()
+
+    assert [row['label'] for row in rows] == ['pattern-b', 'pattern-a']
+    assert [row['value'] for row in rows] == ['pattern-b', 'pattern-a']
+
+
+def test_default_pattern_report_dir_prefers_explicit_b1sample_directory() -> None:
+    rows = [
+        {'label': 'pattern-b', 'value': 'pattern-b'},
+        {'label': dp.DEFAULT_PATTERN_REPORT_DIR_NAME, 'value': f'data/reports/{dp.DEFAULT_PATTERN_REPORT_DIR_NAME}'},
+        {'label': 'pattern-a', 'value': 'pattern-a'},
+    ]
+
+    selected = dp._default_pattern_report_dir_value(rows)
+
+    assert selected == f'data/reports/{dp.DEFAULT_PATTERN_REPORT_DIR_NAME}'
 
 
 def test_b1_score_card_returns_series(tmp_path: Path) -> None:
@@ -256,8 +360,8 @@ def test_b1_score_card_returns_series(tmp_path: Path) -> None:
     assert len(payload["series"]) == 2
 
 
-def test_list_and_delete_strategy_backtest_results() -> None:
-    database_url = "sqlite+pysqlite:///data/pytest_tmp/pattern_registry_test.db"
+def test_list_and_delete_strategy_backtest_results(tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{(tmp_path / 'pattern_registry_test.db').as_posix()}"
     session_factory = create_session_factory(database_url)
     with session_scope(session_factory) as session:
         strategy = CommonStrategyModel(strategy_key="b1", display_name="形态策略 B1", is_active=1)

@@ -233,6 +233,54 @@ def command_history(args):
         return emit_error("history 查询失败: {0}".format(exc))
 
 
+def command_financial_data(args):
+    xtconstant, xtdata, XtQuantTrader, StockAccount = bootstrap_runtime(args.install_dir)
+    try:
+        import pandas as pd
+    except Exception as exc:
+        return emit_error("financial-data 查询失败: pandas 未安装 ({0})".format(exc))
+
+    try:
+        symbols = split_symbols(args.symbols)
+        tables = split_symbols(args.tables)
+        if not symbols or not tables:
+            return emit_ok({"symbols": symbols, "tables": tables, "data": {}})
+
+        xtdata.download_financial_data(symbols, tables, args.start_time, args.end_time)
+        dataset = xtdata.get_financial_data(
+            symbols,
+            tables,
+            args.start_time,
+            args.end_time,
+            args.report_type,
+        ) or {}
+
+        normalized = {}
+        for symbol, table_map in dataset.items():
+            normalized_tables = {}
+            for table_name, frame in (table_map or {}).items():
+                if frame is None or getattr(frame, "empty", True):
+                    normalized_tables[table_name] = []
+                    continue
+                working = frame.copy()
+                for column in working.columns:
+                    if pd.api.types.is_datetime64_any_dtype(working[column]):
+                        working[column] = working[column].dt.strftime("%Y-%m-%d")
+                normalized_tables[table_name] = json.loads(working.to_json(orient="records", force_ascii=False))
+            normalized[symbol] = normalized_tables
+
+        return emit_ok(
+            {
+                "symbols": symbols,
+                "tables": tables,
+                "report_type": args.report_type,
+                "data": normalized,
+            }
+        )
+    except Exception as exc:
+        return emit_error("financial-data 查询失败: {0}".format(exc))
+
+
 def command_account(args):
     xtconstant, xtdata, XtQuantTrader, StockAccount = bootstrap_runtime(args.install_dir)
     trader = None
@@ -342,6 +390,14 @@ def build_parser():
     history_parser.add_argument("--dividend-type", default="front")
     history_parser.add_argument("--fill-data", default="true")
 
+    financial_parser = subparsers.add_parser("financial-data")
+    add_common(financial_parser)
+    financial_parser.add_argument("--symbols", required=True)
+    financial_parser.add_argument("--tables", required=True)
+    financial_parser.add_argument("--start-time", default="")
+    financial_parser.add_argument("--end-time", default="")
+    financial_parser.add_argument("--report-type", default="announce_time")
+
     account_parser = subparsers.add_parser("account")
     add_common(account_parser)
 
@@ -365,6 +421,7 @@ def main():
         "instrument-detail": command_instrument_detail,
         "sector-members": command_sector_members,
         "history": command_history,
+        "financial-data": command_financial_data,
         "account": command_account,
         "order": command_order,
     }
