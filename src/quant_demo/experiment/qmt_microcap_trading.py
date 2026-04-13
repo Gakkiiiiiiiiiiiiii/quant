@@ -70,7 +70,6 @@ class QmtMicrocapTradingEngine:
         self.bridge = QmtBridgeClient(app_settings)
 
     def run(self, initial_cash: Decimal) -> tuple[Path, EvaluationResult, pd.DataFrame]:
-        _ = initial_cash
         self._refresh_history()
         prepared, instrument_frame = self._load_prepared_history()
         if prepared.empty:
@@ -88,11 +87,15 @@ class QmtMicrocapTradingEngine:
         }
         account_snapshot = self.bridge.get_account_snapshot()
         live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
+        strategy_total_asset = self._resolve_strategy_total_asset(initial_cash, reported_total_asset)
+        strategy_total_asset = self._apply_strategy_capital(live_state, strategy_total_asset, fallback_prices)
 
-        target_meta = self._build_target_metadata(latest_date, day_frame, live_state, reported_total_asset)
+        target_meta = self._build_target_metadata(latest_date, day_frame, live_state, strategy_total_asset)
         quote_symbols = sorted(set(target_meta["targets"]) | set(live_state.positions))
         quotes = self.bridge.get_quotes(quote_symbols) if quote_symbols else {}
         price_map, volume_map = self._build_quote_maps(day_frame, quotes)
+        strategy_total_asset = self._apply_strategy_capital(live_state, strategy_total_asset, price_map)
+        target_meta["strategy_total_asset"] = float(strategy_total_asset)
         planned_orders = self._build_order_plan(
             latest_date=latest_date,
             day_frame=day_frame,
@@ -121,6 +124,7 @@ class QmtMicrocapTradingEngine:
             risk_service=risk_service,
             target_meta=target_meta,
             instrument_frame=instrument_frame,
+            strategy_total_asset=strategy_total_asset,
         )
         metrics = Evaluator().evaluate(equity_curve)
         return report_path, metrics, equity_curve
@@ -346,6 +350,7 @@ class QmtMicrocapTradingEngine:
         risk_service: RiskService,
         target_meta: dict[str, Any],
         instrument_frame: pd.DataFrame,
+        strategy_total_asset: Decimal,
     ) -> tuple[pd.DataFrame, Path]:
         instrument_names = (
             instrument_frame.drop_duplicates("symbol", keep="last").set_index("symbol")["instrument_name"].fillna("").to_dict()
@@ -436,7 +441,7 @@ class QmtMicrocapTradingEngine:
                 self._apply_planned_order(planning_state, planned)
 
             snapshot_payload = self.bridge.get_account_snapshot() if qmt_enabled else account_snapshot
-            asset_row, position_rows = self._build_snapshot_rows(snapshot_payload, prices)
+            asset_row, position_rows = self._build_snapshot_rows(snapshot_payload, prices, strategy_total_asset)
             if asset_row is not None:
                 session.add(
                     AssetSnapshotModel(
@@ -474,6 +479,7 @@ class QmtMicrocapTradingEngine:
                         "target_count": target_meta["target_count"],
                         "hedge_ratio": target_meta["hedge_ratio"],
                         "cash_reserve_ratio": target_meta["cash_reserve_ratio"],
+                        "strategy_total_asset": float(strategy_total_asset),
                         "qmt_trade_enabled": qmt_enabled,
                         "planned_orders": [
                             {
@@ -548,8 +554,11 @@ class QmtMicrocapTradingEngine:
         self,
         payload: dict[str, Any],
         prices: dict[str, Decimal],
+        strategy_total_asset: Decimal | None = None,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         state, total_asset = self._build_account_state(payload, prices)
+        if strategy_total_asset is not None and strategy_total_asset > 0:
+            total_asset = self._apply_strategy_capital(state, strategy_total_asset, prices)
         asset_row = {
             "account_id": state.account_id,
             "cash": state.cash,
@@ -568,6 +577,39 @@ class QmtMicrocapTradingEngine:
             for position in state.positions.values()
         ]
         return asset_row, positions
+
+    def _resolve_strategy_total_asset(self, initial_cash: Decimal, reported_total_asset: Decimal) -> Decimal:
+        if self.app_settings.environment != Environment.PAPER:
+            return reported_total_asset
+        try:
+            requested_total_asset = Decimal(str(initial_cash))
+        except Exception:
+            return reported_total_asset
+        if requested_total_asset <= 0:
+            return reported_total_asset
+        return min(reported_total_asset, requested_total_asset)
+
+    def _apply_strategy_capital(
+        self,
+        state: AccountState,
+        strategy_total_asset: Decimal,
+        prices: dict[str, Decimal],
+    ) -> Decimal:
+        if strategy_total_asset <= 0:
+            return state.total_asset(prices)
+        position_value = Decimal("0")
+        for symbol, position in state.positions.items():
+            current_price = prices.get(symbol, position.last_price)
+            position.last_price = current_price
+            position_value += current_price * position.qty
+        capped_total_asset = max(position_value, strategy_total_asset)
+        available_cash = capped_total_asset - position_value
+        if available_cash < 0:
+            available_cash = Decimal("0")
+        state.cash = min(state.cash, available_cash)
+        state.frozen_cash = min(state.frozen_cash, max(capped_total_asset - position_value - state.cash, Decimal("0")))
+        state.peak_total_asset = capped_total_asset
+        return capped_total_asset
 
     def _clone_account_state(self, state: AccountState) -> AccountState:
         return AccountState(

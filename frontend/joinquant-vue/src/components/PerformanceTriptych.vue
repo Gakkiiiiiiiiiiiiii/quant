@@ -29,12 +29,12 @@ const props = defineProps({
 })
 
 const width = 1280
-const padding = { top: 18, right: 24, bottom: 34, left: 68 }
+const padding = { top: 22, right: 22, bottom: 34, left: 68 }
 const gap = 16
 const panelCount = 3
 const containerRef = ref(null)
 const activeIndex = ref(null)
-const hover = reactive({
+const hoverState = reactive({
   visible: false,
   left: 0,
   top: 0,
@@ -42,7 +42,6 @@ const hover = reactive({
 })
 
 const points = computed(() => {
-  const rows = []
   const length = Math.max(
     props.labels.length,
     props.strategy.length,
@@ -50,51 +49,49 @@ const points = computed(() => {
     props.excess.length,
     props.drawdown.length,
   )
-  for (let index = 0; index < length; index += 1) {
-    rows.push({
-      label: props.labels[index] || '',
-      strategy: Number(props.strategy[index]),
-      benchmark: Number(props.benchmark[index]),
-      excess: Number(props.excess[index]),
-      drawdown: Number(props.drawdown[index]),
-    })
-  }
-  return rows.filter((item) => item.label)
+  return Array.from({ length }, (_, index) => ({
+    label: props.labels[index] || '',
+    strategy: Number(props.strategy[index]),
+    benchmark: Number(props.benchmark[index]),
+    excess: Number(props.excess[index]),
+    drawdown: Number(props.drawdown[index]),
+  })).filter((item) => item.label)
 })
 
 const plotWidth = computed(() => width - padding.left - padding.right)
 const panelHeight = computed(() => Math.max(120, (props.height - padding.top - padding.bottom - gap * (panelCount - 1)) / panelCount))
 const totalHeight = computed(() => padding.top + padding.bottom + panelHeight.value * panelCount + gap * (panelCount - 1))
-const xTicks = computed(() => {
-  if (points.value.length <= 1) {
-    return []
-  }
-  const tickCount = Math.min(8, points.value.length)
-  const rawIndexes = Array.from({ length: tickCount }, (_, index) => (
-    Math.round(((points.value.length - 1) * index) / Math.max(tickCount - 1, 1))
-  ))
-  return [...new Set(rawIndexes)].map((index) => ({
-    index,
-    x: xPosition(index),
-    label: points.value[index]?.label || '',
-  }))
-})
-
 const returnRange = computed(() => buildRange([
   ...points.value.map((item) => item.strategy),
   ...points.value.map((item) => item.benchmark),
 ]))
 const excessRange = computed(() => buildRange(points.value.map((item) => item.excess), 0.12))
 const drawdownRange = computed(() => {
-  const min = Math.min(0, ...points.value.map((item) => Number.isFinite(item.drawdown) ? item.drawdown : 0))
+  const clean = points.value.map((item) => item.drawdown).filter((item) => Number.isFinite(item))
+  const min = Math.min(0, ...(clean.length > 0 ? clean : [0]))
   return { min, max: 0 }
 })
 
+const xTicks = computed(() => {
+  if (points.value.length <= 1) {
+    return []
+  }
+  const tickCount = Math.min(8, points.value.length)
+  const indexes = Array.from({ length: tickCount }, (_, index) => (
+    Math.round(((points.value.length - 1) * index) / Math.max(tickCount - 1, 1))
+  ))
+  return [...new Set(indexes)].map((index) => ({
+    index,
+    x: xPosition(index),
+    label: points.value[index]?.label || '',
+  }))
+})
+
 const activePoint = computed(() => {
-  if (activeIndex.value === null || !points.value[activeIndex.value]) {
+  if (activeIndex.value === null) {
     return null
   }
-  return points.value[activeIndex.value]
+  return points.value[activeIndex.value] || null
 })
 
 function buildRange(values, paddingRatio = 0.08) {
@@ -105,19 +102,19 @@ function buildRange(values, paddingRatio = 0.08) {
   const min = Math.min(...clean)
   const max = Math.max(...clean)
   if (min === max) {
-    const basePad = Math.abs(min || 1) * paddingRatio
-    return { min: min - basePad, max: max + basePad }
+    const pad = Math.abs(min || 1) * paddingRatio
+    return { min: min - pad, max: max + pad }
   }
   const pad = (max - min) * paddingRatio
   return { min: min - pad, max: max + pad }
 }
 
-function xPosition(index) {
-  return padding.left + (plotWidth.value * index) / Math.max(points.value.length - 1, 1)
-}
-
 function panelTop(panelIndex) {
   return padding.top + panelIndex * (panelHeight.value + gap)
+}
+
+function xPosition(index) {
+  return padding.left + (plotWidth.value * index) / Math.max(points.value.length - 1, 1)
 }
 
 function yPosition(value, range, panelIndex) {
@@ -125,23 +122,23 @@ function yPosition(value, range, panelIndex) {
   return panelTop(panelIndex) + panelHeight.value - ratio * panelHeight.value
 }
 
-function polyline(values, range, panelIndex) {
+function polyline(accessor, range, panelIndex) {
   return points.value
-    .map((item, index) => `${xPosition(index)},${yPosition(values(item), range, panelIndex)}`)
+    .map((item, index) => `${xPosition(index)},${yPosition(accessor(item), range, panelIndex)}`)
     .join(' ')
 }
 
-function areaPath(values, range, panelIndex, baselineValue = 0) {
+function areaPath(accessor, range, panelIndex, baselineValue = 0) {
   if (points.value.length === 0) {
     return ''
   }
   const baselineY = yPosition(baselineValue, range, panelIndex)
-  const head = points.value
-    .map((item, index) => `${index === 0 ? 'M' : 'L'} ${xPosition(index)} ${yPosition(values(item), range, panelIndex)}`)
-    .join(' ')
-  const lastX = xPosition(points.value.length - 1)
   const firstX = xPosition(0)
-  return `${head} L ${lastX} ${baselineY} L ${firstX} ${baselineY} Z`
+  const lastX = xPosition(points.value.length - 1)
+  const trace = points.value
+    .map((item, index) => `${index === 0 ? 'M' : 'L'} ${xPosition(index)} ${yPosition(accessor(item), range, panelIndex)}`)
+    .join(' ')
+  return `${trace} L ${lastX} ${baselineY} L ${firstX} ${baselineY} Z`
 }
 
 function ticksFor(range, count = 4) {
@@ -160,13 +157,13 @@ function formatPercent(value) {
   return `${(value * 100).toFixed(2)}%`
 }
 
-function handleMove(event) {
+function handleMouseMove(event) {
   if (!containerRef.value || points.value.length === 0) {
     return
   }
-  const rect = event.currentTarget.getBoundingClientRect()
-  const host = containerRef.value.getBoundingClientRect()
-  const x = ((event.clientX - rect.left) / Math.max(rect.width, 1)) * width
+  const svgRect = event.currentTarget.getBoundingClientRect()
+  const containerRect = containerRef.value.getBoundingClientRect()
+  const x = ((event.clientX - svgRect.left) / Math.max(svgRect.width, 1)) * width
   let nearestIndex = 0
   let nearestDistance = Number.POSITIVE_INFINITY
   points.value.forEach((_item, index) => {
@@ -177,14 +174,14 @@ function handleMove(event) {
     }
   })
   activeIndex.value = nearestIndex
-  hover.visible = true
-  hover.left = event.clientX - host.left
-  hover.top = event.clientY - host.top
-  hover.alignRight = hover.left > host.width * 0.7
+  hoverState.visible = true
+  hoverState.left = event.clientX - containerRect.left
+  hoverState.top = event.clientY - containerRect.top
+  hoverState.alignRight = hoverState.left > containerRect.width * 0.7
 }
 
-function handleLeave() {
-  hover.visible = false
+function handleMouseLeave() {
+  hoverState.visible = false
   activeIndex.value = null
 }
 </script>
@@ -198,10 +195,10 @@ function handleLeave() {
       <span><i class="is-drawdown"></i>回撤</span>
     </div>
     <div
-      v-if="hover.visible && activePoint"
+      v-if="hoverState.visible && activePoint"
       class="triptych-chart__tooltip"
-      :class="{ 'is-right': hover.alignRight }"
-      :style="{ left: `${hover.left}px`, top: `${hover.top}px` }"
+      :class="{ 'is-right': hoverState.alignRight }"
+      :style="{ left: `${hoverState.left}px`, top: `${hoverState.top}px` }"
     >
       <div class="triptych-chart__tooltip-date">{{ activePoint.label }}</div>
       <div>策略: {{ formatPercent(activePoint.strategy) }}</div>
@@ -209,17 +206,19 @@ function handleLeave() {
       <div>超额: {{ formatPercent(activePoint.excess) }}</div>
       <div>回撤: {{ formatPercent(activePoint.drawdown) }}</div>
     </div>
-    <svg :viewBox="`0 0 ${width} ${totalHeight}`" preserveAspectRatio="none" @mousemove="handleMove" @mouseleave="handleLeave">
+    <svg :viewBox="`0 0 ${width} ${totalHeight}`" preserveAspectRatio="none" @mousemove="handleMouseMove" @mouseleave="handleMouseLeave">
       <g v-for="value in ticksFor(returnRange)" :key="`ret-${value}`">
         <line :x1="padding.left" :x2="width - padding.right" :y1="yPosition(value, returnRange, 0)" :y2="yPosition(value, returnRange, 0)" class="triptych-chart__grid" />
         <text :x="padding.left - 12" :y="yPosition(value, returnRange, 0) + 4" class="triptych-chart__axis triptych-chart__axis--left">{{ formatPercent(value) }}</text>
       </g>
       <text :x="padding.left" :y="panelTop(0) - 6" class="triptych-chart__panel-title">策略收益 vs 基准</text>
+
       <g v-for="value in ticksFor(excessRange)" :key="`excess-${value}`">
         <line :x1="padding.left" :x2="width - padding.right" :y1="yPosition(value, excessRange, 1)" :y2="yPosition(value, excessRange, 1)" class="triptych-chart__grid" />
         <text :x="padding.left - 12" :y="yPosition(value, excessRange, 1) + 4" class="triptych-chart__axis triptych-chart__axis--left">{{ formatPercent(value) }}</text>
       </g>
       <text :x="padding.left" :y="panelTop(1) - 6" class="triptych-chart__panel-title">超额收益</text>
+
       <g v-for="value in ticksFor(drawdownRange)" :key="`dd-${value}`">
         <line :x1="padding.left" :x2="width - padding.right" :y1="yPosition(value, drawdownRange, 2)" :y2="yPosition(value, drawdownRange, 2)" class="triptych-chart__grid" />
         <text :x="padding.left - 12" :y="yPosition(value, drawdownRange, 2) + 4" class="triptych-chart__axis triptych-chart__axis--left">{{ formatPercent(value) }}</text>
@@ -248,7 +247,7 @@ function handleLeave() {
         class="triptych-chart__crosshair"
       />
 
-      <g v-for="tick in xTicks" :key="tick.label">
+      <g v-for="tick in xTicks" :key="`${tick.index}-${tick.label}`">
         <text :x="tick.x" :y="totalHeight - 10" class="triptych-chart__axis triptych-chart__axis--bottom">{{ tick.label }}</text>
       </g>
     </svg>

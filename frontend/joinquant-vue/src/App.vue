@@ -553,6 +553,60 @@ const microcapTriptych = computed(() => {
   if (!isMicrocapBacktest.value || assets.value.length === 0 || benchmarkCurve.value.length === 0) {
     return { labels: [], strategy: [], benchmark: [], excess: [], drawdown: [] }
   }
+
+  const strategyByDate = new Map()
+  assets.value.forEach((item) => {
+    const label = formatDatetime(item.snapshot_time || item.datetime).slice(0, 10)
+    const value = Number(item.total_asset ?? item.account)
+    if (label && Number.isFinite(value)) {
+      strategyByDate.set(label, value)
+    }
+  })
+
+  const benchmarkByDate = new Map()
+  benchmarkCurve.value.forEach((item) => {
+    const label = formatDatetime(item.trading_date || item.datetime).slice(0, 10)
+    const value = Number(item.benchmark_equity)
+    if (label && Number.isFinite(value)) {
+      benchmarkByDate.set(label, value)
+    }
+  })
+
+  const labels = [...strategyByDate.keys()]
+    .filter((label) => benchmarkByDate.has(label))
+    .sort((left, right) => left.localeCompare(right))
+
+  if (labels.length === 0) {
+    return { labels: [], strategy: [], benchmark: [], excess: [], drawdown: [] }
+  }
+
+  const strategyBase = strategyByDate.get(labels[0]) || 0
+  const benchmarkBase = benchmarkByDate.get(labels[0]) || 0
+  const strategy = []
+  const benchmark = []
+  const excess = []
+  const drawdown = []
+  let peak = strategyBase
+
+  labels.forEach((label) => {
+    const strategyValue = strategyByDate.get(label) || 0
+    const benchmarkValue = benchmarkByDate.get(label) || 0
+    peak = Math.max(peak, strategyValue)
+    const strategyReturn = strategyBase ? strategyValue / strategyBase - 1 : 0
+    const benchmarkReturn = benchmarkBase ? benchmarkValue / benchmarkBase - 1 : 0
+    strategy.push(strategyReturn)
+    benchmark.push(benchmarkReturn)
+    excess.push(strategyReturn - benchmarkReturn)
+    drawdown.push(peak > 0 ? strategyValue / peak - 1 : 0)
+  })
+
+  return { labels, strategy, benchmark, excess, drawdown }
+})
+
+const microcapTriptych = computed(() => {
+  if (!isMicrocapBacktest.value || assets.value.length === 0 || benchmarkCurve.value.length === 0) {
+    return { labels: [], strategy: [], benchmark: [], excess: [], drawdown: [] }
+  }
   const assetMap = new Map()
   assets.value.forEach((item) => {
     const label = formatDatetime(item.snapshot_time || item.datetime).slice(0, 10)

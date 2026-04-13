@@ -7,7 +7,7 @@ import pandas as pd
 from sqlalchemy import select
 
 from quant_demo.core.config import AppSettings, StrategySettings
-from quant_demo.db.models import AuditLogModel, OrderModel
+from quant_demo.db.models import AssetSnapshotModel, AuditLogModel, OrderModel
 from quant_demo.db.session import create_session_factory, session_scope
 from quant_demo.experiment.evaluator import EvaluationResult
 from quant_demo.experiment.manager import ExperimentManager
@@ -210,3 +210,61 @@ def test_qmt_microcap_trading_engine_submits_orders_and_persists_plan(tmp_path: 
     assert len(orders) == 1
     assert orders[0].broker_order_id == "mock-1"
     assert any(item.object_type == "microcap_trade_plan" for item in audits)
+
+
+def test_qmt_microcap_trading_engine_caps_paper_strategy_asset_to_initial_cash(tmp_path: Path, monkeypatch) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=False)
+    strategy_settings = _build_strategy_settings()
+    history_path = Path(app_settings.history_parquet)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_history(history_path)
+    session_factory = create_session_factory(app_settings.database_url)
+
+    instrument_frame = pd.DataFrame(
+        [
+            {"symbol": "AAA.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Alpha", "total_capital_current": 1_000_000.0},
+            {"symbol": "BBB.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Beta", "total_capital_current": 2_000_000.0},
+        ]
+    )
+    capital_frame = pd.DataFrame(columns=["symbol", "effective_date", "total_capital", "circulating_capital", "free_float_capital"])
+
+    monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
+        lambda self, symbols: instrument_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
+        lambda self, symbols: capital_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
+        lambda self: {
+            "account_id": "paper-account",
+            "asset": {"cash": 21_000_000.0, "frozen_cash": 0.0, "total_asset": 21_000_000.0},
+            "positions": [],
+            "orders": [],
+            "trades": [],
+        },
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
+        lambda self, symbols: {
+            "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000},
+            "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
+        },
+    )
+
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+    report_path, metrics, equity_curve = engine.run(Decimal("100000"))
+
+    assert report_path.exists()
+    assert metrics.turnover > 0
+    assert float(equity_curve.iloc[-1]["equity"]) == 100000.0
+
+    with session_scope(session_factory) as session:
+        asset_snapshots = list(session.scalars(select(AssetSnapshotModel).order_by(AssetSnapshotModel.snapshot_time)))
+
+    assert asset_snapshots
+    assert float(asset_snapshots[-1].total_asset) == 100000.0
+    assert float(asset_snapshots[-1].cash) <= 100000.0
