@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -110,4 +111,17 @@ def test_bridge_client_raises_on_bridge_failure(tmp_path: Path, monkeypatch: pyt
 
     client = QmtBridgeClient(settings)
     with pytest.raises(QmtUnavailableError, match="boom"):
+        client.healthcheck()
+
+
+def test_bridge_client_raises_on_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = load_app_settings(build_settings(tmp_path))
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    client = QmtBridgeClient(settings)
+    with pytest.raises(QmtUnavailableError, match="超时"):
         client.healthcheck()

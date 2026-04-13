@@ -13,6 +13,7 @@ from quant_demo.core.config import AppSettings
 from quant_demo.core.exceptions import QmtUnavailableError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
+BRIDGE_TIMEOUT_SECONDS = 30
 
 
 class QmtBridgeClient:
@@ -167,13 +168,17 @@ class QmtBridgeClient:
         cmd.extend(extra_args)
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
-        completed = subprocess.run(
-            cmd,
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            check=False,
-            env=env,
-        )
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                check=False,
+                env=env,
+                timeout=BRIDGE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise QmtUnavailableError(f"QMT 桥接调用超时（>{BRIDGE_TIMEOUT_SECONDS}s）: command={command}") from exc
         stdout = self._decode_output(completed.stdout)
         stderr = self._decode_output(completed.stderr)
         if completed.returncode != 0:

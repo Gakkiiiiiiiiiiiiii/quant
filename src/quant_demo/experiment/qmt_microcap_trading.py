@@ -1,5 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
 
 from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient
@@ -69,7 +70,86 @@ class QmtMicrocapTradingEngine:
         self.cfg = MicrocapStrategyConfig.from_strategy_settings(strategy_settings)
         self.bridge = QmtBridgeClient(app_settings)
 
+    def preview(self, initial_cash: Decimal) -> tuple[Path, dict[str, Any]]:
+        context = self._prepare_trade_context(
+            initial_cash,
+            allow_snapshot_fallback=True,
+            allow_quote_fallback=True,
+            prefer_snapshot_fallback=True,
+            prefer_quote_fallback=True,
+        )
+        plan_payload = self._build_plan_payload(
+            latest_date=context["latest_date"],
+            strategy_total_asset=context["strategy_total_asset"],
+            target_meta=context["target_meta"],
+            planned_orders=context["planned_orders"],
+            live_state=context["live_state"],
+        )
+        plan_path = self._write_trade_plan(plan_payload)
+        return plan_path, plan_payload
+
+    def execute_plan(self, plan_path: str | Path) -> tuple[Path, EvaluationResult, pd.DataFrame]:
+        payload = self._load_trade_plan(plan_path)
+        if not self.app_settings.qmt_trade_enabled:
+            raise QmtUnavailableError("paper 配置未开启 qmt_trade_enabled，当前仅允许生成预览计划")
+        strategy_total_asset = Decimal(str(payload.get("strategy_total_asset") or "0"))
+        expected_signal_date = str(payload.get("signal_trade_date") or "").strip()
+        actual_signal_date = self._load_latest_history_date().date().isoformat()
+        if expected_signal_date and expected_signal_date != actual_signal_date:
+            raise RuntimeError(f"计划信号日为 {expected_signal_date}，当前可执行信号日为 {actual_signal_date}，请先重新生成计划")
+        planned_orders = self._planned_orders_from_payload(payload)
+        fallback_prices = {item.symbol: item.price for item in planned_orders}
+        account_snapshot = self.bridge.get_account_snapshot()
+        live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
+        quote_symbols = sorted(set(fallback_prices) | set(live_state.positions))
+        quotes = self._get_quotes_payload(quote_symbols, allow_quote_fallback=True)
+        price_map, volume_map = self._build_quote_maps_from_quotes(quotes, fallback_prices)
+        strategy_total_asset = self._resolve_strategy_total_asset(strategy_total_asset, reported_total_asset)
+        strategy_total_asset = self._apply_strategy_capital(live_state, strategy_total_asset, price_map)
+        planning_state = self._clone_account_state(live_state)
+        risk_service = RiskService(
+            [
+                CashCheckRule(),
+                PositionLimitRule(self.app_settings.risk.max_position_ratio),
+                TradingWindowRule(self.app_settings.environment, self.app_settings.risk.trading_start, self.app_settings.risk.trading_end),
+                DailyLossLimitRule(self.app_settings.risk.daily_loss_limit),
+            ]
+        )
+        target_meta = dict(payload.get("target_meta") or {})
+        target_meta["strategy_total_asset"] = float(strategy_total_asset)
+        equity_curve, report_path = self._submit_and_persist(
+            latest_date=pd.Timestamp(actual_signal_date),
+            account_snapshot=account_snapshot,
+            live_state=live_state,
+            planning_state=planning_state,
+            planned_orders=planned_orders,
+            prices=price_map,
+            risk_service=risk_service,
+            target_meta=target_meta,
+            instrument_frame=pd.DataFrame(),
+            strategy_total_asset=strategy_total_asset,
+        )
+        metrics = Evaluator().evaluate(equity_curve)
+        self._write_execution_receipt(payload, planned_orders, report_path)
+        return report_path, metrics, equity_curve
+
     def run(self, initial_cash: Decimal) -> tuple[Path, EvaluationResult, pd.DataFrame]:
+        context = self._prepare_trade_context(initial_cash)
+        equity_curve, report_path = self._submit_and_persist(
+            latest_date=context["latest_date"],
+            account_snapshot=context["account_snapshot"],
+            live_state=context["live_state"],
+            planning_state=context["planning_state"],
+            planned_orders=context["planned_orders"],
+            prices=context["price_map"],
+            risk_service=context["risk_service"],
+            target_meta=context["target_meta"],
+            instrument_frame=context["instrument_frame"],
+            strategy_total_asset=context["strategy_total_asset"],
+        )
+        metrics = Evaluator().evaluate(equity_curve)
+        return report_path, metrics, equity_curve
+
         self._refresh_history()
         prepared, instrument_frame = self._load_prepared_history()
         if prepared.empty:
@@ -129,6 +209,117 @@ class QmtMicrocapTradingEngine:
         metrics = Evaluator().evaluate(equity_curve)
         return report_path, metrics, equity_curve
 
+    def _prepare_trade_context(
+        self,
+        initial_cash: Decimal,
+        planned_target_meta: dict[str, Any] | None = None,
+        *,
+        allow_snapshot_fallback: bool = False,
+        allow_quote_fallback: bool = False,
+        prefer_snapshot_fallback: bool = False,
+        prefer_quote_fallback: bool = False,
+    ) -> dict[str, Any]:
+        self._refresh_history()
+        prepared, instrument_frame = self._load_prepared_history()
+        if prepared.empty:
+            raise RuntimeError("微盘交易引擎未找到可用历史数据")
+
+        latest_date = pd.Timestamp(prepared["trading_date"].max()).normalize()
+        day_frame = prepared[prepared["trading_date"] == latest_date].copy()
+        if day_frame.empty:
+            raise RuntimeError(f"微盘交易引擎未找到 {latest_date.date()} 的截面数据")
+        day_frame = day_frame.sort_values(["market_cap_prev", "symbol"], ascending=[True, True]).set_index("symbol", drop=False)
+
+        fallback_prices = {
+            str(symbol): Decimal(str(float(row.get("close") or row.get("open") or 0.0)))
+            for symbol, row in day_frame.iterrows()
+        }
+        account_snapshot = self._get_account_snapshot_payload(
+            fallback_prices,
+            allow_snapshot_fallback=allow_snapshot_fallback,
+            prefer_snapshot_fallback=prefer_snapshot_fallback,
+        )
+        live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
+        strategy_total_asset = self._resolve_strategy_total_asset(initial_cash, reported_total_asset)
+        strategy_total_asset = self._apply_strategy_capital(live_state, strategy_total_asset, fallback_prices)
+        target_meta = self._resolve_target_metadata(
+            latest_date=latest_date,
+            day_frame=day_frame,
+            live_state=live_state,
+            strategy_total_asset=strategy_total_asset,
+            planned_target_meta=planned_target_meta,
+        )
+        quote_symbols = sorted(set(target_meta["targets"]) | set(live_state.positions))
+        quotes = self._get_quotes_payload(
+            quote_symbols,
+            allow_quote_fallback=allow_quote_fallback,
+            prefer_quote_fallback=prefer_quote_fallback,
+        )
+        price_map, volume_map = self._build_quote_maps(day_frame, quotes)
+        strategy_total_asset = self._apply_strategy_capital(live_state, strategy_total_asset, price_map)
+        target_meta["strategy_total_asset"] = float(strategy_total_asset)
+        planned_orders = self._build_order_plan(
+            latest_date=latest_date,
+            day_frame=day_frame,
+            live_state=live_state,
+            prices=price_map,
+            volumes=volume_map,
+            target_meta=target_meta,
+        )
+        planning_state = self._clone_account_state(live_state)
+        risk_service = RiskService(
+            [
+                CashCheckRule(),
+                PositionLimitRule(self.app_settings.risk.max_position_ratio),
+                TradingWindowRule(self.app_settings.environment, self.app_settings.risk.trading_start, self.app_settings.risk.trading_end),
+                DailyLossLimitRule(self.app_settings.risk.daily_loss_limit),
+            ]
+        )
+        return {
+            "latest_date": latest_date,
+            "day_frame": day_frame,
+            "account_snapshot": account_snapshot,
+            "live_state": live_state,
+            "strategy_total_asset": strategy_total_asset,
+            "target_meta": target_meta,
+            "price_map": price_map,
+            "volume_map": volume_map,
+            "planned_orders": planned_orders,
+            "planning_state": planning_state,
+            "risk_service": risk_service,
+            "instrument_frame": instrument_frame,
+        }
+
+    def _resolve_target_metadata(
+        self,
+        latest_date: pd.Timestamp,
+        day_frame: pd.DataFrame,
+        live_state: AccountState,
+        strategy_total_asset: Decimal,
+        planned_target_meta: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not planned_target_meta:
+            return self._build_target_metadata(latest_date, day_frame, live_state, strategy_total_asset)
+        targets = [str(symbol) for symbol in planned_target_meta.get("targets") or [] if str(symbol).strip()]
+        if not targets:
+            raise RuntimeError("计划文件缺少 targets，无法执行")
+        hedge_ratio = float(planned_target_meta.get("hedge_ratio", 0.0) or 0.0)
+        target_count = len(targets)
+        invest_value = float(strategy_total_asset) * (1.0 - self.cfg.cash_buffer)
+        stock_invest_value = invest_value * (1.0 - hedge_ratio)
+        each_target_value = stock_invest_value / float(target_count) if target_count > 0 else 0.0
+        return {
+            "trade_date": latest_date.date().isoformat(),
+            "targets": targets,
+            "ranked_count": int(planned_target_meta.get("ranked_count", target_count) or target_count),
+            "target_count": target_count,
+            "hedge_ratio": hedge_ratio,
+            "cash_reserve_ratio": round(hedge_ratio + self.cfg.cash_buffer, 4),
+            "stock_invest_value": stock_invest_value,
+            "each_target_value": each_target_value,
+            "planned_execution_date": str(planned_target_meta.get("planned_execution_date") or "").strip(),
+        }
+
     def _refresh_history(self) -> None:
         if self.app_settings.history_source.lower() != "qmt":
             return
@@ -142,12 +333,126 @@ class QmtMicrocapTradingEngine:
 
     def _load_prepared_history(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         loader = JoinQuantMicrocapBacktestEngine(self.session_factory, self.app_settings, self.strategy_settings)
-        history = loader._load_history()
+        history = self._load_recent_history_window()
         symbols = history["symbol"].dropna().astype(str).unique().tolist()
         instrument_frame = loader._load_instrument_frame(symbols)
         capital_frame = loader._load_capital_frame(symbols)
         prepared = loader._prepare_history(history, instrument_frame, capital_frame)
         return prepared, instrument_frame
+
+    def _load_latest_history_date(self) -> pd.Timestamp:
+        history_path = Path(self.app_settings.history_parquet)
+        frame = pd.read_parquet(history_path, columns=["trading_date"])
+        frame["trading_date"] = pd.to_datetime(frame["trading_date"]).dt.normalize()
+        start_dt = pd.Timestamp(self.app_settings.history_start or "2020-01-01").normalize()
+        if self.app_settings.history_end:
+            end_dt = pd.Timestamp(self.app_settings.history_end).normalize()
+            frame = frame[(frame["trading_date"] >= start_dt) & (frame["trading_date"] <= end_dt)].copy()
+        else:
+            frame = frame[frame["trading_date"] >= start_dt].copy()
+        if frame.empty:
+            raise RuntimeError("微盘交易引擎未找到可用历史数据")
+        return pd.Timestamp(frame["trading_date"].max()).normalize()
+
+    def _load_recent_history_window(self, window_days: int = 40) -> pd.DataFrame:
+        history_path = Path(self.app_settings.history_parquet)
+        frame = pd.read_parquet(history_path, columns=["trading_date", "symbol", "open", "close", "volume", "amount"])
+        frame["trading_date"] = pd.to_datetime(frame["trading_date"]).dt.normalize()
+        start_dt = pd.Timestamp(self.app_settings.history_start or "2020-01-01").normalize()
+        if self.app_settings.history_end:
+            end_dt = pd.Timestamp(self.app_settings.history_end).normalize()
+            frame = frame[(frame["trading_date"] >= start_dt) & (frame["trading_date"] <= end_dt)].copy()
+        else:
+            frame = frame[frame["trading_date"] >= start_dt].copy()
+        if frame.empty:
+            return frame
+        trading_dates = sorted(pd.Timestamp(item).normalize() for item in frame["trading_date"].dropna().unique())
+        keep_dates = set(trading_dates[-window_days:])
+        frame = frame[frame["trading_date"].isin(keep_dates)].copy()
+        frame["symbol"] = frame["symbol"].astype(str)
+        return frame.sort_values(["symbol", "trading_date"]).reset_index(drop=True)
+
+    def _get_account_snapshot_payload(
+        self,
+        fallback_prices: dict[str, Decimal],
+        *,
+        allow_snapshot_fallback: bool,
+        prefer_snapshot_fallback: bool = False,
+    ) -> dict[str, Any]:
+        if prefer_snapshot_fallback:
+            payload = self._load_latest_snapshot_from_db(fallback_prices)
+            if payload is not None:
+                return payload
+        try:
+            return self.bridge.get_account_snapshot()
+        except QmtUnavailableError:
+            if not allow_snapshot_fallback:
+                raise
+        payload = self._load_latest_snapshot_from_db(fallback_prices)
+        if payload is None:
+            raise QmtUnavailableError("QMT 账户快照不可用，且正式库中没有可回退的资产快照")
+        return payload
+
+    def _get_quotes_payload(
+        self,
+        symbols: list[str],
+        *,
+        allow_quote_fallback: bool,
+        prefer_quote_fallback: bool = False,
+    ) -> dict[str, Any]:
+        if not symbols:
+            return {}
+        if prefer_quote_fallback:
+            return {}
+        try:
+            return self.bridge.get_quotes(symbols)
+        except QmtUnavailableError:
+            if allow_quote_fallback:
+                return {}
+            raise
+
+    def _load_latest_snapshot_from_db(self, fallback_prices: dict[str, Decimal]) -> dict[str, Any] | None:
+        account_id = str(self.app_settings.qmt_account_id or "").strip()
+        with session_scope(self.session_factory) as session:
+            snapshot_stmt = select(AssetSnapshotModel).order_by(AssetSnapshotModel.snapshot_time.desc())
+            if account_id:
+                snapshot_stmt = snapshot_stmt.where(AssetSnapshotModel.account_id == account_id)
+            asset_snapshot = session.scalars(snapshot_stmt.limit(1)).first()
+            if asset_snapshot is None:
+                return None
+
+            snapshot_time = asset_snapshot.snapshot_time
+            position_stmt = select(PositionSnapshotModel).where(PositionSnapshotModel.snapshot_time == snapshot_time)
+            if account_id:
+                position_stmt = position_stmt.where(PositionSnapshotModel.account_id == asset_snapshot.account_id)
+            position_rows = list(session.scalars(position_stmt.order_by(PositionSnapshotModel.symbol)))
+
+        positions: list[dict[str, Any]] = []
+        for row in position_rows:
+            market_price = fallback_prices.get(row.symbol, Decimal(str(row.market_price)))
+            positions.append(
+                {
+                    "symbol": row.symbol,
+                    "qty": int(row.qty),
+                    "available_qty": int(row.available_qty),
+                    "cost_price": float(row.cost_price),
+                    "market_price": float(market_price),
+                }
+            )
+
+        return {
+            "account_id": asset_snapshot.account_id,
+            "asset": {
+                "cash": float(asset_snapshot.cash),
+                "frozen_cash": float(asset_snapshot.frozen_cash),
+                "total_asset": float(asset_snapshot.total_asset),
+            },
+            "positions": positions,
+            "orders": [],
+            "trades": [],
+            "source": "db_snapshot_fallback",
+            "snapshot_time": snapshot_time.isoformat(),
+        }
 
     def _build_target_metadata(
         self,
@@ -186,6 +491,155 @@ class QmtMicrocapTradingEngine:
             "stock_invest_value": stock_invest_value,
             "each_target_value": each_target_value,
         }
+
+    def _build_plan_payload(
+        self,
+        latest_date: pd.Timestamp,
+        strategy_total_asset: Decimal,
+        target_meta: dict[str, Any],
+        planned_orders: list[PlannedOrder],
+        live_state: AccountState,
+    ) -> dict[str, Any]:
+        signal_trade_date = latest_date.date().isoformat()
+        planned_execution_date = str((latest_date + pd.offsets.BDay(1)).date())
+        return {
+            "strategy": self.strategy_settings.name,
+            "generated_at": datetime.now().isoformat(),
+            "signal_trade_date": signal_trade_date,
+            "planned_execution_date": planned_execution_date,
+            "account_id": live_state.account_id,
+            "strategy_total_asset": float(strategy_total_asset),
+            "target_meta": {
+                "trade_date": signal_trade_date,
+                "planned_execution_date": planned_execution_date,
+                "targets": list(target_meta.get("targets") or []),
+                "ranked_count": int(target_meta.get("ranked_count", 0) or 0),
+                "target_count": int(target_meta.get("target_count", 0) or 0),
+                "hedge_ratio": float(target_meta.get("hedge_ratio", 0.0) or 0.0),
+                "cash_reserve_ratio": float(target_meta.get("cash_reserve_ratio", 0.0) or 0.0),
+                "stock_invest_value": float(target_meta.get("stock_invest_value", 0.0) or 0.0),
+                "each_target_value": float(target_meta.get("each_target_value", 0.0) or 0.0),
+            },
+            "preview_orders": [
+                {
+                    "symbol": item.symbol,
+                    "side": item.side.value,
+                    "qty": item.qty,
+                    "price": float(item.price),
+                    "reason": item.reason,
+                    "metadata": item.metadata,
+                }
+                for item in planned_orders
+            ],
+            "current_positions": [
+                {
+                    "symbol": item.symbol,
+                    "qty": item.qty,
+                    "available_qty": item.available_qty,
+                    "cost_price": float(item.cost_price),
+                    "last_price": float(item.last_price),
+                }
+                for item in live_state.positions.values()
+            ],
+        }
+
+    def _trade_plan_dir(self) -> Path:
+        return Path(self.app_settings.report_dir) / "trade_plans"
+
+    def _write_trade_plan(self, payload: dict[str, Any]) -> Path:
+        plan_dir = self._trade_plan_dir()
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        signal_date = str(payload.get("signal_trade_date") or "").replace("-", "")
+        execution_date = str(payload.get("planned_execution_date") or "").replace("-", "")
+        dated_path = plan_dir / f"microcap_t1_plan_{signal_date}_for_{execution_date}.json"
+        latest_path = plan_dir / "microcap_t1_plan_latest.json"
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        dated_path.write_text(content, encoding="utf-8")
+        latest_path.write_text(content, encoding="utf-8")
+        return dated_path
+
+    def _load_trade_plan(self, plan_path: str | Path) -> dict[str, Any]:
+        path = Path(plan_path)
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        if not path.exists():
+            latest_path = self._trade_plan_dir() / "microcap_t1_plan_latest.json"
+            if latest_path.exists():
+                path = latest_path
+            else:
+                raise FileNotFoundError(f"未找到计划文件: {path}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _write_execution_receipt(self, plan_payload: dict[str, Any], planned_orders: list[PlannedOrder], report_path: Path) -> Path:
+        receipt = {
+            "strategy": self.strategy_settings.name,
+            "executed_at": datetime.now().isoformat(),
+            "signal_trade_date": plan_payload.get("signal_trade_date"),
+            "planned_execution_date": plan_payload.get("planned_execution_date"),
+            "strategy_total_asset": plan_payload.get("strategy_total_asset"),
+            "report_path": str(report_path),
+            "submitted_orders": [
+                {
+                    "symbol": item.symbol,
+                    "side": item.side.value,
+                    "qty": item.qty,
+                    "price": float(item.price),
+                    "reason": item.reason,
+                }
+                for item in planned_orders
+            ],
+        }
+        receipt_dir = self._trade_plan_dir()
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        signal_date = str(plan_payload.get("signal_trade_date") or "").replace("-", "")
+        execution_date = str(plan_payload.get("planned_execution_date") or "").replace("-", "")
+        receipt_path = receipt_dir / f"microcap_t1_execution_{signal_date}_for_{execution_date}.json"
+        receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
+        return receipt_path
+
+    def _planned_orders_from_payload(self, payload: dict[str, Any]) -> list[PlannedOrder]:
+        rows = payload.get("preview_orders") or []
+        planned_orders: list[PlannedOrder] = []
+        for item in rows:
+            symbol = str(item.get("symbol") or "").strip()
+            side = str(item.get("side") or "").strip().lower()
+            qty = int(item.get("qty") or 0)
+            price = Decimal(str(item.get("price") or 0))
+            if not symbol or side not in {OrderSide.BUY.value, OrderSide.SELL.value} or qty <= 0 or price <= 0:
+                continue
+            planned_orders.append(
+                PlannedOrder(
+                    symbol=symbol,
+                    side=OrderSide(side),
+                    qty=qty,
+                    price=price,
+                    reason=str(item.get("reason") or "rebalance_buy"),
+                    metadata=dict(item.get("metadata") or {}),
+                )
+            )
+        if not planned_orders:
+            raise RuntimeError("计划文件中没有可执行委托")
+        return planned_orders
+
+    def _build_quote_maps_from_quotes(
+        self,
+        quotes: dict[str, Any],
+        fallback_prices: dict[str, Decimal],
+    ) -> tuple[dict[str, Decimal], dict[str, float]]:
+        prices: dict[str, Decimal] = {}
+        volumes: dict[str, float] = {}
+        symbols = sorted(set(fallback_prices) | set(quotes))
+        for symbol in symbols:
+            quote = quotes.get(symbol, {}) if isinstance(quotes, dict) else {}
+            last_price = self._pick_number(quote, "last_price", default=float(fallback_prices.get(symbol, Decimal("0"))))
+            if last_price <= 0:
+                last_price = self._resolve_quote_price(quote, is_buy=True)
+            if last_price <= 0:
+                last_price = float(fallback_prices.get(symbol, Decimal("0.01")))
+            prices[symbol] = Decimal(str(round(max(last_price, 0.01), 4)))
+            volume = self._pick_number(quote, "volume", default=0.0)
+            volumes[symbol] = volume
+        return prices, volumes
 
     def _build_quote_maps(
         self,
@@ -382,7 +836,7 @@ class QmtMicrocapTradingEngine:
                     AuditLogModel(
                         object_type="risk_decision",
                         object_id=decision.risk_decision_id,
-                        message=f"{planned.symbol} 风控{'通过' if decision.is_approved() else '拒绝'}",
+                        message=f"{planned.symbol} 椋庢帶{'閫氳繃' if decision.is_approved() else '鎷掔粷'}",
                         payload={"reason": planned.reason, "rules": [asdict(result) for result in decision.rule_results]},
                     )
                 )
@@ -416,7 +870,7 @@ class QmtMicrocapTradingEngine:
                         AuditLogModel(
                             object_type="order",
                             object_id=order.order_id,
-                            message=f"{planned.symbol} 已提交 QMT 委托",
+                            message=f"{planned.symbol} 宸叉彁浜?QMT 濮旀墭",
                             payload={"broker_order_id": broker_order_id, "side": planned.side.value, "qty": planned.qty, "price": float(planned.price)},
                         )
                     )
@@ -433,7 +887,7 @@ class QmtMicrocapTradingEngine:
                         AuditLogModel(
                             object_type="order_preview",
                             object_id=order.order_id,
-                            message=f"{planned.symbol} 生成预演委托，未提交 QMT",
+                            message=f"{planned.symbol} 鐢熸垚棰勬紨濮旀墭锛屾湭鎻愪氦 QMT",
                             payload={"side": planned.side.value, "qty": planned.qty, "price": float(planned.price)},
                         )
                     )
