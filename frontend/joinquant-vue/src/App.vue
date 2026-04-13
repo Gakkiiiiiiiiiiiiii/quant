@@ -1,12 +1,13 @@
 ﻿<script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import { apiGet, apiPost } from './api'
 import DataTable from './components/DataTable.vue'
 import LineChart from './components/LineChart.vue'
 import MetricStrip from './components/MetricStrip.vue'
+import PerformanceTriptych from './components/PerformanceTriptych.vue'
 
-const sections = ['收益概述', '交易详情', '每日持仓&收益', '日志输出', '性能分析', '策略代码', 'Qlib 全市场', '形态实验室']
+const sections = ['收益概述', 'QMT 交易看板', '交易详情', '每日持仓&收益', '日志输出', '性能分析', '策略代码', 'Qlib 全市场', '形态实验室']
 const tradeTabs = [
   { key: 'pattern_actions', label: '每日交易记录' },
   { key: 'pattern_decisions', label: '每日决策' },
@@ -14,13 +15,14 @@ const tradeTabs = [
 ]
 const sectionMeta = {
   收益概述: { code: '01', note: '权益、超额与关键指标' },
-  交易详情: { code: '02', note: '成交、决策与报告' },
-  '每日持仓&收益': { code: '03', note: '资产轨迹与仓位快照' },
-  日志输出: { code: '04', note: '系统、测试与接口日志' },
-  性能分析: { code: '05', note: '状态、告警与持仓画像' },
-  策略代码: { code: '06', note: '策略模板与运行入口' },
-  'Qlib 全市场': { code: '07', note: '历史数据与全市场回测' },
-  形态实验室: { code: '08', note: '实验策略与可视化产物' },
+  'QMT 交易看板': { code: '02', note: 'T+1 计划、当日执行与实时持仓' },
+  交易详情: { code: '03', note: '成交、决策与报告' },
+  '每日持仓&收益': { code: '04', note: '资产轨迹与仓位快照' },
+  日志输出: { code: '05', note: '系统、测试与接口日志' },
+  性能分析: { code: '06', note: '状态、告警与持仓画像' },
+  策略代码: { code: '07', note: '策略模板与运行入口' },
+  'Qlib 全市场': { code: '08', note: '历史数据与全市场回测' },
+  形态实验室: { code: '09', note: '实验策略与可视化产物' },
 }
 
 const profile = ref('backtest')
@@ -29,6 +31,7 @@ const activeSection = ref('收益概述')
 const activeTradeTab = ref('pattern_actions')
 const selectedLogSource = ref('QMT 客户端')
 const refreshInterval = ref(0)
+const qmtStream = ref(null)
 
 const state = reactive({
   loading: false,
@@ -214,6 +217,65 @@ async function fetchBootstrap({ preserveForms = false } = {}) {
   }
 }
 
+function closeQmtStream() {
+  if (qmtStream.value) {
+    qmtStream.value.close()
+    qmtStream.value = null
+  }
+}
+
+function connectQmtStream() {
+  closeQmtStream()
+  if (!state.payload || profile.value === 'backtest') {
+    return
+  }
+  const streamUrl = new URL('/api/qmt/stream', window.location.origin)
+  streamUrl.searchParams.set('profile', profile.value)
+  if (state.payload.config_path) {
+    streamUrl.searchParams.set('config', state.payload.config_path)
+  }
+  const source = new EventSource(streamUrl.toString())
+  source.addEventListener('qmt-trade-board', (event) => {
+    try {
+      const payload = JSON.parse(event.data)
+      if (!state.payload || payload.profile !== profile.value) {
+        return
+      }
+      state.payload.generated_at = payload.generated_at || state.payload.generated_at
+      if (payload.overview) {
+        state.payload.overview = payload.overview
+      }
+      if (payload.connection) {
+        state.payload.connection = payload.connection
+      }
+      state.payload.data = state.payload.data || {}
+      state.payload.data.qmt_trade_board = payload.qmt_trade_board || {}
+    } catch (error) {
+      console.error('qmt stream payload parse failed', error)
+    }
+  })
+  source.addEventListener('qmt-trade-board-error', (event) => {
+    try {
+      const payload = JSON.parse(event.data)
+      console.error('qmt stream error', payload.error || payload)
+    } catch (error) {
+      console.error('qmt stream error parse failed', error)
+    }
+  })
+  source.onerror = () => {
+    source.close()
+    qmtStream.value = null
+    if (profile.value !== 'backtest') {
+      window.setTimeout(() => {
+        if (!qmtStream.value && profile.value !== 'backtest') {
+          connectQmtStream()
+        }
+      }, 3000)
+    }
+  }
+  qmtStream.value = source
+}
+
 async function runStrategy(action) {
   actionState.busy = 'strategy'
   try {
@@ -273,7 +335,7 @@ const logs = computed(() => state.payload?.logs || {})
 const dashboardData = computed(() => state.payload?.data || {})
 const qlibStatus = computed(() => state.payload?.qlib?.status || {})
 const pattern = computed(() => state.payload?.pattern || { summary: [], comparison: [] })
-const primaryMode = computed(() => pattern.value.primary_mode || 'B1')
+const primaryMode = computed(() => pattern.value.primary_mode || '')
 const profileOptions = computed(() => state.payload?.meta?.profiles || [])
 const strategyOptions = computed(() => state.payload?.meta?.strategies || [])
 const patternDirOptions = computed(() => pattern.value.report_dirs || [])
@@ -287,9 +349,11 @@ const genericTrades = computed(() => dashboardData.value.trades || [])
 const positions = computed(() => dashboardData.value.positions || [])
 const assets = computed(() => dashboardData.value.assets || [])
 const benchmarkCurve = computed(() => dashboardData.value.benchmark_curve || [])
+const qmtTradeBoard = computed(() => dashboardData.value.qmt_trade_board || {})
 const patternSummary = computed(() => pattern.value.summary || [])
 const patternComparison = computed(() => pattern.value.comparison || [])
 const isMicrocapBacktest = computed(() => assets.value.some((item) => item.account_id === 'joinquant_microcap_alpha'))
+const hasQmtTradeBoard = computed(() => Boolean(qmtTradeBoard.value.available))
 const patternImageUrl = computed(() => {
   if (!pattern.value.png_url) {
     return ''
@@ -363,6 +427,21 @@ const overviewHeroFacts = computed(() => ([
   },
 ]))
 
+const jqLikeMetrics = computed(() => ([
+  { label: '策略收益', value: formatRatio(overview.value.total_return) },
+  { label: '基准收益', value: formatRatio(benchmarkReturn.value) },
+  { label: '超额收益', value: formatRatio(excessReturn.value) },
+  { label: '最大回撤', value: formatRatio(overview.value.drawdown) },
+  { label: '累计换手', value: formatMoney(overview.value.turnover) },
+  { label: '仓位', value: formatRatio(overview.value.exposure) },
+  { label: '订单数', value: String(overview.value.order_count ?? 0) },
+  { label: '成交数', value: String(overview.value.trade_count ?? 0) },
+  { label: '总资产', value: formatMoney(overview.value.total_asset) },
+  { label: '现金', value: formatMoney(overview.value.cash) },
+  { label: '持仓市值', value: formatMoney(overview.value.market_value) },
+  { label: '最新快照', value: formatDatetime(overview.value.latest_time).slice(0, 10) },
+]))
+
 const overviewMetrics = computed(() => [
   { label: '策略收益', value: formatRatio(overview.value.total_return), tone: toneFromValue(overview.value.total_return) },
   { label: '最大回撤', value: formatRatio(overview.value.drawdown), tone: 'negative' },
@@ -377,6 +456,69 @@ const performanceMetrics = computed(() => [
   { label: '持仓市值', value: formatMoney(overview.value.market_value) },
   { label: '仓位', value: formatRatio(overview.value.exposure) },
 ])
+
+const qmtBoardMetrics = computed(() => {
+  const summary = qmtTradeBoard.value.summary || {}
+  const realtimeAsset = qmtTradeBoard.value.realtime_asset || {}
+  return [
+    {
+      label: 'T 日',
+      value: qmtTradeBoard.value.trade_date || '--',
+      foot: qmtTradeBoard.value.next_trade_date ? `T+1 ${qmtTradeBoard.value.next_trade_date}` : '等待计划生成',
+    },
+    {
+      label: '计划买卖',
+      value: `${summary.planned_buy_count ?? 0} / ${summary.planned_sell_count ?? 0}`,
+      foot: qmtTradeBoard.value.plan_status || '--',
+    },
+    {
+      label: '实际买卖',
+      value: `${summary.actual_buy_count ?? 0} / ${summary.actual_sell_count ?? 0}`,
+      foot: qmtTradeBoard.value.actual_source || '--',
+    },
+    {
+      label: '实时持仓',
+      value: String(summary.position_count ?? 0),
+      foot: `现金 ${formatMoney(realtimeAsset.cash)}`,
+    },
+    {
+      label: '持仓市值',
+      value: formatMoney(realtimeAsset.market_value),
+      foot: `总资产 ${formatMoney(realtimeAsset.total_asset)}`,
+    },
+  ]
+})
+
+const qmtPlanColumns = computed(() => ([
+  { key: 'symbol', label: '代码', sticky: true, width: 104, code: true },
+  { key: 'instrument_name', label: '名称', sticky: true, width: 120 },
+  { key: 'qty', label: '数量', width: 84, align: 'right', formatter: formatInteger },
+  { key: 'price', label: '价格', width: 84, align: 'right' },
+  { key: 'amount', label: '金额', width: 112, align: 'right', formatter: formatSignedMoney },
+  { key: 'reason', label: '原因', minWidth: 180, maxWidth: 240, wrap: true, code: true },
+]))
+
+const qmtActualColumns = computed(() => ([
+  { key: 'symbol', label: '代码', sticky: true, width: 104, code: true },
+  { key: 'instrument_name', label: '名称', sticky: true, width: 120 },
+  { key: 'qty', label: '数量', width: 84, align: 'right', formatter: formatInteger },
+  { key: 'price', label: '价格', width: 84, align: 'right' },
+  { key: 'amount', label: '金额', width: 112, align: 'right', formatter: formatSignedMoney },
+  { key: 'status', label: '状态', width: 108, align: 'center' },
+  { key: 'executed_at', label: '时间', minWidth: 156, formatter: formatDatetime },
+  { key: 'broker_order_id', label: '券商单号', minWidth: 132, code: true },
+]))
+
+const qmtPositionColumns = computed(() => ([
+  { key: 'symbol', label: '代码', sticky: true, width: 104, code: true },
+  { key: 'instrument_name', label: '名称', sticky: true, width: 120 },
+  { key: 'qty', label: '持仓', width: 84, align: 'right', formatter: formatInteger },
+  { key: 'available_qty', label: '可用', width: 84, align: 'right', formatter: formatInteger },
+  { key: 'cost_price', label: '成本价', width: 88, align: 'right' },
+  { key: 'market_price', label: '现价', width: 88, align: 'right' },
+  { key: 'market_value', label: '市值', width: 116, align: 'right', formatter: formatSignedMoney },
+  { key: 'unrealized_pnl', label: '浮盈亏', width: 116, align: 'right', formatter: formatSignedMoney, tone: 'pnl' },
+]))
 
 const equitySeries = computed(() => {
   const strategyPoints = assets.value
@@ -405,6 +547,52 @@ const equitySeries = computed(() => {
     points: normalizeCurvePoints(benchmarkPoints),
   }
   return [strategySeries, benchmarkSeries].filter((item) => item.points.length > 0)
+})
+
+const microcapTriptych = computed(() => {
+  if (!isMicrocapBacktest.value || assets.value.length === 0 || benchmarkCurve.value.length === 0) {
+    return { labels: [], strategy: [], benchmark: [], excess: [], drawdown: [] }
+  }
+  const assetMap = new Map()
+  assets.value.forEach((item) => {
+    const label = formatDatetime(item.snapshot_time || item.datetime).slice(0, 10)
+    const value = Number(item.total_asset ?? item.account)
+    if (label && Number.isFinite(value)) {
+      assetMap.set(label, value)
+    }
+  })
+  const benchmarkMap = new Map()
+  benchmarkCurve.value.forEach((item) => {
+    const label = formatDatetime(item.trading_date || item.datetime).slice(0, 10)
+    const value = Number(item.benchmark_equity)
+    if (label && Number.isFinite(value)) {
+      benchmarkMap.set(label, value)
+    }
+  })
+  const labels = [...assetMap.keys()].filter((label) => benchmarkMap.has(label)).sort((left, right) => left.localeCompare(right))
+  if (labels.length === 0) {
+    return { labels: [], strategy: [], benchmark: [], excess: [], drawdown: [] }
+  }
+  const strategyBase = assetMap.get(labels[0]) || 0
+  const benchmarkBase = benchmarkMap.get(labels[0]) || 0
+  let runningPeak = 0
+  const strategy = []
+  const benchmark = []
+  const excess = []
+  const drawdown = []
+  labels.forEach((label) => {
+    const strategyValue = assetMap.get(label) || 0
+    const benchmarkValue = benchmarkMap.get(label) || 0
+    const strategyReturn = strategyBase ? strategyValue / strategyBase - 1 : 0
+    const benchmarkReturn = benchmarkBase ? benchmarkValue / benchmarkBase - 1 : 0
+    runningPeak = Math.max(runningPeak, strategyValue)
+    const drawdownValue = runningPeak > 0 ? strategyValue / runningPeak - 1 : 0
+    strategy.push(strategyReturn)
+    benchmark.push(benchmarkReturn)
+    excess.push(strategyReturn - benchmarkReturn)
+    drawdown.push(drawdownValue)
+  })
+  return { labels, strategy, benchmark, excess, drawdown }
 })
 
 const patternSeries = computed(() => {
@@ -517,8 +705,18 @@ const hasPatternTradeData = computed(() => (
 ))
 
 watch(profile, () => {
+  closeQmtStream()
   fetchBootstrap()
 })
+
+watch(
+  () => state.payload?.config_path,
+  () => {
+    if (state.payload) {
+      connectQmtStream()
+    }
+  },
+)
 
 watch(
   logs,
@@ -546,6 +744,10 @@ watch(refreshInterval, (value) => {
 onMounted(() => {
   fetchBootstrap()
 })
+
+onBeforeUnmount(() => {
+  closeQmtStream()
+})
 </script>
 
 <template>
@@ -556,7 +758,7 @@ onMounted(() => {
         <h1>JoinQuant 风格量化平台</h1>
         <div class="jq-topbar__sub">Vue 版前端，默认展示当前回测产物，并保留形态实验室与全市场入口。</div>
         <div class="jq-topbar__chips">
-          <span class="hero-chip hero-chip--brand">{{ isMicrocapBacktest ? '聚宽微盘 Alpha' : (primaryMode || '策略面板') }}</span>
+          <span class="hero-chip hero-chip--brand">{{ isMicrocapBacktest ? '聚宽微盘 Alpha' : '扩展策略' }}</span>
           <span class="hero-chip">{{ connection.label || '--' }}</span>
           <span class="hero-chip">区间 {{ assetDateRange }}</span>
         </div>
@@ -597,12 +799,6 @@ onMounted(() => {
             <option :value="30">30 秒</option>
           </select>
         </label>
-        <label>
-          <span>结果目录</span>
-          <select v-model="selectedPatternReportDir" @change="fetchBootstrap({ preserveForms: true })">
-            <option v-for="item in patternDirOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
-          </select>
-        </label>
       </div>
       <div class="jq-toolbar__right">
         <div class="toolbar-stat">
@@ -638,19 +834,19 @@ onMounted(() => {
             <small>{{ sectionMeta[section].note }}</small>
           </span>
         </button>
-        <div class="side-nav__hint">概览页默认展示当前回测结果，形态实验室仍可单独查看 {{ primaryMode }} 的实验产物。</div>
+        <div class="side-nav__hint">概览页默认展示当前回测结果，形态实验室单独承载扩展策略实验产物。</div>
       </aside>
 
       <section class="content-stage">
         <template v-if="activeSection === '收益概述'">
-          <section class="overview-hero">
+          <section class="overview-hero overview-hero--compact">
             <div class="overview-hero__copy">
-              <div class="overview-hero__kicker">{{ activeSectionMeta.code }} / {{ isMicrocapBacktest ? 'Microcap Alpha Board' : `${primaryMode} Strategy Board` }}</div>
-              <h2>{{ isMicrocapBacktest ? '聚宽微盘 Alpha 回测总览' : `${primaryMode} 策略总览` }}</h2>
+              <div class="overview-hero__kicker">{{ activeSectionMeta.code }} / {{ isMicrocapBacktest ? 'Microcap Alpha Board' : 'Strategy Board' }}</div>
+              <h2>{{ isMicrocapBacktest ? '聚宽微盘 Alpha 回测总览' : '扩展策略总览' }}</h2>
               <p>
                 {{ isMicrocapBacktest
-                  ? '主图展示策略与 Benchmark 的累计收益，右侧收口到最近成交，首屏优先给出结果而不是表单。'
-                  : '当前版式强调收益曲线、策略状态和实验入口的层级关系，减少信息抢占。'
+                  ? '按 JoinQuant 风格重排首屏，优先放大收益曲线与核心指标，让回测结果一进来就能看清。'
+                  : '首屏优先展示策略曲线和关键结果，把操作入口和次级信息收纳到后面。'
                 }}
               </p>
             </div>
@@ -662,36 +858,56 @@ onMounted(() => {
               </article>
             </div>
           </section>
-          <div class="overview-grid">
-            <div class="panel-card panel-card--main">
-              <div class="panel-card__header">
+          <div class="jq-analytics-shell">
+            <div class="panel-card panel-card--main panel-card--jq">
+              <div class="panel-card__header panel-card__header--tight">
                 <div>
                   <h2>收益概述</h2>
-                  <p>策略净值、Benchmark 与关键收益指标。</p>
+                  <p>策略净值、Benchmark、超额收益与关键指标。</p>
+                </div>
+                <div class="jq-date-range">
+                  <span>区间</span>
+                  <strong>{{ assetDateRange }}</strong>
                 </div>
               </div>
-              <MetricStrip :items="overviewMetrics" />
-              <LineChart :series="equitySeries" :height="520" :as-percent="true" />
+              <div class="jq-metric-grid">
+                <article v-for="item in jqLikeMetrics" :key="item.label" class="jq-metric-item">
+                  <span>{{ item.label }}</span>
+                  <strong>{{ item.value }}</strong>
+                </article>
+              </div>
+              <div class="jq-chart-frame">
+                <PerformanceTriptych
+                  v-if="isMicrocapBacktest"
+                  :labels="microcapTriptych.labels"
+                  :strategy="microcapTriptych.strategy"
+                  :benchmark="microcapTriptych.benchmark"
+                  :excess="microcapTriptych.excess"
+                  :drawdown="microcapTriptych.drawdown"
+                  :height="760"
+                />
+                <LineChart v-else :series="equitySeries" :height="760" :as-percent="true" :fill-area="true" />
+              </div>
             </div>
-            <div class="panel-card panel-card--side">
+            <div class="panel-card panel-card--side panel-card--jq-side">
               <div v-if="isMicrocapBacktest">
                 <div class="panel-card__header">
                   <div>
                     <h2>近期成交</h2>
-                    <p>首屏展示最近的调仓记录，避免把重要信息压到明细页。</p>
+                    <p>最近调仓记录，便于把曲线和执行动作一起对照。</p>
                   </div>
                 </div>
-                <DataTable :rows="recentTradePreview" :columns="overviewTradeColumns" :max-height="430" empty-text="暂无成交记录" />
+                <DataTable :rows="recentTradePreview" :columns="overviewTradeColumns" :max-height="720" empty-text="暂无成交记录" />
               </div>
               <div v-else>
                 <div class="panel-card__header">
                   <div>
-                    <h2>形态策略看板</h2>
-                    <p>{{ primaryMode }} 与 Benchmark 的最新对比。</p>
+                    <h2>扩展策略看板</h2>
+                    <p>扩展策略与 Benchmark 的最新对比。</p>
                   </div>
                 </div>
-                <LineChart :series="patternSeries" :height="320" :as-percent="true" />
-                <DataTable :rows="patternSummary" :max-height="220" empty-text="暂无形态策略回测结果" />
+                <LineChart :series="patternSeries" :height="360" :as-percent="true" :fill-area="true" />
+                <DataTable :rows="patternSummary" :max-height="280" empty-text="暂无形态策略回测结果" />
               </div>
             </div>
           </div>
@@ -702,7 +918,7 @@ onMounted(() => {
             <div class="panel-card__header panel-card__header--tabs">
               <div>
                 <h2>交易详情</h2>
-                <p>{{ hasPatternTradeData ? `${primaryMode} 回测的逐日交易记录、决策与风险指标。` : '当前回测的成交明细与日终报告。' }}</p>
+                <p>{{ hasPatternTradeData ? '扩展策略回测的逐日交易记录、决策与风险指标。' : '当前回测的成交明细与日终报告。' }}</p>
               </div>
               <div v-if="hasPatternTradeData" class="mini-tabs">
                 <button
@@ -734,6 +950,82 @@ onMounted(() => {
               <h3>日终报告</h3>
               <pre>{{ dashboardData.report_text || '暂无日终报告。' }}</pre>
             </div>
+          </div>
+        </template>
+
+        <template v-else-if="activeSection === 'QMT 交易看板'">
+          <div class="panel-card">
+            <div class="panel-card__header">
+              <div>
+                <h2>QMT 交易看板</h2>
+                <p>{{ qmtTradeBoard.message || '展示 T 日生成的 T+1 计划、当日实际执行以及当前持仓。' }}</p>
+              </div>
+              <div class="toolbar-stat">
+                <span>计划生成时间</span>
+                <strong>{{ formatDatetime(qmtTradeBoard.plan_generated_at) }}</strong>
+              </div>
+            </div>
+            <MetricStrip :items="qmtBoardMetrics" />
+            <div v-if="qmtTradeBoard.realtime_error" class="page-alert page-alert--error qmt-board-alert">
+              {{ qmtTradeBoard.realtime_error }}
+            </div>
+            <div v-if="!hasQmtTradeBoard" class="empty-state qmt-board-empty">
+              当前模式下还没有可展示的 QMT 计划或实时持仓数据。
+            </div>
+            <template v-else>
+              <div class="qmt-board-grid">
+                <section class="qmt-board-card">
+                  <div class="qmt-board-card__header">
+                    <div>
+                      <h3>T+1 计划买入</h3>
+                      <p>基于 T 日收盘生成，下一交易日执行。</p>
+                    </div>
+                    <strong>{{ (qmtTradeBoard.planned_buys || []).length }}</strong>
+                  </div>
+                  <DataTable :rows="qmtTradeBoard.planned_buys || []" :columns="qmtPlanColumns" :max-height="320" empty-text="暂无计划买入" />
+                </section>
+                <section class="qmt-board-card">
+                  <div class="qmt-board-card__header">
+                    <div>
+                      <h3>T+1 计划卖出</h3>
+                      <p>计划卖出的调仓标的与原因。</p>
+                    </div>
+                    <strong>{{ (qmtTradeBoard.planned_sells || []).length }}</strong>
+                  </div>
+                  <DataTable :rows="qmtTradeBoard.planned_sells || []" :columns="qmtPlanColumns" :max-height="320" empty-text="暂无计划卖出" />
+                </section>
+                <section class="qmt-board-card">
+                  <div class="qmt-board-card__header">
+                    <div>
+                      <h3>T 日实际买入</h3>
+                      <p>{{ qmtTradeBoard.actual_source || '实际执行来源' }}</p>
+                    </div>
+                    <strong>{{ (qmtTradeBoard.actual_buys || []).length }}</strong>
+                  </div>
+                  <DataTable :rows="qmtTradeBoard.actual_buys || []" :columns="qmtActualColumns" :max-height="320" empty-text="暂无实际买入" />
+                </section>
+                <section class="qmt-board-card">
+                  <div class="qmt-board-card__header">
+                    <div>
+                      <h3>T 日实际卖出</h3>
+                      <p>{{ qmtTradeBoard.actual_source || '实际执行来源' }}</p>
+                    </div>
+                    <strong>{{ (qmtTradeBoard.actual_sells || []).length }}</strong>
+                  </div>
+                  <DataTable :rows="qmtTradeBoard.actual_sells || []" :columns="qmtActualColumns" :max-height="320" empty-text="暂无实际卖出" />
+                </section>
+              </div>
+              <section class="qmt-board-card">
+                <div class="qmt-board-card__header">
+                  <div>
+                    <h3>实时持仓</h3>
+                    <p>优先读取 QMT 账户快照，失败时回退到本地最新持仓快照。</p>
+                  </div>
+                  <strong>{{ (qmtTradeBoard.positions || []).length }}</strong>
+                </div>
+                <DataTable :rows="qmtTradeBoard.positions || []" :columns="qmtPositionColumns" :max-height="420" empty-text="暂无实时持仓" />
+              </section>
+            </template>
           </div>
         </template>
 
@@ -876,13 +1168,21 @@ onMounted(() => {
             <div class="panel-card__header">
               <div>
                 <h2>形态实验室</h2>
-                <p>按聚宽式回测面板展示 {{ primaryMode }} 策略结果，并保留直接运行入口。</p>
+                <p>按聚宽式回测面板展示扩展策略结果，并保留直接运行入口。</p>
               </div>
               <a v-if="pattern.html_url" class="text-link" :href="pattern.html_url" target="_blank" rel="noreferrer">打开交互图</a>
             </div>
             <div class="toolbar-stat">
               <span>当前目录</span>
               <strong>{{ pattern.selected_report_dir || '--' }}</strong>
+            </div>
+            <div class="pattern-dir-picker">
+              <label>
+                <span>结果目录</span>
+                <select v-model="selectedPatternReportDir" @change="fetchBootstrap({ preserveForms: true })">
+                  <option v-for="item in patternDirOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+                </select>
+              </label>
             </div>
             <div class="form-grid form-grid--pattern">
               <label>

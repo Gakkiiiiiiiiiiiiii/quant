@@ -11,6 +11,7 @@ from quant_demo.db.session import create_session_factory, session_scope
 
 from quant_demo.api import dashboard_payloads as dp
 from quant_demo.core.config import AppSettings
+from quant_demo.core.enums import Environment
 
 
 UI_LOG = "\u0055\u0049 \u65e5\u5fd7"
@@ -120,6 +121,34 @@ def test_load_joinquant_microcap_report_builds_dashboard_data(tmp_path: Path) ->
     assert float(data.benchmark_curve.iloc[-1]['benchmark_equity']) == 105000.0
     assert dp.overview(data)['market_value'] == 105000.0
     assert '聚宽微盘 Alpha 回测报告' in data.report_text
+
+
+def test_build_joinquant_microcap_report_text_supports_cash_hedge() -> None:
+    equity = pd.DataFrame(
+        [
+            {'trading_date': pd.Timestamp('2026-04-10'), 'equity': 100000.0, 'cash': 30000.0, 'benchmark_equity': 100000.0},
+            {'trading_date': pd.Timestamp('2026-04-11'), 'equity': 110000.0, 'cash': 55000.0, 'benchmark_equity': 103000.0},
+        ]
+    )
+
+    text = dp._build_joinquant_microcap_report_text(
+        {
+            'strategy': 'joinquant_microcap_alpha',
+            'history_start': '20200101',
+            'history_end': '2026-04-11',
+            'total_return': 0.1,
+            'annualized_return': 0.02,
+            'max_drawdown': -0.05,
+            'turnover': 1234.5,
+            'hedge_name': '现金',
+            'seasonal_hedge_schedule': {'4': 0.5},
+        },
+        equity,
+        pd.DataFrame(),
+    )
+
+    assert '月历对冲: 现金' in text
+    assert "弱势月对冲表: {'4': 0.5}" in text
 
 
 def test_overview_uses_full_period_max_drawdown_instead_of_last_row() -> None:
@@ -235,6 +264,181 @@ def test_build_dashboard_payload_collects_expected_sections(monkeypatch, tmp_pat
     assert payload['connection']['label'] == '\u79bb\u7ebf\u6570\u636e\u5e93\u89c6\u56fe'
     assert payload['qlib']['status']['latest_trading_date'] == '2026-03-24'
     assert payload['logs'][UI_LOG] == 'ready'
+    assert payload['data']['qmt_trade_board']['available'] is False
+
+
+def test_build_dashboard_payload_includes_qmt_trade_board_for_paper(monkeypatch, tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path).model_copy(update={'environment': Environment.PAPER, 'qmt_trade_enabled': True})
+    config_path = tmp_path / 'paper.yaml'
+    config_ref = config_path
+
+    dashboard_data = dp.DashboardData(
+        assets=pd.DataFrame(
+            [
+                {
+                    'account_id': 'qmt-paper',
+                    'snapshot_time': pd.Timestamp('2026-04-10 15:01:00'),
+                    'total_asset': 1050000.0,
+                    'cash': 520000.0,
+                    'frozen_cash': 0.0,
+                    'total_pnl': 0.0,
+                    'turnover': 123456.0,
+                    'max_drawdown': -0.05,
+                }
+            ]
+        ),
+        positions=pd.DataFrame(
+            [
+                {
+                    'symbol': '300001.SZ',
+                    'qty': 1200,
+                    'available_qty': 1200,
+                    'cost_price': 12.3,
+                    'market_price': 12.8,
+                    'market_value': 15360.0,
+                    'unrealized_pnl': 600.0,
+                    'snapshot_time': pd.Timestamp('2026-04-10 15:01:00'),
+                }
+            ]
+        ),
+        orders=pd.DataFrame(
+            [
+                {
+                    'order_id': 'o-1',
+                    'broker_order_id': 'b-1',
+                    'symbol': '300001.SZ',
+                    'side': 'buy',
+                    'qty': 1200,
+                    'filled_qty': 1200,
+                    'status': 'submitted',
+                    'avg_price': 12.8,
+                    'created_at': pd.Timestamp('2026-04-10 15:05:00'),
+                    'updated_at': pd.Timestamp('2026-04-10 15:05:00'),
+                },
+                {
+                    'order_id': 'o-2',
+                    'broker_order_id': 'b-2',
+                    'symbol': '300002.SZ',
+                    'side': 'sell',
+                    'qty': 800,
+                    'filled_qty': 800,
+                    'status': 'submitted',
+                    'avg_price': 9.6,
+                    'created_at': pd.Timestamp('2026-04-10 15:05:00'),
+                    'updated_at': pd.Timestamp('2026-04-10 15:05:00'),
+                },
+            ]
+        ),
+        trades=pd.DataFrame(),
+        risk=pd.DataFrame(),
+        audit=pd.DataFrame(
+            [
+                {
+                    'audit_log_id': 11,
+                    'object_type': 'microcap_trade_plan',
+                    'object_id': '2026-04-10',
+                    'message': 'plan',
+                    'payload': {
+                        'trade_date': '2026-04-10',
+                        'target_count': 35,
+                        'ranked_count': 1500,
+                        'hedge_ratio': 0.5,
+                        'cash_reserve_ratio': 0.51,
+                        'qmt_trade_enabled': True,
+                        'planned_orders': [
+                            {'symbol': '300001.SZ', 'instrument_name': '示例一', 'side': 'buy', 'qty': 1200, 'price': 12.8, 'reason': 'rebalance_buy'},
+                            {'symbol': '300002.SZ', 'instrument_name': '示例二', 'side': 'sell', 'qty': 800, 'price': 9.6, 'reason': 'not_in_target'},
+                        ],
+                    },
+                    'created_at': pd.Timestamp('2026-04-10 15:00:00'),
+                }
+            ]
+        ),
+        rules=pd.DataFrame(),
+        report_text='report',
+        benchmark_curve=pd.DataFrame(),
+    )
+
+    monkeypatch.setattr(dp, 'resolve_settings', lambda profile='paper', config_path=None: ('paper', config_path or config_ref, settings))
+    monkeypatch.setattr(dp, 'load_dashboard_data', lambda database_url, report_dir: dashboard_data)
+    monkeypatch.setattr(dp, 'load_runtime_logs', lambda: {UI_LOG: 'ready'})
+    monkeypatch.setattr(dp, 'workspace_relative', lambda path: Path(path).name)
+    monkeypatch.setattr(
+        dp,
+        'load_live_probe',
+        lambda *_args, **_kwargs: {
+            'health': {'account_status': [{'status': '0'}]},
+            'account': {
+                'account_id': 'qmt-paper',
+                'asset': {'cash': 520000.0, 'total_asset': 1050000.0},
+                'positions': [
+                    {
+                        'stock_code': '300001.SZ',
+                        'stock_name': '示例一',
+                        'volume': 1200,
+                        'can_use_volume': 1200,
+                        'open_price': 12.3,
+                        'market_price': 12.8,
+                    }
+                ],
+                'orders': [
+                    {
+                        'stock_code': '300002.SZ',
+                        'stock_name': '示例二',
+                        'order_id': 'qmt-order-2',
+                        'order_time': '2026-04-10T14:56:00',
+                        'order_type': 'sell',
+                        'order_volume': 800,
+                        'traded_volume': 800,
+                        'traded_price': 9.6,
+                        'status_msg': '已成',
+                    }
+                ],
+                'trades': [
+                    {
+                        'stock_code': '300001.SZ',
+                        'stock_name': '示例一',
+                        'order_id': 'qmt-order-1',
+                        'trade_time': '2026-04-10T14:57:00',
+                        'order_type': 'buy',
+                        'traded_volume': 1200,
+                        'traded_price': 12.8,
+                        'traded_amount': 15360.0,
+                    }
+                ],
+            },
+        },
+    )
+    monkeypatch.setattr(dp, 'history_status', lambda _settings: {'latest_trading_date': '2026-04-10', 'row_count': 10, 'symbol_count': 2})
+    monkeypatch.setattr(dp, 'list_pattern_report_dirs', lambda: [])
+    monkeypatch.setattr(
+        dp,
+        'load_user_pattern_results',
+        lambda _report_dir=dp.USER_PATTERN_REPORT_DIR: {
+            'summary': pd.DataFrame(),
+            'comparison': pd.DataFrame(),
+            'daily_actions': pd.DataFrame(),
+            'daily_decisions': pd.DataFrame(),
+            'png_path': str(tmp_path / 'empty.png'),
+            'html_path': str(tmp_path / 'empty.html'),
+            'base_dir': str(tmp_path),
+        },
+    )
+
+    payload = dp.build_dashboard_payload('paper', str(config_path))
+
+    board = payload['data']['qmt_trade_board']
+    assert payload['connection']['label'] == 'QMT 仿真在线'
+    assert board['available'] is True
+    assert board['trade_date'] == '2026-04-10'
+    assert board['next_trade_date'] == '2026-04-13'
+    assert len(board['planned_buys']) == 1
+    assert len(board['planned_sells']) == 1
+    assert len(board['actual_buys']) == 1
+    assert len(board['actual_sells']) == 1
+    assert board['actual_source'] == 'QMT 成交/委托回报'
+    assert board['positions'][0]['symbol'] == '300001.SZ'
+    assert board['summary']['position_count'] == 1
 
 
 def test_load_user_pattern_results_reads_daily_action_files(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 import json
 import mimetypes
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -10,13 +11,19 @@ from quant_demo.api.dashboard_payloads import (
     ROOT,
     build_b1_score_card,
     build_dashboard_payload,
+    build_qmt_trade_board,
+    connection_state,
     delete_backtest_result,
+    load_dashboard_data,
+    load_live_probe,
     load_runtime_logs,
+    overview,
     resolve_settings,
     run_pattern_action,
     run_qlib_action,
     run_strategy_action,
 )
+from quant_demo.core.enums import Environment
 
 
 class DemoApiHandler(BaseHTTPRequestHandler):
@@ -44,6 +51,90 @@ class DemoApiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _sse(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+    def _sse_event(self, event: str, payload: dict) -> None:
+        body = f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n".encode("utf-8")
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def _stream_qmt_trade_board(self, profile: str, config_path: str | None) -> None:
+        self._sse()
+        self.wfile.write(b"retry: 2000\n\n")
+        self.wfile.flush()
+        last_signature = ""
+        while True:
+            try:
+                profile_key, resolved_config, settings = resolve_settings(profile, config_path)
+                if settings.environment == Environment.BACKTEST:
+                    payload = {
+                        "profile": profile_key,
+                        "generated_at": None,
+                        "overview": {},
+                        "connection": {
+                            "label": "离线数据库视图",
+                            "color": "#64748b",
+                            "detail": "当前未连接 QMT，只展示历史数据。",
+                        },
+                        "qmt_trade_board": {
+                            "available": False,
+                            "mode": settings.environment.value,
+                            "message": "当前是回测模式，QMT 交易看板未启用。",
+                        },
+                    }
+                    self._sse_event("qmt-trade-board", payload)
+                    return
+
+                data = load_dashboard_data(settings.database_url, settings.report_dir)
+                probe = load_live_probe(resolved_config, settings)
+                info = overview(data)
+                board = build_qmt_trade_board(settings, data, probe, info)
+                realtime_asset = board.get("realtime_asset") or {}
+                total_asset = realtime_asset.get("total_asset") if realtime_asset.get("total_asset") is not None else info.get("total_asset")
+                cash = realtime_asset.get("cash") if realtime_asset.get("cash") is not None else info.get("cash")
+                market_value = realtime_asset.get("market_value") if realtime_asset.get("market_value") is not None else info.get("market_value")
+                stream_overview = dict(info)
+                stream_overview.update(
+                    {
+                        "total_asset": total_asset,
+                        "cash": cash,
+                        "market_value": market_value,
+                        "exposure": (market_value / total_asset) if total_asset else None,
+                    }
+                )
+                payload = {
+                    "profile": profile_key,
+                    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "overview": stream_overview,
+                    "connection": connection_state(settings, probe, data),
+                    "qmt_trade_board": board,
+                }
+                signature = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+                if signature != last_signature:
+                    self._sse_event("qmt-trade-board", payload)
+                    last_signature = signature
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                time.sleep(2)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:
+                try:
+                    self._sse_event(
+                        "qmt-trade-board-error",
+                        {"error": str(exc), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S")},
+                    )
+                    time.sleep(2)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -95,9 +186,16 @@ class DemoApiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path in {"/api/bootstrap", "/api/dashboard"}:
             profile = query.get("profile", ["backtest"])[0]
-            config_path = query.get("config", [self.config_path])[0]
+            raw_config = query.get("config", [""])[0].strip()
+            config_path = raw_config or None
             pattern_report_dir = query.get("pattern_report_dir", [""])[0] or None
             self._json(build_dashboard_payload(profile=profile, config_path=config_path, pattern_report_dir=pattern_report_dir))
+            return
+        if parsed.path == "/api/qmt/stream":
+            profile = query.get("profile", ["paper"])[0]
+            raw_config = query.get("config", [""])[0].strip()
+            config_path = raw_config or None
+            self._stream_qmt_trade_board(profile, config_path)
             return
         if parsed.path == "/api/logs":
             self._json({"logs": load_runtime_logs()})

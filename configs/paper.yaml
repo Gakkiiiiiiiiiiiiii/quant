@@ -12,12 +12,13 @@ history_force_refresh: false
 report_dir: data/reports/paper
 qmt_install_dir: runtime/qmt_client/installed
 qmt_download_url: https://download.gjzq.com.cn/temp/organ/gjzqqmt_ceshi.rar
-default_strategy: first_alpha_v1
-symbols:
-  - 510300.SH
-  - 159915.SZ
-  - 510500.SH
-  - 588000.SH
+qmt_userdata_dir: runtime/qmt_client/installed/userdata_mini
+qmt_bridge_python: .venv-qmt36/Scripts/python.exe
+qmt_bridge_script: scripts/qmt_bridge.py
+qmt_trade_enabled: true
+default_strategy: joinquant_microcap_alpha
+history_universe_sector: 沪深京A股
+symbols: []
 risk:
   max_position_ratio: 0.30
   daily_loss_limit: -0.03

@@ -32,7 +32,7 @@ def probe_runtime(config_path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行实盘接入链路")
     parser.add_argument("--config", default=str(ROOT / "configs" / "live.yaml"))
-    parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "first_alpha_v1.yaml"))
+    parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml"))
     parser.add_argument("--mode", choices=["probe", "strategy"], default="probe")
     args = parser.parse_args()
 

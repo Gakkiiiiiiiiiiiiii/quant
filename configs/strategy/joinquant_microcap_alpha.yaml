@@ -17,8 +17,8 @@ max_price_star_hard: 25
 max_overweight_ratio: 1.15
 benchmark_symbol: 000852.SH
 benchmark_name: 中证1000
-hedge_symbol: 515450.SH
-hedge_name: 红利低波50ETF
+hedge_symbol: ""
+hedge_name: 现金
 hedge_history_adjustment: none
 seasonal_hedge_schedule:
   1: 0.20

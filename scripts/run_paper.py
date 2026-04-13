@@ -16,7 +16,7 @@ from quant_demo.experiment.manager import ExperimentManager
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行仿真盘")
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
-    parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "first_alpha_v1.yaml"))
+    parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml"))
     args = parser.parse_args()
 
     app_settings = load_app_settings(args.config)

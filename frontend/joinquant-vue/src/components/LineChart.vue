@@ -22,6 +22,10 @@ const props = defineProps({
     type: String,
     default: '超额收益',
   },
+  fillArea: {
+    type: Boolean,
+    default: false,
+  },
 })
 
 const width = 1080
@@ -69,8 +73,12 @@ const xTicks = computed(() => {
     return []
   }
   const source = visibleSeries.value[0].points
-  const rawIndexes = [0, Math.floor((source.length - 1) / 2), source.length - 1]
-  return rawIndexes.map((index) => ({
+  const tickCount = Math.min(8, source.length)
+  const rawIndexes = Array.from({ length: tickCount }, (_, index) => (
+    Math.round(((source.length - 1) * index) / Math.max(tickCount - 1, 1))
+  ))
+  const uniqueIndexes = [...new Set(rawIndexes)]
+  return uniqueIndexes.map((index) => ({
     x: padding.left + (plotWidth.value * index) / Math.max(source.length - 1, 1),
     label: source[index]?.label ?? '',
   }))
@@ -142,6 +150,17 @@ function buildPolyline(points) {
   return points
     .map((point, index) => `${xPosition(index, points.length)},${yPosition(Number(point.value))}`)
     .join(' ')
+}
+
+function buildAreaPath(points) {
+  if (!points || points.length === 0) {
+    return ''
+  }
+  const first = points[0]
+  const last = points[points.length - 1]
+  const baseline = props.height - padding.bottom
+  const segments = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ')
+  return `${segments} L ${last.x} ${baseline} L ${first.x} ${baseline} Z`
 }
 
 function formatAxis(value) {
@@ -246,13 +265,19 @@ function handleMouseLeave() {
         <text v-for="tick in xTicks" :key="`${tick.x}-label`" :x="tick.x" :y="height - 8" class="line-chart__axis line-chart__axis--bottom">
           {{ tick.label }}
         </text>
+        <path
+          v-if="fillArea && visibleSeries[0]"
+          :d="buildAreaPath(plottedSeries[0]?.points || [])"
+          class="line-chart__area"
+          :style="{ fill: `${visibleSeries[0].color}22` }"
+        />
         <polyline
-          v-for="item in visibleSeries"
+          v-for="(item, index) in visibleSeries"
           :key="item.name"
           :points="buildPolyline(item.points)"
           fill="none"
           :stroke="item.color"
-          stroke-width="3"
+          :stroke-width="index === 0 ? 3 : 2.2"
           stroke-linecap="round"
           stroke-linejoin="round"
         />

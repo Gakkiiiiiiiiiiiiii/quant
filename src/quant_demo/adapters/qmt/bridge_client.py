@@ -125,7 +125,16 @@ class QmtBridgeClient:
     def get_account_snapshot(self) -> dict[str, Any]:
         return self._run("account")
 
-    def submit_order(self, symbol: str, side: str, qty: int, price: Decimal) -> dict[str, Any]:
+    def submit_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: Decimal,
+        *,
+        strategy_name: str = "quant-demo-live",
+        order_remark: str = "quant-demo",
+    ) -> dict[str, Any]:
         return self._run(
             "order",
             "--symbol",
@@ -136,6 +145,10 @@ class QmtBridgeClient:
             str(qty),
             "--price",
             str(price),
+            "--strategy-name",
+            strategy_name,
+            "--order-remark",
+            order_remark,
         )
 
     def _run(self, command: str, *extra_args: str) -> dict[str, Any]:

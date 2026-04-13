@@ -31,6 +31,7 @@ from quant_demo.execution.router import build_trade_client
 from quant_demo.execution.service import ExecutionService
 from quant_demo.experiment.evaluator import EvaluationResult, Evaluator
 from quant_demo.experiment.joinquant_microcap_engine import JoinQuantMicrocapBacktestEngine
+from quant_demo.experiment.qmt_microcap_trading import QmtMicrocapTradingEngine
 from quant_demo.experiment.qlib_engine import QlibBacktestEngine
 from quant_demo.marketdata.readers import group_bars_by_date, prices_from_bars
 from quant_demo.oms.intent_builder import build_order_intents
@@ -96,7 +97,8 @@ class ExperimentManager:
 
     def run(self, initial_cash: Decimal = Decimal("100000")) -> RunResult:
         if self.strategy_settings.implementation == "joinquant_microcap_alpha":
-            report_path, metrics, equity_curve = JoinQuantMicrocapBacktestEngine(
+            engine_cls = JoinQuantMicrocapBacktestEngine if self.app_settings.environment == Environment.BACKTEST else QmtMicrocapTradingEngine
+            report_path, metrics, equity_curve = engine_cls(
                 self.session_factory,
                 self.app_settings,
                 self.strategy_settings,

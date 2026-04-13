@@ -181,6 +181,16 @@ def _json_object(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: _json_scalar(value) for key, value in payload.items()}
 
 
+def _jsonify(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _jsonify(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonify(item) for item in value]
+    if isinstance(value, tuple):
+        return [_jsonify(item) for item in value]
+    return _json_scalar(value)
+
+
 def _safe_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -245,11 +255,13 @@ def _build_joinquant_microcap_report_text(
         f"成交笔数: {len(trades)}",
     ]
     hedge_symbol = str(summary.get("hedge_symbol") or "").strip()
-    if hedge_symbol:
+    hedge_name = str(summary.get("hedge_name") or "").strip()
+    hedge_schedule = summary.get("seasonal_hedge_schedule") or {}
+    if hedge_symbol or hedge_name or hedge_schedule:
         lines.extend(
             [
-                f"月历对冲: {summary.get('hedge_name') or hedge_symbol}",
-                f"弱势月对冲表: {summary.get('seasonal_hedge_schedule') or {}}",
+                f"月历对冲: {hedge_name or hedge_symbol or '现金'}",
+                f"弱势月对冲表: {hedge_schedule}",
             ]
         )
     execution_assumptions = summary.get("execution_assumptions")
@@ -421,7 +433,8 @@ def load_dashboard_data(database_url: str, report_dir: str) -> DashboardData:
 
 
 def load_live_probe(config_path: Path, settings: AppSettings) -> dict[str, Any]:
-    if settings.environment != Environment.LIVE:
+    _ = config_path
+    if settings.environment == Environment.BACKTEST:
         return {}
     bridge = QmtBridgeClient(settings)
     try:
@@ -432,6 +445,420 @@ def load_live_probe(config_path: Path, settings: AppSettings) -> dict[str, Any]:
         }
     except QmtUnavailableError as exc:
         return {"error": str(exc)}
+
+
+def _parse_json_payload(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        try:
+            loaded = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
+def _normalize_symbol_text(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    return str(value).strip()
+
+
+def _pick_text(payload: dict[str, Any], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return default
+
+
+def _pick_number(payload: dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        if key in payload:
+            value = _safe_float(payload.get(key))
+            if value is not None:
+                return value
+    return default
+
+
+def _estimate_next_trading_day(raw_trade_date: Any) -> str | None:
+    trade_date = pd.to_datetime(raw_trade_date, errors="coerce")
+    if pd.isna(trade_date):
+        return None
+    return (trade_date.normalize() + pd.offsets.BDay(1)).date().isoformat()
+
+
+def _format_side_label(side: str) -> str:
+    normalized = str(side or "").strip().lower()
+    if normalized == "buy":
+        return "买入"
+    if normalized == "sell":
+        return "卖出"
+    return normalized or "--"
+
+
+def _normalize_side(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    raw = str(value).strip().lower()
+    if raw in {"buy", "b", "long", "买入", "证券买入"}:
+        return "buy"
+    if raw in {"sell", "s", "short", "卖出", "证券卖出"}:
+        return "sell"
+    if raw.isdigit():
+        number = int(raw)
+        if number in {1, 23, 48}:
+            return "buy"
+        if number in {2, 24, 49}:
+            return "sell"
+    if "买" in raw:
+        return "buy"
+    if "卖" in raw:
+        return "sell"
+    return raw
+
+
+def _build_qmt_plan_rows(plan_payload: dict[str, Any], side: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    target_side = str(side).strip().lower()
+    for item in plan_payload.get("planned_orders") or []:
+        if str(item.get("side") or "").strip().lower() != target_side:
+            continue
+        qty = int(_safe_float(item.get("qty")) or 0)
+        price = _safe_float(item.get("price"))
+        amount = (price * qty) if price is not None and qty > 0 else None
+        rows.append(
+            {
+                "symbol": _normalize_symbol_text(item.get("symbol")),
+                "instrument_name": item.get("instrument_name") or "--",
+                "qty": qty,
+                "price": price,
+                "amount": amount,
+                "reason": item.get("reason") or "--",
+                "side_label": _format_side_label(target_side),
+            }
+        )
+    return rows
+
+
+def _build_actual_trade_rows_from_qmt_snapshot(
+    snapshot: dict[str, Any],
+    trade_date: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    actual_buys: list[dict[str, Any]] = []
+    actual_sells: list[dict[str, Any]] = []
+    target_trade_date = pd.to_datetime(trade_date, errors="coerce")
+    existing_keys: set[tuple[str, str, str]] = set()
+    used_trades = False
+    used_orders = False
+
+    trades = snapshot.get("trades", []) or []
+    if trades:
+        for item in trades:
+            side = _normalize_side(
+                _pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
+                or item.get("order_type")
+                or item.get("m_nOrderType")
+            )
+            if side not in {"buy", "sell"}:
+                continue
+            occurred_at = _pick_text(item, "traded_time", "trade_time", "business_time", "成交时间", default="")
+            occurred_at_value = _json_scalar(occurred_at) if occurred_at else None
+            occurred_day = pd.to_datetime(occurred_at, errors="coerce")
+            if pd.notna(target_trade_date) and pd.notna(occurred_day) and occurred_day.date() != target_trade_date.date():
+                continue
+            qty = int(round(_pick_number(item, "traded_volume", "fill_qty", "volume", "business_amount", "qty")))
+            if qty <= 0:
+                continue
+            price = _pick_number(item, "traded_price", "fill_price", "price", "business_price")
+            amount = _pick_number(item, "traded_amount", "amount", default=price * qty if price > 0 else 0.0)
+            row = {
+                "symbol": _pick_text(item, "stock_code", "symbol", "ticker", "instrument_id"),
+                "instrument_name": _pick_text(item, "stock_name", "instrument_name", "name", default="--"),
+                "qty": qty,
+                "price": price or None,
+                "amount": amount or None,
+                "commission": _pick_number(item, "commission", "fee", default=0.0) or None,
+                "status": "filled",
+                "broker_order_id": _pick_text(item, "order_id", "order_sysid", "entrust_no", default="--"),
+                "executed_at": occurred_at_value,
+            }
+            key = (row["symbol"], side, str(row["broker_order_id"]))
+            existing_keys.add(key)
+            if side == "buy":
+                actual_buys.append(row)
+            else:
+                actual_sells.append(row)
+        used_trades = bool(actual_buys or actual_sells)
+
+    orders = snapshot.get("orders", []) or []
+    if orders:
+        appended_order_count = 0
+        for item in orders:
+            side = _normalize_side(
+                _pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
+                or item.get("order_type")
+                or item.get("m_nOrderType")
+            )
+            if side not in {"buy", "sell"}:
+                continue
+            occurred_at = _pick_text(item, "order_time", "created_at", "entrust_time", default="")
+            occurred_at_value = _json_scalar(occurred_at) if occurred_at else None
+            occurred_day = pd.to_datetime(occurred_at, errors="coerce")
+            if pd.notna(target_trade_date) and pd.notna(occurred_day) and occurred_day.date() != target_trade_date.date():
+                continue
+            qty = int(round(_pick_number(item, "traded_volume", "filled_qty", "volume", "order_volume", "qty")))
+            if qty <= 0:
+                qty = int(round(_pick_number(item, "order_volume", "qty", "volume")))
+            if qty <= 0:
+                continue
+            price = _pick_number(item, "traded_price", "avg_price", "price", "order_price")
+            amount = _pick_number(item, "traded_amount", "amount", default=price * qty if price > 0 else 0.0)
+            row = {
+                "symbol": _pick_text(item, "stock_code", "symbol", "ticker", "instrument_id"),
+                "instrument_name": _pick_text(item, "stock_name", "instrument_name", "name", default="--"),
+                "qty": qty,
+                "price": price or None,
+                "amount": amount or None,
+                "status": _pick_text(item, "status_msg", "status", "order_status", default="--"),
+                "broker_order_id": _pick_text(item, "order_id", "order_sysid", "entrust_no", default="--"),
+                "executed_at": occurred_at_value,
+            }
+            key = (row["symbol"], side, str(row["broker_order_id"]))
+            if key in existing_keys:
+                continue
+            if side == "buy":
+                actual_buys.append(row)
+            else:
+                actual_sells.append(row)
+            existing_keys.add(key)
+            appended_order_count += 1
+        used_orders = appended_order_count > 0
+
+    if used_trades and used_orders:
+        return actual_buys, actual_sells, "QMT 成交/委托回报"
+    if used_trades:
+        return actual_buys, actual_sells, "QMT 成交回报"
+    if used_orders:
+        return actual_buys, actual_sells, "QMT 委托回报"
+
+    return actual_buys, actual_sells, "暂无执行记录"
+
+
+def _build_actual_trade_rows(
+    trades: pd.DataFrame,
+    orders: pd.DataFrame,
+    trade_date: str | None,
+    plan_created_at: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    actual_buys: list[dict[str, Any]] = []
+    actual_sells: list[dict[str, Any]] = []
+    plan_day = pd.to_datetime(plan_created_at, errors="coerce")
+    target_trade_date = pd.to_datetime(trade_date, errors="coerce")
+
+    if not trades.empty:
+        working = trades.copy()
+        if "trade_time" in working.columns:
+            working["trade_time"] = pd.to_datetime(working["trade_time"], errors="coerce")
+            if pd.notna(plan_day):
+                working = working[working["trade_time"].dt.date == plan_day.date()]
+            elif pd.notna(target_trade_date):
+                working = working[working["trade_time"].dt.date == target_trade_date.date()]
+        for record in working.to_dict("records"):
+            qty = int(_safe_float(record.get("fill_qty")) or 0)
+            price = _safe_float(record.get("fill_price"))
+            amount = (price * qty) if price is not None and qty > 0 else None
+            row = {
+                "symbol": _normalize_symbol_text(record.get("symbol")),
+                "instrument_name": record.get("instrument_name") or "--",
+                "qty": qty,
+                "price": price,
+                "amount": amount,
+                "commission": _safe_float(record.get("commission")),
+                "status": "filled",
+                "executed_at": _json_scalar(record.get("trade_time")),
+            }
+            if str(record.get("side") or "").strip().lower() == "buy":
+                actual_buys.append(row)
+            else:
+                actual_sells.append(row)
+        return actual_buys, actual_sells, "成交回报"
+
+    if orders.empty:
+        return actual_buys, actual_sells, "暂无执行记录"
+
+    working = orders.copy()
+    if "created_at" in working.columns:
+        working["created_at"] = pd.to_datetime(working["created_at"], errors="coerce")
+        if pd.notna(plan_day):
+            working = working[working["created_at"].dt.date == plan_day.date()]
+        elif pd.notna(target_trade_date):
+            working = working[working["created_at"].dt.date == target_trade_date.date()]
+    for record in working.to_dict("records"):
+        qty = int(_safe_float(record.get("filled_qty")) or _safe_float(record.get("qty")) or 0)
+        price = _safe_float(record.get("avg_price"))
+        amount = (price * qty) if price is not None and qty > 0 else None
+        row = {
+            "symbol": _normalize_symbol_text(record.get("symbol")),
+            "instrument_name": record.get("instrument_name") or "--",
+            "qty": qty,
+            "price": price,
+            "amount": amount,
+            "status": record.get("status") or "--",
+            "broker_order_id": record.get("broker_order_id") or "--",
+            "executed_at": _json_scalar(record.get("created_at")),
+        }
+        if str(record.get("side") or "").strip().lower() == "buy":
+            actual_buys.append(row)
+        else:
+            actual_sells.append(row)
+    return actual_buys, actual_sells, "委托记录"
+
+
+def _build_qmt_realtime_positions(
+    settings: AppSettings,
+    probe: dict[str, Any],
+    fallback_positions: pd.DataFrame,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
+    snapshot = probe.get("account") if isinstance(probe, dict) else None
+    error = probe.get("error") if isinstance(probe, dict) else None
+    if isinstance(snapshot, dict):
+        asset = snapshot.get("asset") or {}
+        rows: list[dict[str, Any]] = []
+        for item in snapshot.get("positions", []) or []:
+            symbol = _pick_text(item, "stock_code", "symbol", "m_strInstrumentID", "instrument_id", "ticker")
+            qty = int(round(_pick_number(item, "volume", "qty", "current_amount", "total_qty", "m_nVolume")))
+            if not symbol or qty <= 0:
+                continue
+            available_qty = int(round(_pick_number(item, "can_use_volume", "available_qty", "m_nCanUseVolume", "enable_amount", default=qty)))
+            cost_price = _pick_number(item, "open_price", "cost_price", "avg_price", "m_dOpenPrice")
+            market_price = _pick_number(item, "market_price", "last_price", "price", "m_dLastPrice")
+            market_value = market_price * qty if market_price > 0 and qty > 0 else None
+            unrealized_pnl = (market_price - cost_price) * qty if market_price > 0 and cost_price > 0 else None
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "instrument_name": _pick_text(item, "stock_name", "instrument_name", "instrument_name_cn", "name", "m_strInstrumentName", default="--"),
+                    "qty": qty,
+                    "available_qty": max(0, available_qty),
+                    "cost_price": cost_price or None,
+                    "market_price": market_price or None,
+                    "market_value": market_value,
+                    "unrealized_pnl": unrealized_pnl,
+                }
+            )
+        rows.sort(key=lambda item: float(item.get("market_value") or 0.0), reverse=True)
+        asset_payload = {
+            "account_id": str(snapshot.get("account_id") or asset.get("account_id") or settings.qmt_account_id or "--"),
+            "cash": _pick_number(asset, "cash", "m_dCash"),
+            "frozen_cash": _pick_number(asset, "frozen_cash", "m_dFrozenCash"),
+            "total_asset": _pick_number(asset, "total_asset", "m_dTotalAsset"),
+        }
+        asset_payload["market_value"] = max(float(asset_payload["total_asset"] or 0.0) - float(asset_payload["cash"] or 0.0), 0.0)
+        return rows, asset_payload, error
+
+    if fallback_positions.empty:
+        return [], {}, error
+
+    working = fallback_positions.copy()
+    rows = []
+    for record in working.to_dict("records"):
+        rows.append(
+            {
+                "symbol": _normalize_symbol_text(record.get("symbol")),
+                "instrument_name": record.get("instrument_name") or "--",
+                "qty": int(_safe_float(record.get("qty")) or 0),
+                "available_qty": int(_safe_float(record.get("available_qty")) or 0),
+                "cost_price": _safe_float(record.get("cost_price")),
+                "market_price": _safe_float(record.get("market_price")),
+                "market_value": _safe_float(record.get("market_value")),
+                "unrealized_pnl": _safe_float(record.get("unrealized_pnl")),
+            }
+        )
+    return rows, {}, error
+
+
+def build_qmt_trade_board(
+    settings: AppSettings,
+    data: DashboardData,
+    probe: dict[str, Any] | None,
+    info: dict[str, Any],
+) -> dict[str, Any]:
+    environment_value = getattr(settings.environment, "value", str(settings.environment))
+    if environment_value == Environment.BACKTEST.value:
+        return {
+            "available": False,
+            "mode": environment_value,
+            "message": "当前是回测模式，QMT 交易看板未启用。",
+        }
+
+    latest_plan_record: dict[str, Any] | None = None
+    latest_plan_payload: dict[str, Any] = {}
+    if not data.audit.empty and "object_type" in data.audit.columns:
+        plan_rows = data.audit[data.audit["object_type"].astype(str) == "microcap_trade_plan"].copy()
+        if not plan_rows.empty:
+            if "created_at" in plan_rows.columns:
+                plan_rows["created_at"] = pd.to_datetime(plan_rows["created_at"], errors="coerce")
+                plan_rows = plan_rows.sort_values("created_at", ascending=False, na_position="last")
+            latest_plan_record = plan_rows.iloc[0].to_dict()
+            latest_plan_payload = _parse_json_payload(latest_plan_record.get("payload"))
+
+    trade_date = str(latest_plan_payload.get("trade_date") or "") or None
+    next_trade_date = _estimate_next_trading_day(trade_date) if trade_date else None
+    planned_buys = _build_qmt_plan_rows(latest_plan_payload, "buy")
+    planned_sells = _build_qmt_plan_rows(latest_plan_payload, "sell")
+    probe_payload = probe or {}
+    snapshot = probe_payload.get("account") if isinstance(probe_payload, dict) else {}
+    actual_buys, actual_sells, actual_source = _build_actual_trade_rows_from_qmt_snapshot(snapshot or {}, trade_date)
+    if not actual_buys and not actual_sells:
+        actual_buys, actual_sells, actual_source = _build_actual_trade_rows(
+            data.trades,
+            data.orders,
+            trade_date,
+            latest_plan_record.get("created_at") if latest_plan_record else None,
+        )
+    realtime_positions, realtime_asset, realtime_error = _build_qmt_realtime_positions(settings, probe_payload, data.positions)
+
+    cash_value = _safe_float(realtime_asset.get("cash"))
+    total_asset = _safe_float(realtime_asset.get("total_asset")) or _safe_float(info.get("total_asset"))
+    market_value = _safe_float(realtime_asset.get("market_value"))
+    if market_value is None and total_asset is not None and cash_value is not None:
+        market_value = total_asset - cash_value
+
+    return {
+        "available": bool(latest_plan_record or realtime_positions or actual_buys or actual_sells or (probe and not probe.get("error"))),
+        "mode": environment_value,
+        "trade_date": trade_date,
+        "next_trade_date": next_trade_date,
+        "plan_generated_at": _json_scalar(latest_plan_record.get("created_at")) if latest_plan_record else None,
+        "plan_status": "QMT 已启用" if latest_plan_payload.get("qmt_trade_enabled") else "仅生成计划/预演",
+        "actual_source": actual_source,
+        "planned_buys": planned_buys,
+        "planned_sells": planned_sells,
+        "actual_buys": actual_buys,
+        "actual_sells": actual_sells,
+        "positions": realtime_positions,
+        "realtime_asset": {
+            "total_asset": total_asset,
+            "cash": cash_value if cash_value is not None else _safe_float(info.get("cash")),
+            "market_value": market_value if market_value is not None else _safe_float(info.get("market_value")),
+            "account_id": realtime_asset.get("account_id") or "--",
+        },
+        "summary": {
+            "planned_buy_count": len(planned_buys),
+            "planned_sell_count": len(planned_sells),
+            "actual_buy_count": len(actual_buys),
+            "actual_sell_count": len(actual_sells),
+            "position_count": len(realtime_positions),
+            "target_count": int(_safe_float(latest_plan_payload.get("target_count")) or 0),
+            "ranked_count": int(_safe_float(latest_plan_payload.get("ranked_count")) or 0),
+            "hedge_ratio": _safe_float(latest_plan_payload.get("hedge_ratio")),
+            "cash_reserve_ratio": _safe_float(latest_plan_payload.get("cash_reserve_ratio")),
+        },
+        "message": "展示 T 日生成的 T+1 计划、当日实际执行以及当前 QMT 持仓。",
+        "realtime_error": realtime_error,
+    }
 
 
 def overview(data: DashboardData) -> dict[str, Any]:
@@ -473,16 +900,19 @@ def connection_state(settings: AppSettings, probe: dict[str, Any] | None, data: 
             "color": "#0f766e",
             "detail": "当前页面展示 joinquant_microcap_alpha 的本地回测产物。",
         }
-    if settings.environment != Environment.LIVE:
+    if settings.environment == Environment.BACKTEST:
         return {"label": "离线数据库视图", "color": "#64748b", "detail": "当前未连接 QMT，只展示历史数据。"}
     if not probe or probe.get("error"):
         detail = probe.get("error") if probe else "实盘探测失败，无法读取账户与行情。"
-        return {"label": "QMT 未连接", "color": "#b91c1c", "detail": detail}
+        prefix = "QMT 仿真" if settings.environment == Environment.PAPER else "QMT 实盘"
+        return {"label": f"{prefix}未连接", "color": "#b91c1c", "detail": detail}
     statuses = (probe.get("health") or {}).get("account_status") or []
     status_code = statuses[0].get("status") if statuses else None
     if str(status_code) == "0":
-        return {"label": "QMT 在线", "color": "#0f766e", "detail": "账户状态正常，行情与账户查询可用。"}
-    return {"label": f"QMT 状态 {status_code}", "color": "#d97706", "detail": "客户端已连接，但账户状态不是正常。"}
+        label = "QMT 仿真在线" if settings.environment == Environment.PAPER else "QMT 在线"
+        return {"label": label, "color": "#0f766e", "detail": "账户状态正常，行情与账户查询可用。"}
+    prefix = "QMT 仿真" if settings.environment == Environment.PAPER else "QMT"
+    return {"label": f"{prefix}状态 {status_code}", "color": "#d97706", "detail": "客户端已连接，但账户状态不是正常。"}
 
 
 def alerts(settings: AppSettings, info: dict[str, Any], data: DashboardData, probe: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -1066,7 +1496,7 @@ def build_dashboard_payload(
     pattern_decisions = pattern["daily_decisions"].copy()
     primary_record = _select_primary_pattern_record(pattern_summary)
     data = load_dashboard_data(settings.database_url, settings.report_dir)
-    probe = load_live_probe(resolved_config, settings) if settings.environment == Environment.LIVE else {}
+    probe = load_live_probe(resolved_config, settings) if settings.environment != Environment.BACKTEST else {}
     strategy_registry = list_common_strategies_with_results(settings.database_url)
     qlib_runtime = build_qlib_runtime_payload(profile_key)
     qlib_status = history_status(AppSettings.model_validate(qlib_runtime))
@@ -1083,6 +1513,7 @@ def build_dashboard_payload(
     display_rules = data.rules
     display_report_text = data.report_text
     display_benchmark_curve = data.benchmark_curve
+    qmt_trade_board = build_qmt_trade_board(settings, data, probe, info)
 
     if primary_record is not None:
         primary_mode = str(primary_record.get("mode") or "B1")
@@ -1138,6 +1569,7 @@ def build_dashboard_payload(
             "pattern_decisions": _frame_records(pattern_decisions),
             "report_text": display_report_text,
             "benchmark_curve": _frame_records(display_benchmark_curve),
+            "qmt_trade_board": _jsonify(qmt_trade_board),
         },
         "meta": {
             "profiles": [{"key": key, "label": key, "config_path": str(path)} for key, path in CONFIGS.items()],
