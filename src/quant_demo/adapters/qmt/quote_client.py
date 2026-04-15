@@ -206,7 +206,9 @@ class XtQuantQuoteClient(QuoteClient):
         if requested_mode == "cached":
             return "cached"
         if requested_mode == "incremental":
-            return "incremental" if self._is_signature_compatible(output_path, signature) else "full"
+            if not self._is_signature_compatible(output_path, signature):
+                LOGGER.warning("历史签名与缓存不完全一致，显式 incremental 模式下继续执行增量刷新: output=%s", output_path)
+            return "incremental"
         if not self.settings.history_force_refresh and self._is_cache_valid(output_path, signature):
             return "cached"
         return "incremental" if self._is_signature_compatible(output_path, signature) else "full"

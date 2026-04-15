@@ -295,19 +295,15 @@ def command_account(args):
         asset = trader.query_stock_asset(account)
         positions = trader.query_stock_positions(account) or []
         orders = trader.query_stock_orders(account) or []
-        trades = trader.query_stock_trades(account) or []
-        statuses = trader.query_account_status() or []
         return emit_ok(
             {
                 "connect_result": connect_result,
                 "subscribe_result": subscribe_result,
                 "account_id": account_id,
-                "account_infos": [dump_object(item) for item in infos],
-                "account_status": [dump_object(item) for item in statuses],
                 "asset": dump_object(asset) if asset else None,
                 "positions": [dump_object(item) for item in positions],
                 "orders": [dump_object(item) for item in orders],
-                "trades": [dump_object(item) for item in trades],
+                "trades": [],
             }
         )
     except Exception as exc:
@@ -349,6 +345,61 @@ def command_order(args):
         )
     except Exception as exc:
         return emit_error("order 提交失败: {0}".format(exc))
+    finally:
+        if trader is not None:
+            trader.stop()
+
+
+def command_order_status(args):
+    xtconstant, xtdata, XtQuantTrader, StockAccount = bootstrap_runtime(args.install_dir)
+    trader = None
+    try:
+        userdata_dir = infer_userdata_dir(args.install_dir, args.userdata_dir)
+        trader, connect_result = build_trader(XtQuantTrader, userdata_dir)
+        account_id, infos = resolve_account_id(trader, args.account_id)
+        if not account_id:
+            raise RuntimeError("未发现可用证券账户")
+        account = StockAccount(account_id)
+        subscribe_result = trader.subscribe(account)
+        order = trader.query_stock_order(account, int(args.order_id))
+        return emit_ok(
+            {
+                "connect_result": connect_result,
+                "subscribe_result": subscribe_result,
+                "account_id": account_id,
+                "order": dump_object(order) if order else None,
+            }
+        )
+    except Exception as exc:
+        return emit_error("order-status 查询失败: {0}".format(exc))
+    finally:
+        if trader is not None:
+            trader.stop()
+
+
+def command_cancel_order(args):
+    xtconstant, xtdata, XtQuantTrader, StockAccount = bootstrap_runtime(args.install_dir)
+    trader = None
+    try:
+        userdata_dir = infer_userdata_dir(args.install_dir, args.userdata_dir)
+        trader, connect_result = build_trader(XtQuantTrader, userdata_dir)
+        account_id, infos = resolve_account_id(trader, args.account_id)
+        if not account_id:
+            raise RuntimeError("未发现可用证券账户")
+        account = StockAccount(account_id)
+        subscribe_result = trader.subscribe(account)
+        cancel_result = trader.cancel_order_stock(account, int(args.order_id))
+        return emit_ok(
+            {
+                "connect_result": connect_result,
+                "subscribe_result": subscribe_result,
+                "account_id": account_id,
+                "order_id": int(args.order_id),
+                "cancel_result": cancel_result,
+            }
+        )
+    except Exception as exc:
+        return emit_error("cancel-order 执行失败: {0}".format(exc))
     finally:
         if trader is not None:
             trader.stop()
@@ -409,6 +460,14 @@ def build_parser():
     order_parser.add_argument("--price", required=True, type=float)
     order_parser.add_argument("--strategy-name", default="quant-demo-live")
     order_parser.add_argument("--order-remark", default="quant-demo")
+
+    order_status_parser = subparsers.add_parser("order-status")
+    add_common(order_status_parser)
+    order_status_parser.add_argument("--order-id", required=True, type=int)
+
+    cancel_order_parser = subparsers.add_parser("cancel-order")
+    add_common(cancel_order_parser)
+    cancel_order_parser.add_argument("--order-id", required=True, type=int)
     return parser
 
 
@@ -424,6 +483,8 @@ def main():
         "financial-data": command_financial_data,
         "account": command_account,
         "order": command_order,
+        "order-status": command_order_status,
+        "cancel-order": command_cancel_order,
     }
     return command_map[args.command](args)
 

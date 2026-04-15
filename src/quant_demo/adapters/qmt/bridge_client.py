@@ -126,6 +126,13 @@ class QmtBridgeClient:
     def get_account_snapshot(self) -> dict[str, Any]:
         return self._run("account")
 
+    def get_order_status(self, order_id: str | int) -> dict[str, Any]:
+        payload = self._run("order-status", "--order-id", str(order_id))
+        return payload.get("order", {}) or {}
+
+    def cancel_order(self, order_id: str | int) -> dict[str, Any]:
+        return self._run("cancel-order", "--order-id", str(order_id))
+
     def submit_order(
         self,
         symbol: str,

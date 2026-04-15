@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -63,6 +64,10 @@ class PlannedOrder:
 
 
 class QmtMicrocapTradingEngine:
+    ORDER_RETRY_TIMEOUT_SECONDS = 60
+    ORDER_RETRY_POLL_SECONDS = 5
+    ORDER_RETRY_MAX_ATTEMPTS = 3
+
     def __init__(self, session_factory: sessionmaker, app_settings: AppSettings, strategy_settings: StrategySettings) -> None:
         self.session_factory = session_factory
         self.app_settings = app_settings
@@ -70,13 +75,16 @@ class QmtMicrocapTradingEngine:
         self.cfg = MicrocapStrategyConfig.from_strategy_settings(strategy_settings)
         self.bridge = QmtBridgeClient(app_settings)
 
+    def _now_local(self) -> datetime:
+        return datetime.now()
+
     def preview(self, initial_cash: Decimal) -> tuple[Path, dict[str, Any]]:
         context = self._prepare_trade_context(
             initial_cash,
-            allow_snapshot_fallback=True,
+            allow_snapshot_fallback=False,
             allow_quote_fallback=True,
-            prefer_snapshot_fallback=True,
             prefer_quote_fallback=True,
+            require_realtime_positions=True,
         )
         plan_payload = self._build_plan_payload(
             latest_date=context["latest_date"],
@@ -101,11 +109,27 @@ class QmtMicrocapTradingEngine:
         fallback_prices = {item.symbol: item.price for item in planned_orders}
         account_snapshot = self.bridge.get_account_snapshot()
         live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
+        stale_cancellations = self._cancel_stale_open_orders(
+            account_snapshot=account_snapshot,
+            trade_date=str(payload.get("planned_execution_date") or "").strip(),
+        )
+        diff_summary = self._diff_plan_against_today_activity(
+            account_snapshot=account_snapshot,
+            planned_orders=planned_orders,
+            planned_execution_date=str(payload.get("planned_execution_date") or "").strip(),
+            stale_cancellations=stale_cancellations,
+        )
+        planned_orders = diff_summary["remaining_orders"]
         quote_symbols = sorted(set(fallback_prices) | set(live_state.positions))
         quotes = self._get_quotes_payload(quote_symbols, allow_quote_fallback=True)
         price_map, volume_map = self._build_quote_maps_from_quotes(quotes, fallback_prices)
         strategy_total_asset = self._resolve_strategy_total_asset(strategy_total_asset, reported_total_asset)
         strategy_total_asset = self._apply_strategy_capital(live_state, strategy_total_asset, price_map)
+        if not planned_orders:
+            equity_curve = self._build_equity_curve_snapshot(pd.Timestamp(actual_signal_date), live_state, price_map, turnover=Decimal("0"))
+            metrics = Evaluator().evaluate(equity_curve)
+            receipt_path = self._write_execution_receipt(payload, [], Path(plan_path), execution_summary=diff_summary)
+            return receipt_path, metrics, equity_curve
         planning_state = self._clone_account_state(live_state)
         risk_service = RiskService(
             [
@@ -130,7 +154,7 @@ class QmtMicrocapTradingEngine:
             strategy_total_asset=strategy_total_asset,
         )
         metrics = Evaluator().evaluate(equity_curve)
-        self._write_execution_receipt(payload, planned_orders, report_path)
+        self._write_execution_receipt(payload, planned_orders, report_path, execution_summary=diff_summary)
         return report_path, metrics, equity_curve
 
     def run(self, initial_cash: Decimal) -> tuple[Path, EvaluationResult, pd.DataFrame]:
@@ -218,6 +242,7 @@ class QmtMicrocapTradingEngine:
         allow_quote_fallback: bool = False,
         prefer_snapshot_fallback: bool = False,
         prefer_quote_fallback: bool = False,
+        require_realtime_positions: bool = False,
     ) -> dict[str, Any]:
         self._refresh_history()
         prepared, instrument_frame = self._load_prepared_history()
@@ -238,6 +263,7 @@ class QmtMicrocapTradingEngine:
             fallback_prices,
             allow_snapshot_fallback=allow_snapshot_fallback,
             prefer_snapshot_fallback=prefer_snapshot_fallback,
+            require_realtime_positions=require_realtime_positions,
         )
         live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
         strategy_total_asset = self._resolve_strategy_total_asset(initial_cash, reported_total_asset)
@@ -352,7 +378,8 @@ class QmtMicrocapTradingEngine:
             frame = frame[frame["trading_date"] >= start_dt].copy()
         if frame.empty:
             raise RuntimeError("微盘交易引擎未找到可用历史数据")
-        return pd.Timestamp(frame["trading_date"].max()).normalize()
+        trading_dates = sorted(pd.Timestamp(item).normalize() for item in frame["trading_date"].dropna().unique())
+        return self._resolve_completed_history_date(trading_dates)
 
     def _load_recent_history_window(self, window_days: int = 40) -> pd.DataFrame:
         history_path = Path(self.app_settings.history_parquet)
@@ -367,10 +394,22 @@ class QmtMicrocapTradingEngine:
         if frame.empty:
             return frame
         trading_dates = sorted(pd.Timestamp(item).normalize() for item in frame["trading_date"].dropna().unique())
-        keep_dates = set(trading_dates[-window_days:])
+        latest_completed = self._resolve_completed_history_date(trading_dates)
+        completed_dates = [item for item in trading_dates if item <= latest_completed]
+        keep_dates = set(completed_dates[-window_days:])
         frame = frame[frame["trading_date"].isin(keep_dates)].copy()
         frame["symbol"] = frame["symbol"].astype(str)
         return frame.sort_values(["symbol", "trading_date"]).reset_index(drop=True)
+
+    def _resolve_completed_history_date(self, trading_dates: list[pd.Timestamp]) -> pd.Timestamp:
+        if not trading_dates:
+            raise RuntimeError("微盘交易引擎未找到可用历史数据")
+        latest = pd.Timestamp(trading_dates[-1]).normalize()
+        now = pd.Timestamp(self._now_local()).tz_localize(None)
+        close_cutoff = pd.Timestamp(now.date()).replace(hour=15, minute=5, second=0, microsecond=0)
+        if latest.date() == now.date() and now < close_cutoff and len(trading_dates) >= 2:
+            return pd.Timestamp(trading_dates[-2]).normalize()
+        return latest
 
     def _get_account_snapshot_payload(
         self,
@@ -378,19 +417,32 @@ class QmtMicrocapTradingEngine:
         *,
         allow_snapshot_fallback: bool,
         prefer_snapshot_fallback: bool = False,
+        require_realtime_positions: bool = False,
     ) -> dict[str, Any]:
         if prefer_snapshot_fallback:
             payload = self._load_latest_snapshot_from_db(fallback_prices)
             if payload is not None:
+                if require_realtime_positions:
+                    raise QmtUnavailableError("生成预览计划必须读取 QMT 实时持仓，禁止使用数据库快照回退")
                 return payload
         try:
-            return self.bridge.get_account_snapshot()
-        except QmtUnavailableError:
+            payload = self.bridge.get_account_snapshot()
+        except QmtUnavailableError as exc:
             if not allow_snapshot_fallback:
+                if require_realtime_positions:
+                    raise QmtUnavailableError("QMT 实时持仓不可用，无法生成预览计划") from exc
                 raise
+        else:
+            if require_realtime_positions:
+                positions = payload.get("positions")
+                if not isinstance(positions, list):
+                    raise QmtUnavailableError("QMT 实时持仓不可用，无法生成预览计划")
+            return payload
         payload = self._load_latest_snapshot_from_db(fallback_prices)
         if payload is None:
             raise QmtUnavailableError("QMT 账户快照不可用，且正式库中没有可回退的资产快照")
+        if require_realtime_positions:
+            raise QmtUnavailableError("生成预览计划必须读取 QMT 实时持仓，禁止使用数据库快照回退")
         return payload
 
     def _get_quotes_payload(
@@ -570,7 +622,14 @@ class QmtMicrocapTradingEngine:
                 raise FileNotFoundError(f"未找到计划文件: {path}")
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def _write_execution_receipt(self, plan_payload: dict[str, Any], planned_orders: list[PlannedOrder], report_path: Path) -> Path:
+    def _write_execution_receipt(
+        self,
+        plan_payload: dict[str, Any],
+        planned_orders: list[PlannedOrder],
+        report_path: Path,
+        *,
+        execution_summary: dict[str, Any] | None = None,
+    ) -> Path:
         receipt = {
             "strategy": self.strategy_settings.name,
             "executed_at": datetime.now().isoformat(),
@@ -578,6 +637,7 @@ class QmtMicrocapTradingEngine:
             "planned_execution_date": plan_payload.get("planned_execution_date"),
             "strategy_total_asset": plan_payload.get("strategy_total_asset"),
             "report_path": str(report_path),
+            "execution_summary": self._serialize_execution_summary(execution_summary or {}),
             "submitted_orders": [
                 {
                     "symbol": item.symbol,
@@ -620,6 +680,171 @@ class QmtMicrocapTradingEngine:
         if not planned_orders:
             raise RuntimeError("计划文件中没有可执行委托")
         return planned_orders
+
+    def _diff_plan_against_today_activity(
+        self,
+        *,
+        account_snapshot: dict[str, Any],
+        planned_orders: list[PlannedOrder],
+        planned_execution_date: str,
+        stale_cancellations: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        activity_entries = self._extract_today_activity(account_snapshot, planned_execution_date)
+        activity_qty: dict[tuple[str, str], int] = {}
+        for item in activity_entries:
+            key = (item["symbol"], item["side"])
+            activity_qty[key] = activity_qty.get(key, 0) + int(item["qty"])
+
+        remaining_orders: list[PlannedOrder] = []
+        differences: list[dict[str, Any]] = []
+        for order in planned_orders:
+            key = (order.symbol, order.side.value)
+            existing_qty = int(activity_qty.get(key, 0))
+            delta_qty = max(order.qty - existing_qty, 0)
+            differences.append(
+                {
+                    "symbol": order.symbol,
+                    "side": order.side.value,
+                    "planned_qty": order.qty,
+                    "existing_qty": existing_qty,
+                    "remaining_qty": delta_qty,
+                    "reason": order.reason,
+                }
+            )
+            if delta_qty <= 0:
+                continue
+            remaining_orders.append(
+                PlannedOrder(
+                    symbol=order.symbol,
+                    side=order.side,
+                    qty=delta_qty,
+                    price=order.price,
+                    reason=order.reason,
+                    metadata=dict(order.metadata),
+                )
+            )
+
+        return {
+            "planned_order_count": len(planned_orders),
+            "existing_activity_count": len(activity_entries),
+            "remaining_order_count": len(remaining_orders),
+            "has_difference": any(int(item["remaining_qty"]) > 0 for item in differences),
+            "differences": differences,
+            "existing_activity": activity_entries,
+            "stale_cancellations": stale_cancellations or [],
+            "remaining_orders": remaining_orders,
+        }
+
+    def _extract_today_activity(self, account_snapshot: dict[str, Any], trade_date: str) -> list[dict[str, Any]]:
+        target_date = pd.to_datetime(trade_date, errors="coerce")
+        normalized: dict[str, dict[str, Any]] = {}
+
+        def _match_trade_date(raw_value: Any) -> bool:
+            if pd.isna(target_date):
+                return True
+            occurred = pd.to_datetime(raw_value, errors="coerce")
+            if pd.isna(occurred):
+                return True
+            return occurred.date() == target_date.date()
+
+        trades = account_snapshot.get("trades", []) or []
+        for item in trades:
+            side = self._normalize_activity_side(
+                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
+                or item.get("order_type")
+                or item.get("m_nOrderType")
+            )
+            symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
+            occurred_at = self._pick_text(item, "traded_time", "trade_time", "business_time", "成交时间", default="")
+            qty = int(round(self._pick_number(item, "traded_volume", "fill_qty", "volume", "business_amount", "qty")))
+            if side not in {"buy", "sell"} or not symbol or qty <= 0 or not _match_trade_date(occurred_at):
+                continue
+            broker_order_id = self._pick_text(item, "order_id", "order_sysid", "entrust_no", default="")
+            entry_key = f"trade::{broker_order_id or symbol + ':' + side}"
+            normalized[entry_key] = {
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "source": "trade",
+                "broker_order_id": broker_order_id,
+                "occurred_at": occurred_at,
+            }
+
+        orders = account_snapshot.get("orders", []) or []
+        for item in orders:
+            side = self._normalize_activity_side(
+                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
+                or item.get("order_type")
+                or item.get("m_nOrderType")
+            )
+            symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
+            occurred_at = self._pick_text(item, "order_time", "created_at", "entrust_time", default="")
+            status_code = self._coerce_int(item.get("order_status", item.get("status")))
+            traded_qty = int(round(self._pick_number(item, "traded_volume", "filled_qty", "volume", default=0.0)))
+            order_qty = int(round(self._pick_number(item, "order_volume", "qty", "volume", default=0.0)))
+            qty = traded_qty
+            if qty <= 0 and not self._is_active_order_status(status_code):
+                qty = order_qty
+            if qty <= 0 and self._is_active_order_status(status_code) and not self._is_order_stale(item):
+                qty = order_qty
+            if side not in {"buy", "sell"} or not symbol or qty <= 0 or not _match_trade_date(occurred_at):
+                continue
+            broker_order_id = self._pick_text(item, "order_id", "order_sysid", "entrust_no", default="")
+            entry_key = f"trade::{broker_order_id}" if broker_order_id else f"order::{symbol}:{side}:{occurred_at}:{qty}"
+            current = normalized.get(entry_key)
+            if current is None or qty > int(current.get("qty") or 0):
+                normalized[entry_key] = {
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "source": "order",
+                    "broker_order_id": broker_order_id,
+                    "occurred_at": occurred_at,
+                }
+
+        return list(normalized.values())
+
+    def _cancel_stale_open_orders(self, account_snapshot: dict[str, Any], trade_date: str) -> list[dict[str, Any]]:
+        cancellations: list[dict[str, Any]] = []
+        target_trade_date = pd.to_datetime(trade_date, errors="coerce")
+        for item in account_snapshot.get("orders", []) or []:
+            status_code = self._coerce_int(item.get("order_status", item.get("status")))
+            if not self._is_active_order_status(status_code):
+                continue
+            occurred_at = self._pick_text(item, "order_time", "created_at", "entrust_time", default="")
+            occurred_day = pd.to_datetime(occurred_at, errors="coerce")
+            if pd.notna(target_trade_date) and pd.notna(occurred_day) and occurred_day.date() != target_trade_date.date():
+                continue
+            if not self._is_order_stale(item):
+                continue
+            broker_order_id = self._pick_text(item, "order_id", "order_sysid", "entrust_no", default="")
+            cancel_result = self._cancel_broker_order(broker_order_id)
+            cancellations.append(
+                {
+                    "symbol": self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id"),
+                    "broker_order_id": broker_order_id,
+                    "order_status": status_code,
+                    "cancel_result": cancel_result,
+                    "traded_volume": int(round(self._pick_number(item, "traded_volume", "filled_qty", default=0.0))),
+                }
+            )
+        return cancellations
+
+    def _serialize_execution_summary(self, payload: dict[str, Any]) -> dict[str, Any]:
+        serialized = dict(payload)
+        if "remaining_orders" in serialized:
+            serialized["remaining_orders"] = [
+                {
+                    "symbol": item.symbol,
+                    "side": item.side.value,
+                    "qty": item.qty,
+                    "price": float(item.price),
+                    "reason": item.reason,
+                    "metadata": item.metadata,
+                }
+                for item in serialized.get("remaining_orders") or []
+            ]
+        return serialized
 
     def _build_quote_maps_from_quotes(
         self,
@@ -844,15 +1069,8 @@ class QmtMicrocapTradingEngine:
                     continue
                 order = oms_service.create_order(intent, decision)
                 if qmt_enabled:
-                    result = self.bridge.submit_order(
-                        planned.symbol,
-                        planned.side.value,
-                        planned.qty,
-                        planned.price,
-                        strategy_name="joinquant-microcap-paper" if self.app_settings.environment == Environment.PAPER else "joinquant-microcap-live",
-                        order_remark=planned.reason,
-                    )
-                    broker_order_id = str(result.get("order_id") or "")
+                    submission_result = self._submit_order_with_retry(planned, prices, session)
+                    broker_order_id = submission_result["broker_order_id"]
                     order.broker_order_id = broker_order_id or None
                     model = session.get(OrderModel, order.order_id)
                     if model is not None:
@@ -871,7 +1089,14 @@ class QmtMicrocapTradingEngine:
                             object_type="order",
                             object_id=order.order_id,
                             message=f"{planned.symbol} 宸叉彁浜?QMT 濮旀墭",
-                            payload={"broker_order_id": broker_order_id, "side": planned.side.value, "qty": planned.qty, "price": float(planned.price)},
+                            payload={
+                                "broker_order_id": broker_order_id,
+                                "side": planned.side.value,
+                                "qty": planned.qty,
+                                "price": float(planned.price),
+                                "retry_attempts": submission_result["attempts"],
+                                "remaining_qty": submission_result["remaining_qty"],
+                            },
                         )
                     )
                 else:
@@ -894,7 +1119,23 @@ class QmtMicrocapTradingEngine:
                 turnover += Decimal(str(planned.qty)) * planned.price
                 self._apply_planned_order(planning_state, planned)
 
-            snapshot_payload = self.bridge.get_account_snapshot() if qmt_enabled else account_snapshot
+            snapshot_payload = account_snapshot
+            snapshot_source = "input_snapshot"
+            if qmt_enabled:
+                try:
+                    snapshot_payload = self.bridge.get_account_snapshot()
+                    snapshot_source = "qmt_account"
+                except QmtUnavailableError as exc:
+                    snapshot_payload = self._build_snapshot_payload_from_state(planning_state, prices)
+                    snapshot_source = "planned_state_fallback"
+                    session.add(
+                        AuditLogModel(
+                            object_type="account_snapshot",
+                            object_id=latest_date.date().isoformat(),
+                            message="QMT 账户快照超时，已回退为本地计划持仓快照",
+                            payload={"error": str(exc), "source": snapshot_source},
+                        )
+                    )
             asset_row, position_rows = self._build_snapshot_rows(snapshot_payload, prices, strategy_total_asset)
             if asset_row is not None:
                 session.add(
@@ -935,6 +1176,7 @@ class QmtMicrocapTradingEngine:
                         "cash_reserve_ratio": target_meta["cash_reserve_ratio"],
                         "strategy_total_asset": float(strategy_total_asset),
                         "qmt_trade_enabled": qmt_enabled,
+                        "snapshot_source": snapshot_source,
                         "planned_orders": [
                             {
                                 "symbol": item.symbol,
@@ -964,6 +1206,167 @@ class QmtMicrocapTradingEngine:
             ]
         )
         return equity_curve, report_path
+
+    def _submit_order_with_retry(
+        self,
+        planned: PlannedOrder,
+        prices: dict[str, Decimal],
+        session,
+    ) -> dict[str, Any]:
+        remaining_qty = int(planned.qty)
+        attempts = 0
+        broker_order_id = ""
+        while remaining_qty > 0 and attempts < self.ORDER_RETRY_MAX_ATTEMPTS:
+            attempts += 1
+            current_price = self._resolve_resubmit_price(planned, prices)
+            result = self.bridge.submit_order(
+                planned.symbol,
+                planned.side.value,
+                remaining_qty,
+                current_price,
+                strategy_name="joinquant-microcap-paper" if self.app_settings.environment == Environment.PAPER else "joinquant-microcap-live",
+                order_remark=planned.reason,
+            )
+            broker_order_id = str(result.get("order_id") or "")
+            wait_result = self._wait_for_order_resolution(broker_order_id, remaining_qty)
+            filled_qty = int(wait_result.get("filled_qty") or 0)
+            final_remaining_qty = max(remaining_qty - filled_qty, 0)
+            session.add(
+                AuditLogModel(
+                    object_type="order_retry",
+                    object_id=broker_order_id or planned.symbol,
+                    message=f"{planned.symbol} 第 {attempts} 次委托检查完成",
+                    payload={
+                        "attempt": attempts,
+                        "submitted_qty": remaining_qty,
+                        "filled_qty": filled_qty,
+                        "remaining_qty": final_remaining_qty,
+                        "status_text": wait_result.get("status_text"),
+                        "status_code": wait_result.get("status_code"),
+                        "timed_out": bool(wait_result.get("timed_out")),
+                    },
+                )
+            )
+            if final_remaining_qty <= 0:
+                return {"broker_order_id": broker_order_id, "attempts": attempts, "remaining_qty": 0}
+            if not wait_result.get("status_available", True):
+                return {"broker_order_id": broker_order_id, "attempts": attempts, "remaining_qty": final_remaining_qty}
+            if wait_result.get("is_active", False) or wait_result.get("timed_out", False):
+                cancel_result = self._cancel_broker_order(broker_order_id)
+                session.add(
+                    AuditLogModel(
+                        object_type="order_retry",
+                        object_id=broker_order_id or planned.symbol,
+                        message=f"{planned.symbol} 未在 1 分钟内成交完成，已尝试撤单",
+                        payload={"attempt": attempts, "cancel_result": cancel_result, "remaining_qty": final_remaining_qty},
+                    )
+                )
+                if cancel_result != 0:
+                    return {"broker_order_id": broker_order_id, "attempts": attempts, "remaining_qty": final_remaining_qty}
+            remaining_qty = final_remaining_qty
+        return {"broker_order_id": broker_order_id, "attempts": attempts, "remaining_qty": remaining_qty}
+
+    def _wait_for_order_resolution(self, broker_order_id: str, submitted_qty: int) -> dict[str, Any]:
+        deadline = time.time() + float(self.ORDER_RETRY_TIMEOUT_SECONDS)
+        last_result = {
+            "status_available": False,
+            "status_text": "",
+            "status_code": -1,
+            "filled_qty": 0,
+            "is_active": False,
+            "timed_out": False,
+        }
+        while time.time() <= deadline:
+            try:
+                payload = self.bridge.get_order_status(broker_order_id)
+            except QmtUnavailableError:
+                return last_result
+            current = self._parse_order_status(payload, submitted_qty)
+            last_result = current
+            if current["filled_qty"] >= submitted_qty:
+                return current
+            if not current["is_active"]:
+                return current
+            time.sleep(max(1, int(self.ORDER_RETRY_POLL_SECONDS)))
+        last_result["timed_out"] = True
+        return last_result
+
+    def _parse_order_status(self, payload: dict[str, Any], submitted_qty: int) -> dict[str, Any]:
+        status_text = self._pick_text(payload, "status_msg", "status", "order_status_msg", default="")
+        status_code = self._coerce_int(payload.get("order_status", payload.get("status")))
+        filled_qty = int(round(self._pick_number(payload, "traded_volume", "filled_qty", "fill_qty", default=0.0)))
+        if filled_qty <= 0 and status_code == 56:
+            filled_qty = int(submitted_qty)
+        final_status_codes = {52, 53, 54, 56, 57}
+        normalized_text = status_text.lower()
+        is_filled = filled_qty >= submitted_qty or status_code == 56 or any(token in normalized_text for token in ["filled", "succeeded", "全部成交", "已成"])
+        is_final = status_code in final_status_codes or any(token in normalized_text for token in ["cancel", "rejected", "junk", "撤", "废", "拒"])
+        is_active = not is_filled and (self._is_active_order_status(status_code) or not is_final)
+        return {
+            "status_available": True,
+            "status_text": status_text,
+            "status_code": status_code,
+            "filled_qty": max(0, min(filled_qty, submitted_qty)),
+            "is_active": is_active,
+            "timed_out": False,
+        }
+
+    def _cancel_broker_order(self, broker_order_id: str) -> int:
+        if not broker_order_id:
+            return -2
+        try:
+            payload = self.bridge.cancel_order(broker_order_id)
+        except QmtUnavailableError:
+            return -9
+        try:
+            return int(payload.get("cancel_result"))
+        except (TypeError, ValueError):
+            return -8
+
+    def _resolve_resubmit_price(self, planned: PlannedOrder, prices: dict[str, Decimal]) -> Decimal:
+        try:
+            quotes = self.bridge.get_quotes([planned.symbol])
+            quote = quotes.get(planned.symbol, {}) if isinstance(quotes, dict) else {}
+            latest = self._resolve_quote_price(quote, is_buy=planned.side == OrderSide.BUY)
+            if latest > 0:
+                return Decimal(str(round(latest, 4)))
+        except QmtUnavailableError:
+            pass
+        return prices.get(planned.symbol, planned.price)
+
+    def _is_order_stale(self, payload: dict[str, Any]) -> bool:
+        order_time = self._coerce_order_time(payload.get("order_time", payload.get("created_at", payload.get("entrust_time"))))
+        if order_time is None:
+            return False
+        return (datetime.now() - order_time).total_seconds() >= float(self.ORDER_RETRY_TIMEOUT_SECONDS)
+
+    @staticmethod
+    def _is_active_order_status(status_code: int) -> bool:
+        return status_code in {48, 49, 50, 51, 55, 255}
+
+    @staticmethod
+    def _coerce_order_time(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 1_000_000_000_000:
+                timestamp = timestamp / 1000.0
+            try:
+                return datetime.fromtimestamp(timestamp)
+            except (OverflowError, OSError, ValueError):
+                return None
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return -1
 
     def _build_account_state(
         self,
@@ -1031,6 +1434,54 @@ class QmtMicrocapTradingEngine:
             for position in state.positions.values()
         ]
         return asset_row, positions
+
+    def _build_snapshot_payload_from_state(
+        self,
+        state: AccountState,
+        prices: dict[str, Decimal],
+    ) -> dict[str, Any]:
+        total_asset = state.total_asset(prices)
+        return {
+            "account_id": state.account_id,
+            "asset": {
+                "cash": float(state.cash),
+                "frozen_cash": float(state.frozen_cash),
+                "total_asset": float(total_asset),
+            },
+            "positions": [
+                {
+                    "symbol": position.symbol,
+                    "qty": position.qty,
+                    "available_qty": position.available_qty,
+                    "cost_price": float(position.cost_price),
+                    "market_price": float(prices.get(position.symbol, position.last_price)),
+                }
+                for position in state.positions.values()
+            ],
+            "orders": [],
+            "trades": [],
+            "source": "planned_state_fallback",
+        }
+
+    def _build_equity_curve_snapshot(
+        self,
+        latest_date: pd.Timestamp,
+        state: AccountState,
+        prices: dict[str, Decimal],
+        *,
+        turnover: Decimal,
+    ) -> pd.DataFrame:
+        total_asset = state.total_asset(prices)
+        return pd.DataFrame(
+            [
+                {
+                    "trading_date": latest_date.date(),
+                    "equity": float(total_asset),
+                    "cash": float(state.cash),
+                    "turnover": float(turnover),
+                }
+            ]
+        )
 
     def _resolve_strategy_total_asset(self, initial_cash: Decimal, reported_total_asset: Decimal) -> Decimal:
         if self.app_settings.environment != Environment.PAPER:
@@ -1132,6 +1583,27 @@ class QmtMicrocapTradingEngine:
         if value > 0:
             return value
         return QmtMicrocapTradingEngine._pick_number(quote, "last_price", "open", default=0.0)
+
+    @staticmethod
+    def _normalize_activity_side(value: Any) -> str:
+        if value in (None, ""):
+            return ""
+        raw = str(value).strip().lower()
+        if raw in {"buy", "b", "long", "买入", "证券买入"}:
+            return "buy"
+        if raw in {"sell", "s", "short", "卖出", "证券卖出"}:
+            return "sell"
+        if raw.isdigit():
+            number = int(raw)
+            if number in {1, 23, 48}:
+                return "buy"
+            if number in {2, 24, 49}:
+                return "sell"
+        if "买" in raw:
+            return "buy"
+        if "卖" in raw:
+            return "sell"
+        return raw
 
     @staticmethod
     def _pick_text(payload: dict[str, Any], *keys: str, default: str = "") -> str:

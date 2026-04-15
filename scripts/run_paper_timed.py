@@ -8,6 +8,8 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pandas as pd
+
 from _bootstrap import ROOT, SRC
 
 sys.path.insert(0, str(SRC))
@@ -35,13 +37,26 @@ def _now_local() -> datetime:
     return datetime.now()
 
 
+def _load_latest_history_date(history_path: str) -> str:
+    path = Path(history_path)
+    if not path.exists():
+        return ""
+    frame = pd.read_parquet(path, columns=["trading_date"])
+    if frame.empty:
+        return ""
+    latest = pd.to_datetime(frame["trading_date"]).dt.normalize().max()
+    if pd.isna(latest):
+        return ""
+    return latest.date().isoformat()
+
+
 def _seconds_until(target_hhmm: str, now: datetime) -> float:
     target_dt = datetime.strptime(f"{now.date()} {target_hhmm}", "%Y-%m-%d %H:%M")
     return (target_dt - now).total_seconds()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="运行微盘股 T+1 定时仿真执行")
+    parser = argparse.ArgumentParser(description="运行微盘股 T+1 定时仿真交易")
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
     parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml"))
     parser.add_argument("--capital", default="100000")
@@ -73,7 +88,11 @@ def main() -> None:
     planned_execution_date = str(plan_payload.get("planned_execution_date") or "").strip()
     signal_trade_date = str(plan_payload.get("signal_trade_date") or "").strip()
     if planned_execution_date != today:
-        raise RuntimeError(f"当前计划执行日为 {planned_execution_date}，今天是 {today}，请在对应交易日运行或重新生成计划")
+        latest_history_date = _load_latest_history_date(app_settings.history_parquet)
+        raise RuntimeError(
+            f"当前计划执行日为 {planned_execution_date}，今天是 {today}。"
+            f" 本地历史最新交易日为 {latest_history_date or '未知'}，请先刷新到最新交易日后重新生成计划。"
+        )
 
     receipt_path = _resolve_receipt_path(app_settings.report_dir, signal_trade_date, planned_execution_date)
     if receipt_path.exists():
