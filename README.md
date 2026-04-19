@@ -1,58 +1,72 @@
 # QMT 事件驱动量化交易 Demo
 
-日期：2026-03-21  
+日期：2026-04-20  
 执行者：Codex
 
-本项目依据 `QMT_事件驱动量化交易_Demo_技术设计文档_v1.0.docx` 落地一套可运行的量化交易 Demo，覆盖研究、回测、仿真、实盘接入骨架与展示层。系统遵循“研究层 / 交易核心层 / 接入层 / 存储层”分层，QMT 仅作为行情与交易接入层，交易内核完全由 Python 控制。
+本项目是一个以 `Python + QMT + PostgreSQL + Vue` 为核心的量化交易示例工程，覆盖了：
+
+- 历史数据加载与缓存
+- 策略回测
+- QMT 仿真盘计划生成与自动执行
+- QMT 实盘探活与策略执行
+- 本地 API 与前端看板展示
+
+当前仓库的核心目标不是做单一策略研究，而是打通一条完整链路：
+
+- `研究 / 回测`
+- `仿真盘计划 / 自动执行`
+- `QMT 实盘接入`
+- `结果记录 / 报表展示`
 
 ## 目录说明
 
-- `src/quant_demo/`：核心系统代码。
-- `scripts/`：运行脚本，包括历史数据加载、回测、仿真、实盘、对账与 QMT 安装引导。
-- `configs/`：环境和策略配置。
-- `sql/schema.sql`：设计文档对应的 PostgreSQL 初始化 DDL。
-- `data/parquet/`：研究数据目录。
-- `runtime/qmt_client/`：QMT 客户端安装和运行目录，与源码隔离。
-- `.codex/`：本次实现过程留痕、上下文扫描、测试记录与审查报告。
+- `src/quant_demo/`：核心业务代码
+- `scripts/`：运行脚本，包含历史数据、回测、仿真盘、实盘、对账与 API 启动
+- `configs/`：环境与策略配置
+- `frontend/joinquant-vue/`：Vue 3 + Vite 前端
+- `data/`：本地 parquet、回测报告、仿真盘/实盘计划文件
+- `runtime/qmt_client/`：QMT 客户端安装与用户目录
+- `sql/schema.sql`：数据库初始化脚本
+- `.codex/`：本地过程留痕、测试记录与审查文件
 
-## Python 虚拟环境
+## 环境准备
 
-当前工作区已创建 `.venv`。由于沙箱网络和 `ensurepip` 权限限制，`.venv` 通过启用系统站点包复用了本机 Anaconda 环境中已有的 `pandas`、`SQLAlchemy`、`PyYAML`、`pytest`、`streamlit`、`pyarrow` 等依赖。
+项目默认使用本地虚拟环境 `.venv`。
 
 常用命令：
 
 ```powershell
+.\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe scripts\load_history.py
 .\.venv\Scripts\python.exe scripts\run_backtest.py
 .\.venv\Scripts\python.exe scripts\run_paper.py
-.\.venv\Scripts\python.exe scripts\reconcile_eod.py
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\run_live.py --mode probe
 ```
+
+数据库默认配置在各环境 YAML 中，当前主要使用 PostgreSQL。
 
 ## 项目启动
 
-本项目本地开发时，前端和 API 需要分别启动。推荐先启动 API，再启动前端。
-
-1. 启动本地 API
+### 1. 启动本地 API
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_api.py
 ```
 
-- 默认监听地址：`http://127.0.0.1:8011`
-- 健康检查：`http://127.0.0.1:8011/health`
+- 默认地址：[http://127.0.0.1:8011](http://127.0.0.1:8011)
+- 健康检查：[http://127.0.0.1:8011/health](http://127.0.0.1:8011/health)
 
-2. 启动前端开发服务
+### 2. 启动前端开发服务
 
 ```powershell
 cd frontend\joinquant-vue
 D:\nodejs\npm.cmd run dev
 ```
 
-- 默认访问地址：`http://127.0.0.1:8501`
+- 默认地址：[http://127.0.0.1:8501](http://127.0.0.1:8501)
 - 前端会将 `/api` 代理到 `http://127.0.0.1:8011`
 
-3. 如需启动打包后的前端静态页
+### 3. 启动打包后的前端
 
 ```powershell
 cd frontend\joinquant-vue
@@ -61,26 +75,226 @@ cd ..\..
 .\.venv\Scripts\python.exe scripts\run_dashboard.py
 ```
 
-- 默认访问地址：`http://127.0.0.1:8501`
-- `scripts/run_dashboard.py` 会托管 `frontend/joinquant-vue/dist/` 和 `/api` 接口
+- `scripts/run_dashboard.py` 会托管 `frontend/joinquant-vue/dist/`
+- 默认地址：[http://127.0.0.1:8501](http://127.0.0.1:8501)
 
-## Vue 前端
+## 当前策略清单
 
-- 新前端位于 `frontend/joinquant-vue/`，使用 `Vue 3 + Vite`，整体信息架构与视觉语言对齐聚宽量化平台。
-- `scripts/run_api.py` 可单独启动 API；`scripts/run_dashboard.py` 会在 `8501` 端口直接托管打包后的 Vue 页面和 `/api` 接口。
-- 开发模式下可进入 `frontend/joinquant-vue/` 后执行 `D:\nodejs\npm.cmd run dev`，默认把 `/api` 代理到 `127.0.0.1:8011`。
-- 生产静态产物输出到 `frontend/joinquant-vue/dist/`，由 Python 本地服务直接托管。
-## 默认实现说明
+策略配置文件位于 [D:\project\quant\configs\strategy](/D:/project/quant/configs/strategy)。
 
-- 数据库默认使用 `PostgreSQL`（见 `configs/*.yaml` 的 `database_url`），并在 `sql/schema.sql` 提供完整初始化 DDL。
-- 历史数据默认落到 `data/parquet/history.parquet`。若本机未安装 QMT/xtquant，则自动生成示例 ETF 数据，保障回测链路可运行。
-- QMT 实盘接入通过动态导入 `xtdata` / `xttrader`。如果 QMT 客户端尚未安装，系统仍可执行回测和仿真盘流程。
-- `api/app.py` 提供基于标准库 `http.server` 的演示接口，避免无网环境下额外安装 FastAPI；`ui/streamlit_app.py` 保持 Streamlit 展示入口。
+### 微盘主线策略
 
-## 聚宽风格策略形态
+- `joinquant_microcap_alpha.yaml`
+  - 纯微盘 Alpha
+- `joinquant_microcap_alpha_zhuang_filter.yaml`
+  - 聚宽微盘 Alpha（庄股过滤）
+  - 当前项目主线之一
+  - 当前正式默认规则：
+    - 不允许 `ST`
+    - 不允许北交所
+    - 继续排除 `*ST`
+    - 继续排除退市整理
+- `joinquant_microcap_alpha_zfe.yaml`
+  - 聚宽微盘 Alpha（庄股过滤增强卖点）
+- `joinquant_microcap_alpha_zr.yaml`
+  - 聚宽微盘 Alpha（庄股最终替换）
+- `joinquant_microcap_alpha_zro.yaml`
+  - 聚宽微盘 Alpha（优化版）
 
-- 新增 `configs/strategy/joinquant_style.yaml`，将策略声明改成更接近聚宽的钩子风格：`initialize / before_trading_start / handle_data / after_trading_end`。
-- 数据接入层继续沿用 QMT（`history_source=qmt`），在 UI 的“聚宽风格”模板下仍由 `scripts/load_history.py` 和 QMT bridge 负责历史行情拉取。
-- 回测层保持 Qlib 引擎不变（`backtest_engine=qlib`），新增策略的信号映射可直接进入 `TopkDropoutStrategy` 完成全市场回测。
-- 回测详情主图区支持“策略曲线 + Benchmark 曲线”同图展示；Qlib 回测完成后会输出 `report_dir/qlib_curve.csv` 供 UI 读取。
-- UI 侧边栏新增“准实时刷新”选项，可按秒级间隔自动轮询最新资产快照与报告。
+### 微盘扩展实验策略
+
+- `industry_weighted_microcap_alpha.yaml`
+  - 行业增强微盘 Alpha
+- `microcap_100b_layer_rotation.yaml`
+  - 0-100 亿分层轮动微盘 Alpha
+- `microcap_50b_layer_rotation.yaml`
+  - 0-50 亿分层轮动微盘 Alpha
+- `monster_prelude_alpha.yaml`
+  - 妖股前奏 Alpha（实验策略）
+
+### 通用策略 / 展示策略
+
+- `first_alpha_v1.yaml`
+  - 通用 Alpha 排序策略
+- `stock_ranking.yaml`
+  - 股票排序策略
+- `etf_rotation.yaml`
+  - ETF 轮动策略
+- `joinquant_style.yaml`
+  - 聚宽风格策略模板
+
+## 推荐使用方式
+
+如果你主要关注当前项目的主线策略，建议优先使用：
+
+- 回测：`joinquant_microcap_alpha_zhuang_filter.yaml`
+- 仿真盘：`joinquant_microcap_alpha_zhuang_filter.yaml`
+- 实盘探活或计划执行：`joinquant_microcap_alpha_zhuang_filter.yaml`
+
+## 回测执行
+
+默认回测入口：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_backtest.py --strategy configs\strategy\joinquant_microcap_alpha_zhuang_filter.yaml
+```
+
+回测完成后会输出 JSON 指标，包含：
+
+- `total_return`
+- `annualized_return`
+- `max_drawdown`
+- `turnover`
+- `report_path`
+
+回测报告通常落在：
+
+- `data/reports/`
+- `data/reports/saved_backtests/`
+
+## 仿真盘执行
+
+### 1. 预览明日交易计划
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_paper.py --mode preview --capital 100000 --strategy configs\strategy\joinquant_microcap_alpha_zhuang_filter.yaml
+```
+
+预览输出会包含：
+
+- `plan_path`
+- `signal_trade_date`
+- `planned_execution_date`
+- `strategy_total_asset`
+- `preview_order_count`
+
+当前 `run_paper.py` 已支持整组微盘策略正确走 `preview / execute` 分支，不再只支持纯微盘。
+
+### 2. 明日定时执行仿真盘计划
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_paper_timed.py --capital 100000 --execute-at 09:35 --strategy configs\strategy\joinquant_microcap_alpha_zhuang_filter.yaml
+```
+
+可选参数：
+
+- `--force-refresh-plan`
+  - 强制重新生成计划，不复用已有 `latest` 计划文件
+
+### 3. 计划文件位置
+
+仿真盘计划文件默认写入：
+
+- [D:\project\quant\data\reports\paper\trade_plans](/D:/project/quant/data/reports/paper/trade_plans)
+
+关键文件：
+
+- `microcap_t1_plan_latest.json`
+- `microcap_t1_plan_YYYYMMDD_for_YYYYMMDD.json`
+- `microcap_t1_execution_YYYYMMDD_for_YYYYMMDD.json`
+
+### 4. 仿真盘测试建议
+
+如果想验证自动交易程序是否正确，建议先在仿真盘做“有买有卖”的测试，而不是直接上实盘。
+
+推荐流程：
+
+1. 先跑一次 `preview`
+2. 如果 `preview_order_count = 0`，可以手工制造一个“错仓”和一个“缺仓”
+3. 再跑一次 `preview`，确认出现买单和卖单
+4. 第二天用 `run_paper_timed.py` 自动执行
+
+## QMT 实盘执行
+
+### 1. 先做 QMT 探活
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_live.py --config configs\live.yaml --mode probe
+```
+
+该命令会输出：
+
+- QMT 健康状态
+- 当前账号资产
+- 当前持仓
+- 当前可读到的账户快照
+
+### 2. 运行实盘策略
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_live.py --config configs\live.yaml --mode strategy --strategy configs\strategy\joinquant_microcap_alpha_zhuang_filter.yaml --capital 100000
+```
+
+注意事项：
+
+- `configs/live.yaml` 中必须显式开启：
+  - `qmt_trade_enabled: true`
+- 当前 `run_live.py` 已支持 `--capital`
+  - 可用于将实盘策略资金上限限制为指定金额
+  - 例如 `100000`
+- 如果不传或传 `0`，则按账户真实资产口径运行
+
+### 3. 实盘与仿真盘的区别
+
+- `run_paper.py`
+  - 用于仿真盘计划生成与执行
+  - 支持 `preview`
+  - 支持 `--capital`
+- `run_live.py`
+  - 用于 QMT 实盘探活与真实策略执行
+  - `--mode probe` 不下单，只检查
+  - `--mode strategy` 才会真正执行策略
+  - 需要 `qmt_trade_enabled: true`
+
+## 当前策略执行特点
+
+以 `joinquant_microcap_alpha_zhuang_filter` 为例：
+
+- 会基于交易当日的历史 `ST / *ST / 退市整理` 状态做过滤
+- 当前正式默认规则下：
+  - 不买 `ST`
+  - 不买北交所
+  - 不买 `*ST`
+  - 不买退市整理
+- 如果持仓中的股票在交易当日被识别为 `ST`
+  - 不会继续进入目标池
+  - 会在后续可卖出的调仓日按 `not_in_target` 逻辑处理
+
+## 常见脚本说明
+
+- `scripts/load_history.py`
+  - 加载或刷新历史数据
+- `scripts/manage_history.py`
+  - 管理历史数据缓存
+- `scripts/run_backtest.py`
+  - 运行回测
+- `scripts/run_paper.py`
+  - 生成或执行仿真盘计划
+- `scripts/run_paper_timed.py`
+  - 定时执行仿真盘计划
+- `scripts/run_live.py`
+  - QMT 实盘探活与策略执行
+- `scripts/run_api.py`
+  - 启动本地 API
+- `scripts/run_dashboard.py`
+  - 启动打包后的前端
+- `scripts/reconcile_eod.py`
+  - 日终对账
+- `scripts/bootstrap_qmt.py`
+  - QMT 客户端安装引导
+
+## 已知现状
+
+- `joinquant_microcap_engine.py` 中仍有少量 `pandas FutureWarning`
+  - 不影响当前回测、仿真盘和实盘预览
+- 首次跑微盘策略计划时，历史特征准备可能需要几十秒到 1 分钟
+  - 这通常不是卡死，而是首次特征计算耗时
+- README 历史版本存在乱码，本次已整体重写为中文可读版本
+
+## 建议的日常使用顺序
+
+1. `run_live.py --mode probe`
+2. `run_paper.py --mode preview`
+3. 确认计划文件与目标仓
+4. `run_paper_timed.py` 做仿真盘自动执行验证
+5. 确认无误后，再考虑 `run_live.py --mode strategy`
