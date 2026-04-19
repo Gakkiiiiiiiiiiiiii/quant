@@ -8,6 +8,7 @@ import MetricStrip from './components/MetricStrip.vue'
 import PerformanceTriptych from './components/PerformanceTriptych.vue'
 
 const sections = ['收益概述', 'QMT 交易看板', '交易详情', '每日持仓&收益', '日志输出', '性能分析', '策略代码', 'Qlib 全市场', '形态实验室']
+const microcapStrategyKeys = ['joinquant_microcap_alpha', 'joinquant_microcap_alpha_zf', 'joinquant_microcap_alpha_zfe', 'joinquant_microcap_alpha_zr', 'joinquant_microcap_alpha_zro', 'monster_prelude_alpha', 'microcap_100b_layer_rot', 'microcap_50b_layer_rot', 'industry_weighted_microcap_alpha']
 const tradeTabs = [
   { key: 'pattern_actions', label: '每日交易记录' },
   { key: 'pattern_decisions', label: '每日决策' },
@@ -27,11 +28,13 @@ const sectionMeta = {
 
 const profile = ref('backtest')
 const selectedPatternReportDir = ref('')
+const selectedBacktestResultId = ref('')
 const activeSection = ref('收益概述')
 const activeTradeTab = ref('pattern_actions')
 const selectedLogSource = ref('QMT 客户端')
 const refreshInterval = ref(0)
 const qmtStream = ref(null)
+const dashboardCache = new Map()
 
 const state = reactive({
   loading: false,
@@ -52,9 +55,11 @@ const strategyForm = reactive({
 })
 
 const qlibForm = reactive({
+  strategy_label: '',
   history_universe_sector: '',
   history_universe_limit: 0,
   history_start: '',
+  history_end: '',
   history_adjustment: 'front',
   history_batch_size: 200,
   qlib_n_drop: 1,
@@ -83,6 +88,60 @@ const actionState = reactive({
   qlib: null,
   pattern: null,
 })
+
+function normalizeDateInput(value) {
+  if (!value) {
+    return ''
+  }
+  const text = String(value).trim()
+  if (/^\d{8}$/.test(text)) {
+    return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`
+  }
+  const parsed = new Date(text)
+  if (Number.isNaN(parsed.getTime())) {
+    return text
+  }
+  return parsed.toISOString().slice(0, 10)
+}
+
+function clonePayload(payload) {
+  if (!payload) {
+    return payload
+  }
+  if (typeof structuredClone === 'function') {
+    return structuredClone(payload)
+  }
+  return JSON.parse(JSON.stringify(payload))
+}
+
+function bootstrapCacheKey() {
+  if (!selectedBacktestResultId.value) {
+    return ''
+  }
+  return JSON.stringify({
+    profile: profile.value,
+    pattern_report_dir: selectedPatternReportDir.value || '',
+    backtest_result_id: selectedBacktestResultId.value,
+  })
+}
+
+function strategyTemplate(label) {
+  return (state.payload?.meta?.strategies || []).find((item) => item.label === label)?.defaults || null
+}
+
+function applyStrategyTemplate(targetForm, label) {
+  const template = strategyTemplate(label)
+  if (!template) {
+    return
+  }
+  targetForm.strategy_label = template.label || label
+  targetForm.name = template.name || ''
+  targetForm.implementation = template.implementation || ''
+  targetForm.rebalance_frequency = template.rebalance_frequency || 'weekly'
+  targetForm.lookback_days = Number(template.lookback_days || 20)
+  targetForm.top_n = Number(template.top_n || 2)
+  targetForm.lot_size = Number(template.lot_size || 100)
+}
 
 function formatMoney(value) {
   if (value === null || value === undefined || value === '') {
@@ -169,9 +228,11 @@ function hydrateForms(payload) {
   strategyForm.lot_size = Number(defaults.lot_size || 100)
 
   const qlibRuntime = payload.qlib?.runtime || {}
+  qlibForm.strategy_label = defaults.label || ''
   qlibForm.history_universe_sector = qlibRuntime.history_universe_sector || ''
   qlibForm.history_universe_limit = Number(qlibRuntime.history_universe_limit || 0)
-  qlibForm.history_start = qlibRuntime.history_start || ''
+  qlibForm.history_start = normalizeDateInput(qlibRuntime.history_start || '')
+  qlibForm.history_end = normalizeDateInput(qlibRuntime.history_end || '')
   qlibForm.history_adjustment = qlibRuntime.history_adjustment || 'front'
   qlibForm.history_batch_size = Number(qlibRuntime.history_batch_size || 200)
   qlibForm.qlib_n_drop = Number(qlibRuntime.qlib_n_drop || 1)
@@ -192,22 +253,42 @@ function hydrateForms(payload) {
   patternForm.risk_degree = Number(patternDefaults.risk_degree || 0.95)
   patternForm.max_holding_days = Number(patternDefaults.max_holding_days || 15)
   selectedPatternReportDir.value = payload.pattern?.selected_report_dir || ''
+  selectedBacktestResultId.value = payload.selected_backtest_result_id || ''
 }
 
 async function fetchBootstrap({ preserveForms = false } = {}) {
+  const cacheKey = bootstrapCacheKey()
   state.loading = !state.payload
   state.refreshing = Boolean(state.payload)
   state.error = ''
+  if (cacheKey && dashboardCache.has(cacheKey)) {
+    const cachedPayload = clonePayload(dashboardCache.get(cacheKey))
+    state.payload = cachedPayload
+    state.refreshedAt = Date.now()
+    if (!preserveForms) {
+      hydrateForms(cachedPayload)
+      activeTradeTab.value = (cachedPayload.data?.pattern_actions || []).length > 0 ? 'pattern_actions' : (((cachedPayload.data?.pattern_decisions || []).length > 0 ? 'pattern_decisions' : 'rules'))
+    }
+    state.loading = false
+    state.refreshing = false
+    return
+  }
   try {
     const payload = await apiGet('/api/bootstrap', {
       profile: profile.value,
       pattern_report_dir: selectedPatternReportDir.value,
+      backtest_result_id: selectedBacktestResultId.value,
     })
+    if (cacheKey) {
+      dashboardCache.set(cacheKey, clonePayload(payload))
+    }
     state.payload = payload
     state.refreshedAt = Date.now()
     if (!preserveForms) {
       hydrateForms(payload)
       activeTradeTab.value = (payload.data?.pattern_actions || []).length > 0 ? 'pattern_actions' : ((payload.data?.pattern_decisions || []).length > 0 ? 'pattern_decisions' : 'rules')
+    } else if (!(payload.selected_backtest_result_id || '') && selectedBacktestResultId.value) {
+      selectedBacktestResultId.value = ''
     }
   } catch (error) {
     state.error = error.message
@@ -279,12 +360,16 @@ function connectQmtStream() {
 async function runStrategy(action) {
   actionState.busy = 'strategy'
   try {
+    dashboardCache.clear()
     const response = await apiPost('/api/actions/strategy', {
       profile: profile.value,
       action,
       ...strategyForm,
     })
     actionState.strategy = response.result
+    if (action === 'backtest' && response.result?.backtest_result_id) {
+      selectedBacktestResultId.value = response.result.backtest_result_id
+    }
     await fetchBootstrap({ preserveForms: true })
   } catch (error) {
     actionState.strategy = { ok: false, stderr: error.message }
@@ -296,12 +381,16 @@ async function runStrategy(action) {
 async function runQlib(action) {
   actionState.busy = 'qlib'
   try {
+    dashboardCache.clear()
     const response = await apiPost('/api/actions/qlib', {
       profile: profile.value,
       action,
       ...qlibForm,
     })
     actionState.qlib = response.result
+    if (action === 'backtest' && response.result?.backtest_result_id) {
+      selectedBacktestResultId.value = response.result.backtest_result_id
+    }
     await fetchBootstrap({ preserveForms: true })
   } catch (error) {
     actionState.qlib = { ok: false, stderr: error.message }
@@ -313,6 +402,7 @@ async function runQlib(action) {
 async function runPattern(runAll) {
   actionState.busy = 'pattern'
   try {
+    dashboardCache.clear()
     const response = await apiPost('/api/actions/pattern', {
       ...patternForm,
       pattern_report_dir: selectedPatternReportDir.value,
@@ -338,6 +428,68 @@ const pattern = computed(() => state.payload?.pattern || { summary: [], comparis
 const primaryMode = computed(() => pattern.value.primary_mode || '')
 const profileOptions = computed(() => state.payload?.meta?.profiles || [])
 const strategyOptions = computed(() => state.payload?.meta?.strategies || [])
+const strategyRegistry = computed(() => (state.payload?.strategy_registry || []).filter((item) => item.results?.some((result) => result.category === 'system')))
+const strategyLabelLookup = computed(() => {
+  const pairs = []
+  strategyOptions.value.forEach((item) => {
+    const implementation = item?.defaults?.implementation
+    if (implementation) {
+      pairs.push([implementation, item.label])
+    }
+  })
+  strategyRegistry.value.forEach((item) => {
+    if (item.strategy_key) {
+      pairs.push([item.strategy_key, item.display_name || item.strategy_key])
+    }
+  })
+  return Object.fromEntries(pairs)
+})
+const selectedBacktestEntry = computed(() => {
+  if (!selectedBacktestResultId.value) {
+    return null
+  }
+  for (const item of strategyRegistry.value) {
+    for (const result of item.results || []) {
+      if (result.backtest_result_id === selectedBacktestResultId.value) {
+        return {
+          ...result,
+          display_name: item.display_name,
+          strategy_key: item.strategy_key,
+        }
+      }
+    }
+  }
+  return null
+})
+const savedBacktestOptions = computed(() => (
+  strategyRegistry.value
+    .flatMap((item) => (
+      (item.results || [])
+        .filter((result) => result.category === 'system')
+        .map((result) => ({
+          value: result.backtest_result_id,
+          strategyLabel: result.strategy_label || item.display_name,
+          createdAt: result.created_at || '',
+          label: `${result.strategy_label || item.display_name} | ${normalizeDateInput(result.start_date) || '--'} ~ ${normalizeDateInput(result.end_date) || '--'} | ${formatDatetime(result.created_at)}`,
+        }))
+    ))
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))
+))
+const historyResultRows = computed(() => (
+  strategyRegistry.value.flatMap((item) => (
+    (item.results || [])
+      .filter((result) => result.category === 'system')
+      .map((result) => ({
+        strategy_label: result.strategy_label || item.display_name,
+        period: `${normalizeDateInput(result.start_date) || '--'} ~ ${normalizeDateInput(result.end_date) || '--'}`,
+        total_return: result.total_return,
+        annualized_return: result.annualized_return,
+        max_drawdown: result.max_drawdown,
+        created_at: result.created_at,
+        selected: result.backtest_result_id === selectedBacktestResultId.value ? '当前查看' : '点击上方下拉切换',
+      }))
+  ))
+))
 const patternDirOptions = computed(() => pattern.value.report_dirs || [])
 const activeSectionMeta = computed(() => sectionMeta[activeSection.value] || { code: '--', note: '' })
 
@@ -352,7 +504,24 @@ const benchmarkCurve = computed(() => dashboardData.value.benchmark_curve || [])
 const qmtTradeBoard = computed(() => dashboardData.value.qmt_trade_board || {})
 const patternSummary = computed(() => pattern.value.summary || [])
 const patternComparison = computed(() => pattern.value.comparison || [])
-const isMicrocapBacktest = computed(() => assets.value.some((item) => item.account_id === 'joinquant_microcap_alpha'))
+const currentStrategyKey = computed(() => {
+  if (selectedBacktestEntry.value?.implementation) {
+    return selectedBacktestEntry.value.implementation
+  }
+  const lastAsset = assets.value.length > 0 ? assets.value[assets.value.length - 1] : null
+  return String(lastAsset?.account_id || '')
+})
+const currentStrategyLabel = computed(() => {
+  const selectedLabel = selectedBacktestEntry.value?.strategy_label || selectedBacktestEntry.value?.display_name
+  if (selectedLabel) {
+    return selectedLabel
+  }
+  if (currentStrategyKey.value && strategyLabelLookup.value[currentStrategyKey.value]) {
+    return strategyLabelLookup.value[currentStrategyKey.value]
+  }
+  return primaryMode.value || '扩展策略'
+})
+const isMicrocapBacktest = computed(() => microcapStrategyKeys.includes(currentStrategyKey.value))
 const hasQmtTradeBoard = computed(() => Boolean(qmtTradeBoard.value.available))
 const patternImageUrl = computed(() => {
   if (!pattern.value.png_url) {
@@ -423,7 +592,7 @@ const overviewHeroFacts = computed(() => ([
   {
     label: '回测区间',
     value: assetDateRange.value,
-    foot: isMicrocapBacktest.value ? '10万资金 / 微盘 Alpha' : (connection.value.label || '--'),
+    foot: isMicrocapBacktest.value ? `10万资金 / ${currentStrategyLabel.value}` : (connection.value.label || '--'),
   },
 ]))
 
@@ -537,7 +706,7 @@ const equitySeries = computed(() => {
     .sort((left, right) => left.label.localeCompare(right.label))
 
   const strategySeries = {
-    name: isMicrocapBacktest.value ? '聚宽微盘 Alpha' : (primaryMode.value || '策略曲线'),
+    name: currentStrategyLabel.value || (primaryMode.value || '策略曲线'),
     color: '#2e62ad',
     points: normalizeCurvePoints(strategyPoints),
   }
@@ -603,51 +772,15 @@ const microcapTriptych = computed(() => {
   return { labels, strategy, benchmark, excess, drawdown }
 })
 
-const microcapTriptych = computed(() => {
-  if (!isMicrocapBacktest.value || assets.value.length === 0 || benchmarkCurve.value.length === 0) {
-    return { labels: [], strategy: [], benchmark: [], excess: [], drawdown: [] }
-  }
-  const assetMap = new Map()
-  assets.value.forEach((item) => {
-    const label = formatDatetime(item.snapshot_time || item.datetime).slice(0, 10)
-    const value = Number(item.total_asset ?? item.account)
-    if (label && Number.isFinite(value)) {
-      assetMap.set(label, value)
-    }
-  })
-  const benchmarkMap = new Map()
-  benchmarkCurve.value.forEach((item) => {
-    const label = formatDatetime(item.trading_date || item.datetime).slice(0, 10)
-    const value = Number(item.benchmark_equity)
-    if (label && Number.isFinite(value)) {
-      benchmarkMap.set(label, value)
-    }
-  })
-  const labels = [...assetMap.keys()].filter((label) => benchmarkMap.has(label)).sort((left, right) => left.localeCompare(right))
-  if (labels.length === 0) {
-    return { labels: [], strategy: [], benchmark: [], excess: [], drawdown: [] }
-  }
-  const strategyBase = assetMap.get(labels[0]) || 0
-  const benchmarkBase = benchmarkMap.get(labels[0]) || 0
-  let runningPeak = 0
-  const strategy = []
-  const benchmark = []
-  const excess = []
-  const drawdown = []
-  labels.forEach((label) => {
-    const strategyValue = assetMap.get(label) || 0
-    const benchmarkValue = benchmarkMap.get(label) || 0
-    const strategyReturn = strategyBase ? strategyValue / strategyBase - 1 : 0
-    const benchmarkReturn = benchmarkBase ? benchmarkValue / benchmarkBase - 1 : 0
-    runningPeak = Math.max(runningPeak, strategyValue)
-    const drawdownValue = runningPeak > 0 ? strategyValue / runningPeak - 1 : 0
-    strategy.push(strategyReturn)
-    benchmark.push(benchmarkReturn)
-    excess.push(strategyReturn - benchmarkReturn)
-    drawdown.push(drawdownValue)
-  })
-  return { labels, strategy, benchmark, excess, drawdown }
-})
+const historyResultColumns = computed(() => ([
+  { key: 'strategy_label', label: '策略', sticky: true, minWidth: 168 },
+  { key: 'period', label: '区间', minWidth: 188 },
+  { key: 'total_return', label: '总收益', width: 108, align: 'right', formatter: formatRatio, tone: 'return' },
+  { key: 'annualized_return', label: '年化', width: 108, align: 'right', formatter: formatRatio, tone: 'return' },
+  { key: 'max_drawdown', label: '最大回撤', width: 108, align: 'right', formatter: formatRatio, tone: 'return' },
+  { key: 'created_at', label: '保存时间', minWidth: 148, formatter: formatDatetime },
+  { key: 'selected', label: '状态', minWidth: 120 },
+]))
 
 const patternSeries = computed(() => {
   const palette = {
@@ -760,7 +893,27 @@ const hasPatternTradeData = computed(() => (
 
 watch(profile, () => {
   closeQmtStream()
+  dashboardCache.clear()
+  selectedBacktestResultId.value = ''
   fetchBootstrap()
+})
+
+watch(() => strategyForm.strategy_label, (value, previous) => {
+  if (value && value !== previous) {
+    applyStrategyTemplate(strategyForm, value)
+  }
+})
+
+watch(() => qlibForm.strategy_label, (value, previous) => {
+  if (value && value !== previous) {
+    applyStrategyTemplate(qlibForm, value)
+  }
+})
+
+watch(selectedBacktestResultId, (value, previous) => {
+  if (value !== previous) {
+    fetchBootstrap({ preserveForms: true })
+  }
 })
 
 watch(
@@ -812,7 +965,7 @@ onBeforeUnmount(() => {
         <h1>JoinQuant 风格量化平台</h1>
         <div class="jq-topbar__sub">Vue 版前端，默认展示当前回测产物，并保留形态实验室与全市场入口。</div>
         <div class="jq-topbar__chips">
-          <span class="hero-chip hero-chip--brand">{{ isMicrocapBacktest ? '聚宽微盘 Alpha' : '扩展策略' }}</span>
+          <span class="hero-chip hero-chip--brand">{{ currentStrategyLabel }}</span>
           <span class="hero-chip">{{ connection.label || '--' }}</span>
           <span class="hero-chip">区间 {{ assetDateRange }}</span>
         </div>
@@ -851,6 +1004,13 @@ onBeforeUnmount(() => {
             <option :value="10">10 秒</option>
             <option :value="20">20 秒</option>
             <option :value="30">30 秒</option>
+          </select>
+        </label>
+        <label>
+          <span>历史回测</span>
+          <select v-model="selectedBacktestResultId">
+            <option value="">当前运行态 / 默认报表</option>
+            <option v-for="item in savedBacktestOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
           </select>
         </label>
       </div>
@@ -896,7 +1056,7 @@ onBeforeUnmount(() => {
           <section class="overview-hero overview-hero--compact">
             <div class="overview-hero__copy">
               <div class="overview-hero__kicker">{{ activeSectionMeta.code }} / {{ isMicrocapBacktest ? 'Microcap Alpha Board' : 'Strategy Board' }}</div>
-              <h2>{{ isMicrocapBacktest ? '聚宽微盘 Alpha 回测总览' : '扩展策略总览' }}</h2>
+              <h2>{{ isMicrocapBacktest ? `${currentStrategyLabel} 回测总览` : `${currentStrategyLabel} 总览` }}</h2>
               <p>
                 {{ isMicrocapBacktest
                   ? '按 JoinQuant 风格重排首屏，优先放大收益曲线与核心指标，让回测结果一进来就能看清。'
@@ -947,21 +1107,22 @@ onBeforeUnmount(() => {
               <div v-if="isMicrocapBacktest">
                 <div class="panel-card__header">
                   <div>
-                    <h2>近期成交</h2>
-                    <p>最近调仓记录，便于把曲线和执行动作一起对照。</p>
+                    <h2>历史回测与近期成交</h2>
+                    <p>上方可切换不同策略的历史回测，下面保留最近调仓记录便于对照。</p>
                   </div>
                 </div>
+                <DataTable :rows="historyResultRows" :columns="historyResultColumns" :max-height="260" empty-text="暂无已保存回测结果" />
                 <DataTable :rows="recentTradePreview" :columns="overviewTradeColumns" :max-height="720" empty-text="暂无成交记录" />
               </div>
               <div v-else>
                 <div class="panel-card__header">
                   <div>
-                    <h2>扩展策略看板</h2>
-                    <p>扩展策略与 Benchmark 的最新对比。</p>
+                    <h2>扩展策略与历史回测</h2>
+                    <p>扩展策略当前对比曲线，以及已保存回测结果摘要。</p>
                   </div>
                 </div>
                 <LineChart :series="patternSeries" :height="360" :as-percent="true" :fill-area="true" />
-                <DataTable :rows="patternSummary" :max-height="280" empty-text="暂无形态策略回测结果" />
+                <DataTable :rows="historyResultRows.length > 0 ? historyResultRows : patternSummary" :columns="historyResultRows.length > 0 ? historyResultColumns : []" :max-height="280" empty-text="暂无形态策略回测结果" />
               </div>
             </div>
           </div>
@@ -1182,8 +1343,21 @@ onBeforeUnmount(() => {
             <div class="panel-card__header">
               <div>
                 <h2>Qlib 全市场回测</h2>
-                <p>历史更新、Provider 缓存与全市场回测统一入口。</p>
+                <p>历史更新、Provider 缓存、时间范围回测与已保存结果切换入口。</p>
               </div>
+            </div>
+            <div class="toolbar-stat">
+              <span>已保存结果</span>
+              <strong>{{ selectedBacktestResultId ? '查看历史回测' : '当前运行态' }}</strong>
+            </div>
+            <div class="pattern-dir-picker">
+              <label>
+                <span>结果切换</span>
+                <select v-model="selectedBacktestResultId">
+                  <option value="">当前运行态 / 默认报表</option>
+                  <option v-for="item in savedBacktestOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+                </select>
+              </label>
             </div>
             <MetricStrip :items="[
               { label: '历史记录数', value: String(qlibStatus.row_count ?? 0) },
@@ -1192,8 +1366,15 @@ onBeforeUnmount(() => {
               { label: '历史文件', value: qlibStatus.history_path || '--' },
             ]" />
             <div class="form-grid form-grid--qlib">
+              <label>
+                <span>策略模板</span>
+                <select v-model="qlibForm.strategy_label">
+                  <option v-for="item in strategyOptions" :key="item.label" :value="item.label">{{ item.label }}</option>
+                </select>
+              </label>
               <label><span>股票池板块</span><input v-model="qlibForm.history_universe_sector" type="text" /></label>
-              <label><span>历史起始日</span><input v-model="qlibForm.history_start" type="text" /></label>
+              <label><span>开始日期</span><input v-model="qlibForm.history_start" type="date" /></label>
+              <label><span>结束日期</span><input v-model="qlibForm.history_end" type="date" /></label>
               <label><span>复权口径</span>
                 <select v-model="qlibForm.history_adjustment">
                   <option value="front">front</option>
@@ -1233,7 +1414,7 @@ onBeforeUnmount(() => {
             <div class="pattern-dir-picker">
               <label>
                 <span>结果目录</span>
-                <select v-model="selectedPatternReportDir" @change="fetchBootstrap({ preserveForms: true })">
+                <select v-model="selectedPatternReportDir" @change="dashboardCache.clear(); fetchBootstrap({ preserveForms: true })">
                   <option v-for="item in patternDirOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
                 </select>
               </label>

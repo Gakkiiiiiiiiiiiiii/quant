@@ -29,6 +29,41 @@
 .\.venv\Scripts\python.exe -m pytest
 ```
 
+## 项目启动
+
+本项目本地开发时，前端和 API 需要分别启动。推荐先启动 API，再启动前端。
+
+1. 启动本地 API
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_api.py
+```
+
+- 默认监听地址：`http://127.0.0.1:8011`
+- 健康检查：`http://127.0.0.1:8011/health`
+
+2. 启动前端开发服务
+
+```powershell
+cd frontend\joinquant-vue
+D:\nodejs\npm.cmd run dev
+```
+
+- 默认访问地址：`http://127.0.0.1:8501`
+- 前端会将 `/api` 代理到 `http://127.0.0.1:8011`
+
+3. 如需启动打包后的前端静态页
+
+```powershell
+cd frontend\joinquant-vue
+D:\nodejs\npm.cmd run build
+cd ..\..
+.\.venv\Scripts\python.exe scripts\run_dashboard.py
+```
+
+- 默认访问地址：`http://127.0.0.1:8501`
+- `scripts/run_dashboard.py` 会托管 `frontend/joinquant-vue/dist/` 和 `/api` 接口
+
 ## Vue 前端
 
 - 新前端位于 `frontend/joinquant-vue/`，使用 `Vue 3 + Vite`，整体信息架构与视觉语言对齐聚宽量化平台。

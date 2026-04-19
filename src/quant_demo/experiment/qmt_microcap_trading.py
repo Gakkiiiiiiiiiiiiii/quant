@@ -383,7 +383,10 @@ class QmtMicrocapTradingEngine:
 
     def _load_recent_history_window(self, window_days: int = 40) -> pd.DataFrame:
         history_path = Path(self.app_settings.history_parquet)
-        frame = pd.read_parquet(history_path, columns=["trading_date", "symbol", "open", "close", "volume", "amount"])
+        frame = pd.read_parquet(
+            history_path,
+            columns=["trading_date", "symbol", "open", "high", "low", "close", "volume", "amount"],
+        )
         frame["trading_date"] = pd.to_datetime(frame["trading_date"]).dt.normalize()
         start_dt = pd.Timestamp(self.app_settings.history_start or "2020-01-01").normalize()
         if self.app_settings.history_end:
@@ -1484,8 +1487,6 @@ class QmtMicrocapTradingEngine:
         )
 
     def _resolve_strategy_total_asset(self, initial_cash: Decimal, reported_total_asset: Decimal) -> Decimal:
-        if self.app_settings.environment != Environment.PAPER:
-            return reported_total_asset
         try:
             requested_total_asset = Decimal(str(initial_cash))
         except Exception:

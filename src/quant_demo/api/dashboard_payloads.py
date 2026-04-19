@@ -20,6 +20,7 @@ from quant_demo.core.enums import Environment
 from quant_demo.core.exceptions import QmtUnavailableError
 from quant_demo.db.models import CommonStrategyModel, StrategyBacktestResultModel
 from quant_demo.db.session import create_session_factory, session_scope
+from quant_demo.experiment.evaluator import Evaluator
 from quant_demo.marketdata.history_manager import history_status
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -34,6 +35,14 @@ STRATEGIES = {
     "第一版策略": ROOT / "configs" / "strategy" / "first_alpha_v1.yaml",
     "聚宽风格": ROOT / "configs" / "strategy" / "joinquant_style.yaml",
     "聚宽微盘 Alpha": ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml",
+    "聚宽微盘 Alpha（庄股过滤）": ROOT / "configs" / "strategy" / "joinquant_microcap_alpha_zhuang_filter.yaml",
+    "聚宽微盘 Alpha（庄股过滤增强）": ROOT / "configs" / "strategy" / "joinquant_microcap_alpha_zfe.yaml",
+    "聚宽微盘 Alpha（庄股替换）": ROOT / "configs" / "strategy" / "joinquant_microcap_alpha_zr.yaml",
+    "聚宽微盘 Alpha（优化版）": ROOT / "configs" / "strategy" / "joinquant_microcap_alpha_zro.yaml",
+    "妖股前奏 Alpha": ROOT / "configs" / "strategy" / "monster_prelude_alpha.yaml",
+    "0-100亿分层轮动微盘 Alpha": ROOT / "configs" / "strategy" / "microcap_100b_layer_rotation.yaml",
+    "0-50亿分层轮动微盘 Alpha": ROOT / "configs" / "strategy" / "microcap_50b_layer_rotation.yaml",
+    "行业增强微盘 Alpha": ROOT / "configs" / "strategy" / "industry_weighted_microcap_alpha.yaml",
 }
 USER_PATTERN_OPTIONS = {
     "形态策略 B1": "B1",
@@ -232,6 +241,19 @@ def _build_joinquant_microcap_report_text(
     trades: pd.DataFrame,
 ) -> str:
     latest = equity.iloc[-1] if not equity.empty else {}
+    strategy_key = str(summary.get("strategy") or "joinquant_microcap_alpha")
+    report_title_map = {
+        "joinquant_microcap_alpha": "聚宽微盘 Alpha 回测报告",
+        "joinquant_microcap_alpha_zf": "聚宽微盘 Alpha（庄股过滤）回测报告",
+        "joinquant_microcap_alpha_zfe": "聚宽微盘 Alpha（庄股过滤增强）回测报告",
+        "joinquant_microcap_alpha_zr": "聚宽微盘 Alpha（庄股替换）回测报告",
+        "joinquant_microcap_alpha_zro": "聚宽微盘 Alpha（优化版）回测报告",
+        "monster_prelude_alpha": "妖股前奏 Alpha 回测报告",
+        "microcap_100b_layer_rot": "0-100亿分层轮动微盘 Alpha 回测报告",
+        "microcap_50b_layer_rot": "0-50亿分层轮动微盘 Alpha 回测报告",
+        "industry_weighted_microcap_alpha": "行业增强微盘 Alpha 回测报告",
+    }
+    report_title = report_title_map.get(strategy_key, "聚宽微盘 Alpha 回测报告")
     benchmark_return = None
     benchmark_label = str(summary.get("benchmark_name") or summary.get("benchmark_symbol") or "Benchmark")
     if not equity.empty and "benchmark_equity" in equity.columns:
@@ -240,9 +262,9 @@ def _build_joinquant_microcap_report_text(
         if benchmark_start:
             benchmark_return = (benchmark_end - benchmark_start) / benchmark_start
     lines = [
-        "# 聚宽微盘 Alpha 回测报告",
+        f"# {report_title}",
         "",
-        f"策略标识: {summary.get('strategy', 'joinquant_microcap_alpha')}",
+        f"策略标识: {strategy_key}",
         f"回测区间: {summary.get('history_start', '--')} 至 {summary.get('history_end', '--')}",
         f"期末权益: {_format_money_text(latest.get('equity'))}",
         f"期末现金: {_format_money_text(latest.get('cash'))}",
@@ -300,8 +322,17 @@ def _load_joinquant_microcap_report(report_dir: str) -> DashboardData | None:
     if "trading_date" in equity.columns:
         equity["trading_date"] = pd.to_datetime(equity["trading_date"], errors="coerce")
 
+    summary: dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                summary = payload
+        except Exception:
+            summary = {}
+
     assets = equity.rename(columns={"trading_date": "snapshot_time", "equity": "total_asset"}).copy()
-    assets["account_id"] = "joinquant_microcap_alpha"
+    assets["account_id"] = str(summary.get("strategy") or "joinquant_microcap_alpha")
     if {"total_asset", "cash"}.issubset(assets.columns):
         assets["market_value"] = pd.to_numeric(assets["total_asset"], errors="coerce") - pd.to_numeric(assets["cash"], errors="coerce")
     if "total_pnl" not in assets.columns:
@@ -337,15 +368,6 @@ def _load_joinquant_microcap_report(report_dir: str) -> DashboardData | None:
         orders["status"] = "filled"
         orders["order_id"] = range(1, len(orders) + 1)
 
-    summary: dict[str, Any] = {}
-    if summary_path.exists():
-        try:
-            payload = json.loads(summary_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                summary = payload
-        except Exception:
-            summary = {}
-
     report_text = _build_joinquant_microcap_report_text(summary, equity, trades)
     return DashboardData(
         assets=assets,
@@ -364,7 +386,17 @@ def _is_joinquant_microcap_dashboard(data: DashboardData) -> bool:
     if data.assets.empty or "account_id" not in data.assets.columns:
         return False
     account_id = str(data.assets.iloc[-1].get("account_id") or "")
-    return account_id == "joinquant_microcap_alpha"
+    return account_id in {
+        "joinquant_microcap_alpha",
+        "joinquant_microcap_alpha_zf",
+        "joinquant_microcap_alpha_zfe",
+        "joinquant_microcap_alpha_zr",
+        "joinquant_microcap_alpha_zro",
+        "monster_prelude_alpha",
+        "microcap_100b_layer_rot",
+        "microcap_50b_layer_rot",
+        "industry_weighted_microcap_alpha",
+    }
 
 
 def resolve_profile_path(profile: str) -> Path:
@@ -895,10 +927,23 @@ def overview(data: DashboardData) -> dict[str, Any]:
 
 def connection_state(settings: AppSettings, probe: dict[str, Any] | None, data: DashboardData | None = None) -> dict[str, str]:
     if data is not None and _is_joinquant_microcap_dashboard(data):
+        account_id = str(data.assets.iloc[-1].get("account_id") or "") if not data.assets.empty and "account_id" in data.assets.columns else ""
+        detail_map = {
+            "industry_weighted_microcap_alpha": "当前页面展示 industry_weighted_microcap_alpha 的本地回测产物。",
+            "joinquant_microcap_alpha_zf": "当前页面展示 joinquant_microcap_alpha_zf 的本地回测产物。",
+            "joinquant_microcap_alpha_zfe": "当前页面展示 joinquant_microcap_alpha_zfe 的本地回测产物。",
+            "joinquant_microcap_alpha_zr": "当前页面展示 joinquant_microcap_alpha_zr 的本地回测产物。",
+            "joinquant_microcap_alpha_zro": "当前页面展示 joinquant_microcap_alpha_zro 的本地回测产物。",
+            "monster_prelude_alpha": "当前页面展示 monster_prelude_alpha 的本地回测产物。",
+            "microcap_100b_layer_rot": "当前页面展示 microcap_100b_layer_rot 的本地回测产物。",
+            "microcap_50b_layer_rot": "当前页面展示 microcap_50b_layer_rot 的本地回测产物。",
+            "joinquant_microcap_alpha": "当前页面展示 joinquant_microcap_alpha 的本地回测产物。",
+        }
+        detail = detail_map.get(account_id, "当前页面展示 joinquant_microcap_alpha 的本地回测产物。")
         return {
             "label": "聚宽微盘回测视图",
             "color": "#0f766e",
-            "detail": "当前页面展示 joinquant_microcap_alpha 的本地回测产物。",
+            "detail": detail,
         }
     if settings.environment == Environment.BACKTEST:
         return {"label": "离线数据库视图", "color": "#64748b", "detail": "当前未连接 QMT，只展示历史数据。"}
@@ -983,6 +1028,106 @@ def build_pattern_defaults() -> dict[str, Any]:
         "max_holdings": 10,
         "risk_degree": 0.95,
         "max_holding_days": 15,
+    }
+
+
+def _compact_date_text(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(parsed):
+        return raw.replace("-", "")
+    return parsed.strftime("%Y%m%d")
+
+
+def _iso_date_text(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(parsed):
+        return raw
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _report_dir_slug(value: str) -> str:
+    normalized = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value or "").strip().lower())
+    normalized = normalized.strip("_")
+    return normalized or "backtest"
+
+
+def _resolve_workspace_path(raw_path: str | Path) -> Path:
+    candidate = Path(raw_path)
+    return candidate.resolve() if candidate.is_absolute() else (ROOT / candidate).resolve()
+
+
+def _make_backtest_report_dir(strategy_key: str, start_date: str, end_date: str) -> Path:
+    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    start_label = _compact_date_text(start_date) or "auto"
+    end_label = _compact_date_text(end_date) or "latest"
+    safe_key = _report_dir_slug(strategy_key)
+    return (ROOT / "data" / "reports" / "saved_backtests" / f"{safe_key}_{start_label}_{end_label}_{stamp}").resolve()
+
+
+def _frame_from_records(records: Any, date_columns: list[str] | None = None) -> pd.DataFrame:
+    if not isinstance(records, list) or not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records)
+    for column in date_columns or []:
+        if column in frame.columns:
+            frame[column] = pd.to_datetime(frame[column], errors="coerce")
+    return frame
+
+
+def _serialize_dashboard_data(data: DashboardData) -> dict[str, Any]:
+    return {
+        "assets": _frame_records(data.assets),
+        "positions": _frame_records(data.positions),
+        "orders": _frame_records(data.orders),
+        "trades": _frame_records(data.trades),
+        "risk": _frame_records(data.risk),
+        "audit": _frame_records(data.audit),
+        "rules": _frame_records(data.rules),
+        "report_text": data.report_text,
+        "benchmark_curve": _frame_records(data.benchmark_curve),
+    }
+
+
+def _restore_dashboard_data(payload: dict[str, Any]) -> DashboardData:
+    return DashboardData(
+        assets=_frame_from_records(payload.get("assets"), ["snapshot_time"]),
+        positions=_frame_from_records(payload.get("positions"), ["snapshot_time"]),
+        orders=_frame_from_records(payload.get("orders"), ["created_at", "updated_at"]),
+        trades=_frame_from_records(payload.get("trades"), ["trade_time", "trading_date"]),
+        risk=_frame_from_records(payload.get("risk"), ["decided_at"]),
+        audit=_frame_from_records(payload.get("audit"), ["created_at"]),
+        rules=_frame_from_records(payload.get("rules"), ["decided_at"]),
+        report_text=str(payload.get("report_text") or "暂无日终报告。"),
+        benchmark_curve=_frame_from_records(payload.get("benchmark_curve"), ["trading_date"]),
+    )
+
+
+def _build_metrics_from_assets(assets: pd.DataFrame) -> dict[str, Any]:
+    if assets.empty or "total_asset" not in assets.columns:
+        return {"total_return": None, "annualized_return": None, "max_drawdown": None, "turnover": None, "ending_equity": None}
+    working = assets.copy()
+    working["equity"] = pd.to_numeric(working["total_asset"], errors="coerce")
+    if "turnover" in working.columns:
+        working["turnover"] = pd.to_numeric(working["turnover"], errors="coerce").fillna(0.0)
+    else:
+        working["turnover"] = 0.0
+    working = working.dropna(subset=["equity"]).reset_index(drop=True)
+    if working.empty:
+        return {"total_return": None, "annualized_return": None, "max_drawdown": None, "turnover": None, "ending_equity": None}
+    metrics = Evaluator().evaluate(working.loc[:, ["equity", "turnover"]])
+    return {
+        "total_return": metrics.total_return,
+        "annualized_return": metrics.annualized_return,
+        "max_drawdown": metrics.max_drawdown,
+        "turnover": metrics.turnover,
+        "ending_equity": float(working["equity"].iloc[-1]),
+        "account": float(working["equity"].iloc[0]),
     }
 
 
@@ -1086,6 +1231,9 @@ def list_common_strategies_with_results(database_url: str) -> list[dict[str, Any
                         "annualized_return": _safe_float(item.annualized_return),
                         "max_drawdown": _safe_float(item.max_drawdown),
                         "ending_equity": _safe_float(item.ending_equity),
+                        "category": _parse_json_payload(item.raw_payload).get("category", ""),
+                        "implementation": _parse_json_payload(item.raw_payload).get("implementation", ""),
+                        "strategy_label": _parse_json_payload(item.raw_payload).get("strategy_label", strategy.display_name),
                         "created_at": item.created_at.isoformat(),
                     }
                     for item in rows
@@ -1131,11 +1279,108 @@ def persist_pattern_backtest_results(database_url: str, summary_rows: list[dict[
                         risk_path=_resolve_result_path(row.get("risk_path"), base_dir),
                         daily_action_path=_resolve_result_path(row.get("daily_action_path"), base_dir),
                         daily_decision_path=_resolve_result_path(row.get("daily_decision_path"), base_dir),
-                        raw_payload=row,
+                        raw_payload={"category": "pattern", "summary": row},
                     )
                 )
     except Exception:
         return
+
+
+def load_saved_backtest_result(database_url: str, backtest_result_id: str) -> dict[str, Any] | None:
+    target_id = str(backtest_result_id or "").strip()
+    if not target_id:
+        return None
+    try:
+        factory = create_session_factory(database_url)
+        with session_scope(factory) as session:
+            result_row = session.scalar(
+                select(StrategyBacktestResultModel).where(StrategyBacktestResultModel.backtest_result_id == target_id)
+            )
+            if result_row is None:
+                return None
+            strategy = session.scalar(
+                select(CommonStrategyModel).where(CommonStrategyModel.strategy_id == result_row.strategy_id)
+            )
+    except Exception:
+        return None
+    raw_payload = _parse_json_payload(result_row.raw_payload)
+    dashboard_payload = raw_payload.get("dashboard_data")
+    if not isinstance(dashboard_payload, dict):
+        return None
+    return {
+        "result": result_row,
+        "strategy": strategy,
+        "raw_payload": raw_payload,
+        "data": _restore_dashboard_data(dashboard_payload),
+    }
+
+
+def persist_strategy_backtest_result(
+    database_url: str,
+    *,
+    strategy_label: str,
+    strategy_payload: dict[str, Any],
+    runtime_payload: dict[str, Any],
+    data: DashboardData,
+    profile: str,
+) -> str | None:
+    if data.assets.empty:
+        return None
+    strategy_key = str(strategy_payload.get("implementation") or strategy_label).strip() or "strategy"
+    display_name = str(strategy_label or strategy_key).strip() or strategy_key
+    report_dir = _resolve_workspace_path(str(runtime_payload.get("report_dir") or "data/reports"))
+    metrics = _build_metrics_from_assets(data.assets)
+    end_date = _compact_date_text(runtime_payload.get("history_end"))
+    if not end_date and not data.assets.empty and "snapshot_time" in data.assets.columns:
+        latest_snapshot = pd.to_datetime(data.assets["snapshot_time"], errors="coerce").dropna()
+        if not latest_snapshot.empty:
+            end_date = latest_snapshot.iloc[-1].strftime("%Y%m%d")
+    report_candidates = [
+        report_dir / "daily_report.md",
+        report_dir / "joinquant_microcap_summary.json",
+    ]
+    report_path = next((workspace_relative(path) for path in report_candidates if path.exists()), workspace_relative(report_dir))
+    run_key = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    raw_payload = {
+        "category": "system",
+        "profile": profile,
+        "strategy_label": display_name,
+        "implementation": strategy_key,
+        "report_dir": workspace_relative(report_dir),
+        "history_start": _compact_date_text(runtime_payload.get("history_start")),
+        "history_end": end_date,
+        "backtest_engine": str(runtime_payload.get("backtest_engine") or ""),
+        "dashboard_data": _serialize_dashboard_data(data),
+    }
+    try:
+        factory = create_session_factory(database_url)
+        with session_scope(factory) as session:
+            strategy = session.scalar(select(CommonStrategyModel).where(CommonStrategyModel.strategy_key == strategy_key))
+            if strategy is None:
+                strategy = CommonStrategyModel(strategy_key=strategy_key, display_name=display_name, is_active=1)
+                session.add(strategy)
+                session.flush()
+            strategy.display_name = display_name
+            strategy.updated_at = datetime.utcnow()
+            result = StrategyBacktestResultModel(
+                strategy_id=strategy.strategy_id,
+                run_key=run_key,
+                mode="backtest",
+                start_date=str(raw_payload["history_start"] or ""),
+                end_date=str(raw_payload["history_end"] or ""),
+                account=_to_decimal(metrics.get("account")) or Decimal("0"),
+                total_return=_to_decimal(metrics.get("total_return")),
+                annualized_return=_to_decimal(metrics.get("annualized_return")),
+                max_drawdown=_to_decimal(metrics.get("max_drawdown")),
+                ending_equity=_to_decimal(metrics.get("ending_equity")),
+                report_path=report_path,
+                raw_payload=raw_payload,
+            )
+            session.add(result)
+            session.flush()
+            return str(result.backtest_result_id)
+    except Exception:
+        return None
 
 
 def delete_backtest_result(database_url: str, backtest_result_id: str) -> int:
@@ -1479,6 +1724,7 @@ def build_dashboard_payload(
     profile: str = "backtest",
     config_path: str | None = None,
     pattern_report_dir: str | None = None,
+    backtest_result_id: str | None = None,
 ) -> dict[str, Any]:
     profile_key, resolved_config, settings = resolve_settings(profile, config_path)
     pattern_dir_options = list_pattern_report_dirs()
@@ -1495,7 +1741,8 @@ def build_dashboard_payload(
     pattern_actions = pattern["daily_actions"].copy()
     pattern_decisions = pattern["daily_decisions"].copy()
     primary_record = _select_primary_pattern_record(pattern_summary)
-    data = load_dashboard_data(settings.database_url, settings.report_dir)
+    selected_backtest_result = load_saved_backtest_result(settings.database_url, backtest_result_id or "")
+    data = selected_backtest_result["data"] if selected_backtest_result is not None else load_dashboard_data(settings.database_url, settings.report_dir)
     probe = load_live_probe(resolved_config, settings) if settings.environment != Environment.BACKTEST else {}
     strategy_registry = list_common_strategies_with_results(settings.database_url)
     qlib_runtime = build_qlib_runtime_payload(profile_key)
@@ -1515,7 +1762,26 @@ def build_dashboard_payload(
     display_benchmark_curve = data.benchmark_curve
     qmt_trade_board = build_qmt_trade_board(settings, data, probe, info)
 
-    if primary_record is not None:
+    if selected_backtest_result is not None:
+        connection = {
+            "label": "历史回测结果",
+            "color": "#0f766e",
+            "detail": f"当前页面展示已保存的回测结果 {selected_backtest_result['result'].run_key}。",
+        }
+        alert_items = [
+            {
+                "severity": "info",
+                "title": "已切换到历史结果",
+                "detail": "资产、交易、报告与曲线均来自 PostgreSQL 中保存的回测快照。",
+            }
+        ]
+        qmt_trade_board = {
+            "available": False,
+            "mode": "backtest",
+            "message": "当前查看的是历史回测结果，QMT 交易看板未启用。",
+        }
+
+    if primary_record is not None and selected_backtest_result is None:
         primary_mode = str(primary_record.get("mode") or "B1")
         pattern_summary = _filter_pattern_frame(pattern_summary, "mode", {primary_mode})
         pattern_comparison = _filter_pattern_frame(pattern_comparison, "series", {primary_mode, "Benchmark"})
@@ -1531,6 +1797,7 @@ def build_dashboard_payload(
     return {
         "profile": profile_key,
         "config_path": str(resolved_config),
+        "selected_backtest_result_id": str(backtest_result_id or ""),
         "settings": settings.model_dump(mode="json"),
         "strategy_defaults": build_strategy_defaults(settings.default_strategy),
         "overview": _json_object(info),
@@ -1557,6 +1824,7 @@ def build_dashboard_payload(
             "base_dir": pattern["base_dir"],
             "strategy_registry": strategy_registry,
         },
+        "strategy_registry": strategy_registry,
         "data": {
             "assets": _frame_records(display_assets),
             "positions": _frame_records(display_positions),
@@ -1573,7 +1841,7 @@ def build_dashboard_payload(
         },
         "meta": {
             "profiles": [{"key": key, "label": key, "config_path": str(path)} for key, path in CONFIGS.items()],
-            "strategies": [{"label": label, "path": str(path)} for label, path in STRATEGIES.items()],
+            "strategies": [{"label": label, "path": str(path), "defaults": build_strategy_defaults(path.stem)} for label, path in STRATEGIES.items()],
         },
         "generated_at": datetime.now().isoformat(),
     }
@@ -1633,19 +1901,42 @@ def run_strategy_action(payload: dict[str, Any]) -> dict[str, Any]:
     strategy_payload = _read_yaml(strategy_file)
     strategy_payload.update(
         {
-            "name": payload.get("name", defaults["name"]),
-            "implementation": payload.get("implementation", defaults["implementation"]),
-            "rebalance_frequency": payload.get("rebalance_frequency", defaults["rebalance_frequency"]),
-            "lookback_days": int(payload.get("lookback_days", defaults["lookback_days"])),
-            "top_n": int(payload.get("top_n", defaults["top_n"])),
-            "lot_size": int(payload.get("lot_size", defaults["lot_size"])),
+            "name": payload.get("name", strategy_payload.get("name", defaults["name"])),
+            "implementation": payload.get("implementation", strategy_payload.get("implementation", defaults["implementation"])),
+            "rebalance_frequency": payload.get("rebalance_frequency", strategy_payload.get("rebalance_frequency", defaults["rebalance_frequency"])),
+            "lookback_days": int(payload.get("lookback_days", strategy_payload.get("lookback_days", defaults["lookback_days"]))),
+            "top_n": int(payload.get("top_n", strategy_payload.get("top_n", defaults["top_n"]))),
+            "lot_size": int(payload.get("lot_size", strategy_payload.get("lot_size", defaults["lot_size"]))),
         }
     )
     UI_RUNTIME.mkdir(parents=True, exist_ok=True)
     strategy_path = UI_RUNTIME / f"strategy_{action}.yaml"
     _write_yaml(strategy_path, strategy_payload)
     if action == "backtest":
-        result = run_cmd("scripts/run_backtest.py", ["--config", str(config_path), "--strategy", str(strategy_path)])
+        runtime_payload = settings.model_dump(mode="json")
+        runtime_payload["history_start"] = _compact_date_text(payload.get("history_start") or runtime_payload.get("history_start"))
+        runtime_payload["history_end"] = _compact_date_text(payload.get("history_end") or runtime_payload.get("history_end"))
+        runtime_payload["report_dir"] = workspace_relative(
+            _make_backtest_report_dir(
+                strategy_payload.get("implementation", defaults["implementation"]),
+                runtime_payload.get("history_start"),
+                runtime_payload.get("history_end"),
+            )
+        )
+        runtime_config_path = UI_RUNTIME / "strategy_backtest_runtime.yaml"
+        _write_yaml(runtime_config_path, runtime_payload)
+        result = run_cmd("scripts/run_backtest.py", ["--config", str(runtime_config_path), "--strategy", str(strategy_path)])
+        if result.get("ok"):
+            data = load_dashboard_data(str(runtime_payload.get("database_url") or settings.database_url), str(runtime_payload["report_dir"]))
+            result["backtest_result_id"] = persist_strategy_backtest_result(
+                str(runtime_payload.get("database_url") or settings.database_url),
+                strategy_label=strategy_label,
+                strategy_payload=strategy_payload,
+                runtime_payload=runtime_payload,
+                data=data,
+                profile=profile,
+            )
+            result["report_dir"] = str(runtime_payload["report_dir"])
     elif action == "paper":
         result = run_cmd("scripts/run_paper.py", ["--config", str(CONFIGS["paper"]), "--strategy", str(strategy_path)])
     elif action == "probe":
@@ -1663,7 +1954,8 @@ def run_qlib_action(payload: dict[str, Any]) -> dict[str, Any]:
     runtime_overrides = {
         "history_universe_sector": payload.get("history_universe_sector"),
         "history_universe_limit": int(payload["history_universe_limit"]) if payload.get("history_universe_limit") not in (None, "") else None,
-        "history_start": payload.get("history_start"),
+        "history_start": _compact_date_text(payload.get("history_start")),
+        "history_end": _compact_date_text(payload.get("history_end")),
         "history_adjustment": payload.get("history_adjustment"),
         "history_batch_size": int(payload["history_batch_size"]) if payload.get("history_batch_size") not in (None, "") else None,
         "qlib_n_drop": int(payload["qlib_n_drop"]) if payload.get("qlib_n_drop") not in (None, "") else None,
@@ -1672,23 +1964,48 @@ def run_qlib_action(payload: dict[str, Any]) -> dict[str, Any]:
     runtime_payload = build_qlib_runtime_payload(profile, runtime_overrides)
     UI_RUNTIME.mkdir(parents=True, exist_ok=True)
     config_path = UI_RUNTIME / "qlib_runtime.yaml"
-    _write_yaml(config_path, runtime_payload)
     strategy_defaults = build_strategy_defaults(load_app_settings(resolve_profile_path(profile)).default_strategy)
-    strategy_payload = {
-        "name": payload.get("name", strategy_defaults["name"]),
-        "implementation": payload.get("implementation", strategy_defaults["implementation"]),
-        "rebalance_frequency": payload.get("rebalance_frequency", strategy_defaults["rebalance_frequency"]),
-        "lookback_days": int(payload.get("lookback_days", strategy_defaults["lookback_days"])),
-        "top_n": int(payload.get("top_n", strategy_defaults["top_n"])),
-        "lot_size": int(payload.get("lot_size", strategy_defaults["lot_size"])),
-    }
+    strategy_label = str(payload.get("strategy_label") or strategy_defaults["label"])
+    strategy_file = STRATEGIES.get(strategy_label, STRATEGIES[strategy_defaults["label"]])
+    strategy_payload = _read_yaml(strategy_file)
+    strategy_payload.update(
+        {
+            "name": payload.get("name", strategy_payload.get("name", strategy_defaults["name"])),
+            "implementation": payload.get("implementation", strategy_payload.get("implementation", strategy_defaults["implementation"])),
+            "rebalance_frequency": payload.get("rebalance_frequency", strategy_payload.get("rebalance_frequency", strategy_defaults["rebalance_frequency"])),
+            "lookback_days": int(payload.get("lookback_days", strategy_payload.get("lookback_days", strategy_defaults["lookback_days"]))),
+            "top_n": int(payload.get("top_n", strategy_payload.get("top_n", strategy_defaults["top_n"]))),
+            "lot_size": int(payload.get("lot_size", strategy_payload.get("lot_size", strategy_defaults["lot_size"]))),
+        }
+    )
     strategy_path = UI_RUNTIME / "strategy_qlib.yaml"
     _write_yaml(strategy_path, strategy_payload)
     if action == "backtest":
+        runtime_payload["report_dir"] = workspace_relative(
+            _make_backtest_report_dir(
+                strategy_payload.get("implementation", strategy_defaults["implementation"]),
+                runtime_payload.get("history_start"),
+                runtime_payload.get("history_end"),
+            )
+        )
+        _write_yaml(config_path, runtime_payload)
         result = run_cmd("scripts/run_backtest.py", ["--config", str(config_path), "--strategy", str(strategy_path)])
+        if result.get("ok"):
+            data = load_dashboard_data(str(runtime_payload.get("database_url") or ""), str(runtime_payload["report_dir"]))
+            result["backtest_result_id"] = persist_strategy_backtest_result(
+                str(runtime_payload.get("database_url") or ""),
+                strategy_label=strategy_label,
+                strategy_payload=strategy_payload,
+                runtime_payload=runtime_payload,
+                data=data,
+                profile=profile,
+            )
+            result["report_dir"] = str(runtime_payload["report_dir"])
     else:
+        _write_yaml(config_path, runtime_payload)
         result = run_cmd("scripts/manage_history.py", ["--config", str(config_path), "--mode", action])
     result["action"] = f"qlib-{action}"
+    result["strategy_label"] = strategy_label
     return result
 
 

@@ -593,3 +593,97 @@ def test_list_and_delete_strategy_backtest_results(tmp_path: Path) -> None:
 
     deleted = dp.delete_backtest_result(database_url, str(result_id))
     assert deleted == 1
+
+
+def test_persist_and_load_strategy_backtest_result(tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{(tmp_path / 'saved_strategy_result.db').as_posix()}"
+    report_dir = tmp_path / "reports" / "saved-run"
+    report_dir.mkdir(parents=True)
+    (report_dir / "daily_report.md").write_text("saved report", encoding="utf-8")
+
+    result_id = dp.persist_strategy_backtest_result(
+        database_url,
+        strategy_label="first_alpha_v1",
+        strategy_payload={"implementation": "first_alpha_v1"},
+        runtime_payload={
+            "report_dir": str(report_dir),
+            "history_start": "20260101",
+            "history_end": "20260324",
+            "backtest_engine": "qlib",
+        },
+        data=_make_dashboard_data(),
+        profile="backtest",
+    )
+
+    assert result_id is not None
+
+    saved = dp.load_saved_backtest_result(database_url, str(result_id))
+
+    assert saved is not None
+    assert saved["raw_payload"]["category"] == "system"
+    assert saved["raw_payload"]["backtest_engine"] == "qlib"
+    assert saved["raw_payload"]["history_start"] == "20260101"
+    assert saved["raw_payload"]["history_end"] == "20260324"
+    assert float(saved["data"].assets.iloc[-1]["total_asset"]) == 100000.0
+    assert saved["data"].report_text == "report"
+
+
+def test_build_dashboard_payload_uses_saved_backtest_snapshot(monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{(tmp_path / 'saved_payload.db').as_posix()}"
+    report_dir = tmp_path / "reports" / "saved-run"
+    report_dir.mkdir(parents=True)
+    (report_dir / "daily_report.md").write_text("saved report", encoding="utf-8")
+    settings = _make_settings(tmp_path).model_copy(
+        update={
+            "database_url": database_url,
+            "report_dir": str(report_dir),
+        }
+    )
+    config_file = tmp_path / "app.yaml"
+
+    saved_result_id = dp.persist_strategy_backtest_result(
+        database_url,
+        strategy_label="first_alpha_v1",
+        strategy_payload={"implementation": "first_alpha_v1"},
+        runtime_payload={
+            "report_dir": str(report_dir),
+            "history_start": "20260101",
+            "history_end": "20260324",
+            "backtest_engine": "qlib",
+        },
+        data=_make_dashboard_data(),
+        profile="backtest",
+    )
+    assert saved_result_id is not None
+
+    live_data = _make_dashboard_data()
+    live_data.assets = live_data.assets.assign(total_asset=999999.0, cash=888888.0)
+
+    monkeypatch.setattr(dp, "resolve_settings", lambda profile="backtest", config_path=None: ("backtest", config_path or config_file, settings))
+    monkeypatch.setattr(dp, "load_dashboard_data", lambda database_url, report_dir: live_data)
+    monkeypatch.setattr(dp, "load_runtime_logs", lambda: {UI_LOG: "ready"})
+    monkeypatch.setattr(dp, "load_live_probe", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(dp, "history_status", lambda _settings: {"latest_trading_date": "2026-03-24", "row_count": 10, "symbol_count": 2})
+    monkeypatch.setattr(dp, "list_pattern_report_dirs", lambda: [])
+    monkeypatch.setattr(
+        dp,
+        "load_user_pattern_results",
+        lambda _report_dir=dp.USER_PATTERN_REPORT_DIR: {
+            "summary": pd.DataFrame(),
+            "comparison": pd.DataFrame(),
+            "daily_actions": pd.DataFrame(),
+            "daily_decisions": pd.DataFrame(),
+            "png_path": str(tmp_path / "empty.png"),
+            "html_path": str(tmp_path / "empty.html"),
+            "base_dir": str(tmp_path),
+        },
+    )
+
+    payload = dp.build_dashboard_payload("backtest", str(config_file), backtest_result_id=str(saved_result_id))
+
+    assert payload["selected_backtest_result_id"] == str(saved_result_id)
+    assert payload["overview"]["total_asset"] == 100000.0
+    assert payload["overview"]["cash"] == 40000.0
+    assert payload["connection"]["label"] == "历史回测结果"
+    assert payload["data"]["qmt_trade_board"]["available"] is False
+    assert payload["strategy_registry"][0]["results"][0]["category"] == "system"

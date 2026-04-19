@@ -274,6 +274,71 @@ def test_qmt_microcap_trading_engine_caps_paper_strategy_asset_to_initial_cash(t
     assert float(asset_snapshots[-1].cash) <= 100000.0
 
 
+def test_qmt_microcap_trading_engine_caps_live_strategy_asset_when_capital_is_explicit(tmp_path: Path, monkeypatch) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="live", trade_enabled=False)
+    strategy_settings = _build_strategy_settings()
+    history_path = Path(app_settings.history_parquet)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_history(history_path)
+    session_factory = create_session_factory(app_settings.database_url)
+
+    instrument_frame = pd.DataFrame(
+        [
+            {"symbol": "AAA.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Alpha", "total_capital_current": 1_000_000.0},
+            {"symbol": "BBB.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Beta", "total_capital_current": 2_000_000.0},
+        ]
+    )
+    capital_frame = pd.DataFrame(columns=["symbol", "effective_date", "total_capital", "circulating_capital", "free_float_capital"])
+
+    monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
+        lambda self, symbols: instrument_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
+        lambda self, symbols: capital_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
+        lambda self: {
+            "account_id": "live-account",
+            "asset": {"cash": 21_000_000.0, "frozen_cash": 0.0, "total_asset": 21_000_000.0},
+            "positions": [],
+            "orders": [],
+            "trades": [],
+        },
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
+        lambda self, symbols: {
+            "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000},
+            "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
+        },
+    )
+
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+    plan_path, payload = engine.preview(Decimal("100000"))
+
+    assert plan_path.exists()
+    assert payload["strategy_total_asset"] == 100000.0
+
+
+def test_qmt_microcap_trading_engine_load_recent_history_window_keeps_high_low_columns(tmp_path: Path) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="live", trade_enabled=False)
+    strategy_settings = _build_strategy_settings()
+    history_path = Path(app_settings.history_parquet)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_history(history_path)
+    session_factory = create_session_factory(app_settings.database_url)
+
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+    frame = engine._load_recent_history_window()
+
+    assert {"open", "high", "low", "close", "volume", "amount"}.issubset(frame.columns)
+    assert not frame.empty
+
+
 def test_qmt_microcap_trading_engine_uses_previous_completed_day_during_trading_hours(tmp_path: Path, monkeypatch) -> None:
     app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=False)
     app_settings = app_settings.model_copy(update={"history_end": ""})

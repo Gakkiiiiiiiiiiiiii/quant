@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Codex" }]
 dependencies = [
+  "akshare>=1.17",
+  "baostock>=0.8.9",
   "pandas>=2.0",
   "pydantic>=2.0",
   "PyYAML>=6.0",

@@ -258,6 +258,8 @@ class QlibBacktestEngine:
 
         with self.session_factory() as session:
             self._reset_non_live_state(session)
+            position_rows: list[dict[str, object]] = []
+            asset_rows: list[dict[str, object]] = []
             for trade_time in ordered_report.index:
                 snapshot_time = datetime.combine(trade_time.date(), datetime.min.time())
                 total_asset = Decimal(str(equity.loc[trade_time]))
@@ -271,45 +273,53 @@ class QlibBacktestEngine:
                     if amount <= 0:
                         continue
                     stock_value += Decimal(amount) * price
-                    session.add(
-                        PositionSnapshotModel(
-                            account_id=self.account_id,
-                            symbol=self._from_qlib_symbol(symbol),
-                            qty=amount,
-                            available_qty=amount,
-                            cost_price=price,
-                            market_price=price,
-                            snapshot_time=snapshot_time,
-                        )
+                    position_rows.append(
+                        {
+                            "account_id": self.account_id,
+                            "symbol": self._from_qlib_symbol(symbol),
+                            "qty": amount,
+                            "available_qty": amount,
+                            "cost_price": price,
+                            "market_price": price,
+                            "snapshot_time": snapshot_time,
+                        }
                     )
                 cash_value = total_asset - stock_value
-                session.add(
-                    AssetSnapshotModel(
-                        account_id=self.account_id,
-                        cash=cash_value,
-                        frozen_cash=Decimal("0"),
-                        total_asset=total_asset,
-                        total_pnl=total_asset - initial_cash,
-                        turnover=Decimal(str(cumulative_turnover.loc[trade_time])),
-                        max_drawdown=Decimal(str(drawdown.loc[trade_time])),
-                        snapshot_time=snapshot_time,
-                    )
+                asset_rows.append(
+                    {
+                        "account_id": self.account_id,
+                        "cash": cash_value,
+                        "frozen_cash": Decimal("0"),
+                        "total_asset": total_asset,
+                        "total_pnl": total_asset - initial_cash,
+                        "turnover": Decimal(str(cumulative_turnover.loc[trade_time])),
+                        "max_drawdown": Decimal(str(drawdown.loc[trade_time])),
+                        "snapshot_time": snapshot_time,
+                    }
                 )
-            session.add(
-                AuditLogModel(
-                    object_type="backtest_engine",
-                    object_id="qlib",
-                    message="Qlib backtest finished",
-                    payload={
-                        "strategy": self.strategy_settings.implementation,
-                        "benchmark": self.app_settings.qlib_benchmark,
-                        "engine": self.app_settings.backtest_engine,
-                        "provider_dir": str(self.qlib_provider_dir),
-                    },
-                )
+            if position_rows:
+                session.bulk_insert_mappings(PositionSnapshotModel, position_rows)
+            if asset_rows:
+                session.bulk_insert_mappings(AssetSnapshotModel, asset_rows)
+            session.bulk_insert_mappings(
+                AuditLogModel,
+                [
+                    {
+                        "object_type": "backtest_engine",
+                        "object_id": "qlib",
+                        "message": "Qlib backtest finished",
+                        "payload": {
+                            "strategy": self.strategy_settings.implementation,
+                            "benchmark": self.app_settings.qlib_benchmark,
+                            "engine": self.app_settings.backtest_engine,
+                            "provider_dir": str(self.qlib_provider_dir),
+                        },
+                    }
+                ],
             )
-            session.commit()
+            session.flush()
             report_path = AuditReportService().write_daily_report(session, self.app_settings.report_dir)
+            session.commit()
         metrics = Evaluator().evaluate(equity_curve)
         return report_path, metrics, equity_curve
 
@@ -343,9 +353,9 @@ class QlibBacktestEngine:
         return {
             "history_digest": digest,
             "row_count": len(history),
-            "benchmark": self.app_settings.qlib_benchmark,
-            "strategy": self.strategy_settings.implementation,
-            "provider_dir": str(self.qlib_provider_dir),
+            "benchmark_symbol": self.app_settings.qlib_benchmark_symbol,
+            "history_period": self.app_settings.history_period,
+            "history_adjustment": self.app_settings.history_adjustment,
         }
 
     def _provider_cache_valid(self, meta_path: Path, signature: dict[str, Any]) -> bool:

@@ -96,7 +96,17 @@ class ExperimentManager:
         session.flush()
 
     def run(self, initial_cash: Decimal = Decimal("100000")) -> RunResult:
-        if self.strategy_settings.implementation == "joinquant_microcap_alpha":
+        if self.strategy_settings.implementation in {
+            "joinquant_microcap_alpha",
+            "joinquant_microcap_alpha_zf",
+            "joinquant_microcap_alpha_zfe",
+            "joinquant_microcap_alpha_zr",
+            "joinquant_microcap_alpha_zro",
+            "monster_prelude_alpha",
+            "microcap_100b_layer_rot",
+            "microcap_50b_layer_rot",
+            "industry_weighted_microcap_alpha",
+        }:
             engine_cls = JoinQuantMicrocapBacktestEngine if self.app_settings.environment == Environment.BACKTEST else QmtMicrocapTradingEngine
             report_path, metrics, equity_curve = engine_cls(
                 self.session_factory,

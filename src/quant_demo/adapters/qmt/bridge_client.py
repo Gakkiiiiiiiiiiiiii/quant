@@ -14,6 +14,7 @@ from quant_demo.core.exceptions import QmtUnavailableError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 BRIDGE_TIMEOUT_SECONDS = 30
+INDUSTRY_MAP_TIMEOUT_SECONDS = 300
 
 
 class QmtBridgeClient:
@@ -63,6 +64,19 @@ class QmtBridgeClient:
             str(limit),
         )
         return payload.get("symbols", [])
+
+    def get_industry_map(self, symbols: list[str], sector_prefix: str = "GICS2", only_a_share: bool = True) -> list[dict[str, Any]]:
+        payload = self._run(
+            "industry-map",
+            "--symbols",
+            ",".join(symbols),
+            "--sector-prefix",
+            str(sector_prefix or "GICS2"),
+            "--only-a-share",
+            str(only_a_share).lower(),
+            timeout_seconds=INDUSTRY_MAP_TIMEOUT_SECONDS,
+        )
+        return payload.get("rows", []) or []
 
     def get_history(
         self,
@@ -159,7 +173,7 @@ class QmtBridgeClient:
             order_remark,
         )
 
-    def _run(self, command: str, *extra_args: str) -> dict[str, Any]:
+    def _run(self, command: str, *extra_args: str, timeout_seconds: int | None = None) -> dict[str, Any]:
         self._ensure_runtime_paths()
         cmd = [
             str(self.python_path),
@@ -182,15 +196,19 @@ class QmtBridgeClient:
                 capture_output=True,
                 check=False,
                 env=env,
-                timeout=BRIDGE_TIMEOUT_SECONDS,
+                timeout=timeout_seconds or BRIDGE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
-            raise QmtUnavailableError(f"QMT 桥接调用超时（>{BRIDGE_TIMEOUT_SECONDS}s）: command={command}") from exc
+            timeout_text = timeout_seconds or BRIDGE_TIMEOUT_SECONDS
+            raise QmtUnavailableError(f"QMT 桥接调用超时（>{timeout_text}s）: command={command}") from exc
         stdout = self._decode_output(completed.stdout)
         stderr = self._decode_output(completed.stderr)
         if completed.returncode != 0:
             detail = stderr or stdout or "桥接进程没有返回错误详情"
             raise QmtUnavailableError(f"QMT 桥接执行失败: {detail}")
+        json_start = stdout.find('{"ok"')
+        if json_start > 0:
+            stdout = stdout[json_start:]
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError as exc:

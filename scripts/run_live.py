@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from decimal import Decimal
 
 from _bootstrap import ROOT, SRC
 
@@ -34,6 +35,7 @@ def main() -> None:
     parser.add_argument("--config", default=str(ROOT / "configs" / "live.yaml"))
     parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml"))
     parser.add_argument("--mode", choices=["probe", "strategy"], default="probe")
+    parser.add_argument("--capital", default="0")
     args = parser.parse_args()
 
     if args.mode == "probe":
@@ -50,7 +52,7 @@ def main() -> None:
     try:
         if not app_settings.qmt_trade_enabled:
             raise QmtUnavailableError("实盘策略模式已禁止自动委托，请先在 live.yaml 中显式开启 qmt_trade_enabled")
-        result = ExperimentManager(session_factory, app_settings, strategy_settings).run()
+        result = ExperimentManager(session_factory, app_settings, strategy_settings).run(Decimal(str(args.capital)))
         print(f"实盘链路执行完成，报告: {result.report_path}")
     except QmtUnavailableError as exc:
         print(f"QMT 未就绪: {exc}")

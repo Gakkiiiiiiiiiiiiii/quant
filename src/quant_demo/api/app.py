@@ -189,7 +189,15 @@ class DemoApiHandler(BaseHTTPRequestHandler):
             raw_config = query.get("config", [""])[0].strip()
             config_path = raw_config or None
             pattern_report_dir = query.get("pattern_report_dir", [""])[0] or None
-            self._json(build_dashboard_payload(profile=profile, config_path=config_path, pattern_report_dir=pattern_report_dir))
+            backtest_result_id = query.get("backtest_result_id", [""])[0] or None
+            self._json(
+                build_dashboard_payload(
+                    profile=profile,
+                    config_path=config_path,
+                    pattern_report_dir=pattern_report_dir,
+                    backtest_result_id=backtest_result_id,
+                )
+            )
             return
         if parsed.path == "/api/qmt/stream":
             profile = query.get("profile", ["paper"])[0]

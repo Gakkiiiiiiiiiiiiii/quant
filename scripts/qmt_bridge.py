@@ -161,6 +161,51 @@ def command_sector_members(args):
         return emit_error("sector-members 查询失败: {0}".format(exc))
 
 
+def command_industry_map(args):
+    xtconstant, xtdata, XtQuantTrader, StockAccount = bootstrap_runtime(args.install_dir)
+    try:
+        xtdata.download_sector_data()
+        prefix = str(args.sector_prefix or "GICS2")
+        target_symbols = set(split_symbols(args.symbols))
+        sectors = [item for item in (xtdata.get_sector_list() or []) if str(item).startswith(prefix)]
+        if not sectors:
+            return emit_ok({"sector_prefix": prefix, "sector_count": 0, "row_count": 0, "rows": []})
+        rows = []
+        seen_symbols = set()
+        allowed_suffix = (".SH", ".SZ", ".BJ")
+        for sector_name in sectors:
+            members = xtdata.get_stock_list_in_sector(sector_name) or []
+            if parse_bool(args.only_a_share):
+                members = [item for item in members if str(item).endswith(allowed_suffix)]
+            if target_symbols:
+                members = [item for item in members if item in target_symbols]
+            for symbol in members:
+                if symbol in seen_symbols:
+                    continue
+                seen_symbols.add(symbol)
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "industry_code": str(sector_name),
+                        "industry_name": str(sector_name)[len(prefix):] if str(sector_name).startswith(prefix) else str(sector_name),
+                        "industry_level": prefix,
+                    }
+                )
+            if target_symbols and seen_symbols >= target_symbols:
+                break
+        rows.sort(key=lambda item: item["symbol"])
+        return emit_ok(
+            {
+                "sector_prefix": prefix,
+                "sector_count": len(sectors),
+                "row_count": len(rows),
+                "rows": rows,
+            }
+        )
+    except Exception as exc:
+        return emit_error("industry-map 查询失败: {0}".format(exc))
+
+
 def _normalize_history_rows(pandas_module, symbol, frame):
     rows = []
     if frame is None or frame.empty:
@@ -432,6 +477,12 @@ def build_parser():
     sector_parser.add_argument("--only-a-share", default="true")
     sector_parser.add_argument("--limit", type=int, default=0)
 
+    industry_parser = subparsers.add_parser("industry-map")
+    add_common(industry_parser)
+    industry_parser.add_argument("--symbols", default="")
+    industry_parser.add_argument("--sector-prefix", default="GICS2")
+    industry_parser.add_argument("--only-a-share", default="true")
+
     history_parser = subparsers.add_parser("history")
     add_common(history_parser)
     history_parser.add_argument("--symbols", required=True)
@@ -479,6 +530,7 @@ def main():
         "quote": command_quote,
         "instrument-detail": command_instrument_detail,
         "sector-members": command_sector_members,
+        "industry-map": command_industry_map,
         "history": command_history,
         "financial-data": command_financial_data,
         "account": command_account,

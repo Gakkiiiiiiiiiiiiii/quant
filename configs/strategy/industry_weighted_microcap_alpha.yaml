@@ -1,0 +1,49 @@
+name: industry_weighted_microcap_alpha
+implementation: industry_weighted_microcap_alpha
+rebalance_frequency: weekly
+lookback_days: 20
+top_n: 35
+lot_size: 100
+target_hold_num: 35
+buy_rank: 35
+keep_rank: 100
+query_limit: 1500
+min_list_days: 60
+min_avg_money_20: 8000000
+cash_buffer: 0.01
+min_price_floor: 1.0
+max_price_normal_hard: 50
+max_price_star_hard: 25
+max_overweight_ratio: 1.15
+benchmark_symbol: 000852.SH
+benchmark_name: 中证1000
+hedge_symbol: ""
+hedge_name: 现金
+hedge_history_adjustment: none
+seasonal_hedge_schedule:
+  1: 0.20
+  2: 0.30
+  4: 0.50
+  12: 0.20
+buy_slippage_bps: 35
+sell_slippage_bps: 35
+max_trade_volume_ratio: 0.03
+instrument_cache_path: data/parquet/joinquant_microcap_instruments.parquet
+capital_cache_path: data/parquet/joinquant_microcap_capital.parquet
+industry_weighted_enabled: true
+industry_sector_prefix: GICS2
+industry_cache_path: data/parquet/joinquant_microcap_industries_gics2.parquet
+industry_top_k: 8
+industry_keep_top_k: 14
+industry_min_slots: 1
+industry_max_slots: 6
+industry_lookback_days: 20
+industry_breadth_lookback_days: 5
+industry_liquidity_lookback_days: 5
+industry_score_momentum_weight: 0.5
+industry_score_breadth_weight: 0.3
+industry_score_liquidity_weight: 0.2
+industry_query_limit_multiplier: 3
+industry_min_candidate_count: 10
+min_holding_days: 10
+industry_holding_score_bonus: 0.08

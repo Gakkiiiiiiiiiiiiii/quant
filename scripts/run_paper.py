@@ -15,6 +15,19 @@ from quant_demo.experiment.manager import ExperimentManager
 from quant_demo.experiment.qmt_microcap_trading import QmtMicrocapTradingEngine
 
 
+MICROCAP_IMPLEMENTATIONS = {
+    "joinquant_microcap_alpha",
+    "joinquant_microcap_alpha_zf",
+    "joinquant_microcap_alpha_zfe",
+    "joinquant_microcap_alpha_zr",
+    "joinquant_microcap_alpha_zro",
+    "monster_prelude_alpha",
+    "microcap_100b_layer_rot",
+    "microcap_50b_layer_rot",
+    "industry_weighted_microcap_alpha",
+}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行仿真盘")
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
@@ -29,7 +42,7 @@ def main() -> None:
     session_factory = create_session_factory(app_settings.database_url)
     initial_cash = Decimal(str(args.capital))
 
-    if strategy_settings.implementation == "joinquant_microcap_alpha" and app_settings.environment.value == "paper":
+    if strategy_settings.implementation in MICROCAP_IMPLEMENTATIONS and app_settings.environment.value == "paper":
         engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
         if args.mode == "preview":
             plan_path, payload = engine.preview(initial_cash)

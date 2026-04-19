@@ -1,0 +1,48 @@
+name: joinquant_microcap_alpha_zf
+implementation: joinquant_microcap_alpha_zf
+rebalance_frequency: daily
+lookback_days: 20
+top_n: 35
+lot_size: 100
+target_hold_num: 35
+buy_rank: 35
+keep_rank: 60
+query_limit: 1500
+min_list_days: 60
+min_avg_money_20: 8000000
+cash_buffer: 0.01
+min_price_floor: 1.0
+max_price_normal_hard: 50
+max_price_star_hard: 25
+max_overweight_ratio: 1.15
+benchmark_symbol: 000852.SH
+benchmark_name: 中证1000
+hedge_symbol: ""
+hedge_name: 现金
+hedge_history_adjustment: none
+seasonal_hedge_schedule:
+  1: 0.20
+  2: 0.30
+  4: 0.50
+  12: 0.20
+buy_slippage_bps: 35
+sell_slippage_bps: 35
+max_trade_volume_ratio: 0.03
+instrument_cache_path: data/parquet/joinquant_microcap_instruments.parquet
+capital_cache_path: data/parquet/joinquant_microcap_capital.parquet
+zhuang_filter_enabled: true
+zhuang_filter_mode: hard_filter
+zhuang_final_replace_max_count: 0
+zhuang_amp120_min: 1.0
+zhuang_ret120_max: 0.25
+zhuang_shadow_amp_min: 0.06
+zhuang_upper_shadow_ratio: 0.45
+zhuang_upper_shadow_count60: 4
+zhuang_intraday_attack_min: 0.07
+zhuang_close_ret_max: 0.02
+zhuang_failed_attack_count120: 3
+zhuang_score_threshold: 2
+allow_st_buy: false
+allow_beijing_stock_buy: false
+exclude_star_st_buy: true
+exclude_delisting_buy: true
