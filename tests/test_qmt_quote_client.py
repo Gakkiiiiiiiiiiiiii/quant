@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 from pathlib import Path
+
+import pandas as pd
 
 from quant_demo.adapters.qmt.quote_client import XtQuantQuoteClient
 from quant_demo.core.config import load_app_settings
@@ -80,3 +83,23 @@ def test_quote_client_explicit_incremental_does_not_downgrade_to_full(tmp_path: 
     )
 
     assert mode == "incremental"
+
+
+def test_quote_client_next_start_time_refetches_same_day_if_latest_is_today(monkeypatch) -> None:
+    frame = pd.DataFrame({"trading_date": [date(2026, 4, 21)]})
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 21, 15, 30, 0)
+
+    monkeypatch.setattr("quant_demo.adapters.qmt.quote_client.datetime", FrozenDatetime)
+
+    assert XtQuantQuoteClient._next_start_time(frame) == "20260421"
+
+
+def test_quote_client_next_start_time_refetches_same_day_if_latest_matches_metadata_update() -> None:
+    frame = pd.DataFrame({"trading_date": [date(2026, 4, 21)]})
+    metadata = {"updated_at": "2026-04-21T12:32:34"}
+
+    assert XtQuantQuoteClient._next_start_time(frame, metadata) == "20260421"

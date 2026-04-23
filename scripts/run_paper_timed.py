@@ -60,6 +60,7 @@ def main() -> None:
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
     parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml"))
     parser.add_argument("--capital", default="100000")
+    parser.add_argument("--plan", default="")
     parser.add_argument("--execute-at", default="09:35")
     parser.add_argument("--poll-seconds", type=int, default=5)
     parser.add_argument("--force-refresh-plan", action="store_true")
@@ -76,7 +77,14 @@ def main() -> None:
     plan_payload: dict | None = None
     plan_path: Path | None = None
 
-    if latest_plan_path.exists() and not args.force_refresh_plan:
+    if args.plan:
+        plan_path = Path(args.plan)
+        if not plan_path.is_absolute():
+            plan_path = (Path.cwd() / plan_path).resolve()
+        if not plan_path.exists():
+            raise FileNotFoundError(f"未找到指定计划文件: {plan_path}")
+        plan_payload = _load_plan(plan_path)
+    elif latest_plan_path.exists() and not args.force_refresh_plan:
         cached = _load_plan(latest_plan_path)
         if str(cached.get("planned_execution_date") or "").strip() == today:
             plan_payload = cached
@@ -98,6 +106,28 @@ def main() -> None:
     if receipt_path.exists():
         raise RuntimeError(f"今天 {today} 的执行回执已存在，疑似已经执行过，回执文件: {receipt_path}")
 
+    preview_order_count = len(plan_payload.get("preview_orders") or [])
+    if preview_order_count <= 0:
+        print(
+            json.dumps(
+                {
+                    "environment": app_settings.environment.value,
+                    "mode": "timed-execute",
+                    "plan_path": str(plan_path),
+                    "signal_trade_date": signal_trade_date,
+                    "planned_execution_date": planned_execution_date,
+                    "execute_at": args.execute_at,
+                    "strategy_total_asset": plan_payload.get("strategy_total_asset"),
+                    "preview_order_count": 0,
+                    "status": "noop",
+                    "message": "计划文件中没有可执行委托，本次不执行自动交易。",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
     wait_seconds = _seconds_until(args.execute_at, _now_local())
     if wait_seconds > 0:
         print(
@@ -111,7 +141,7 @@ def main() -> None:
                     "execute_at": args.execute_at,
                     "wait_seconds": round(wait_seconds, 2),
                     "strategy_total_asset": plan_payload.get("strategy_total_asset"),
-                    "preview_order_count": len(plan_payload.get("preview_orders") or []),
+                    "preview_order_count": preview_order_count,
                 },
                 ensure_ascii=False,
                 indent=2,

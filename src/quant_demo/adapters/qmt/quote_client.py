@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +95,8 @@ class XtQuantQuoteClient(QuoteClient):
             return load_history_dataframe(output), {"mode": "full", "fetched_batches": self._batch_count(resolved_symbols), "fetched_rows": len(frame)}
 
         existing = load_history_dataframe(output)
-        next_start = self._next_start_time(existing)
+        existing_metadata = load_history_metadata(output)
+        next_start = self._next_start_time(existing, existing_metadata)
         LOGGER.info(
             "增量刷新准备完成: existing_rows=%s latest=%s next_start=%s",
             len(existing),
@@ -247,9 +249,19 @@ class XtQuantQuoteClient(QuoteClient):
         return bool(metadata) and all(metadata.get(key) == signature.get(key) for key in compatible_keys)
 
     @staticmethod
-    def _next_start_time(frame: pd.DataFrame) -> str:
-        latest = pd.Timestamp(frame["trading_date"].max()) + pd.Timedelta(days=1)
-        return latest.strftime("%Y%m%d")
+    def _next_start_time(frame: pd.DataFrame, metadata: dict[str, Any] | None = None) -> str:
+        latest = pd.Timestamp(frame["trading_date"].max()).normalize()
+        today = pd.Timestamp(datetime.now().date()).normalize()
+        updated_at = None
+        if metadata:
+            raw_updated_at = str(metadata.get("updated_at") or "").strip()
+            if raw_updated_at:
+                updated_at = pd.Timestamp(raw_updated_at).normalize()
+        if updated_at is not None and latest >= updated_at:
+            return latest.strftime("%Y%m%d")
+        if latest >= today:
+            return latest.strftime("%Y%m%d")
+        return (latest + pd.Timedelta(days=1)).strftime("%Y%m%d")
 
     @staticmethod
     def _range_finished(start_time: str, end_time: str) -> bool:

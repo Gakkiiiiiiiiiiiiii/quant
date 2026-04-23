@@ -899,6 +899,14 @@ class QmtMicrocapTradingEngine:
         volumes: dict[str, float],
         target_meta: dict[str, Any],
     ) -> list[PlannedOrder]:
+        def _plan_price(symbol: str, row: pd.Series) -> Decimal:
+            close_price = float(row.get("close") or 0.0)
+            if close_price <= 0:
+                raise RuntimeError(
+                    f"计划价格缺少有效收盘价: symbol={symbol} trade_date={latest_date.date()}"
+                )
+            return Decimal(str(round(close_price, 4)))
+
         remaining_trade_capacity = {
             str(symbol): int(volume_units_to_shares(float(row.get("avg_volume_20_prev", 0.0) or 0.0)) * self.cfg.max_trade_volume_ratio)
             for symbol, row in day_frame.iterrows()
@@ -922,7 +930,7 @@ class QmtMicrocapTradingEngine:
             if sell_qty <= 0:
                 continue
             row = day_frame.loc[symbol]
-            sell_price = prices[symbol]
+            sell_price = _plan_price(symbol, row)
             if not can_trade(symbol, latest_date, float(sell_price), volumes.get(symbol, 0.0), float(row.get("prev_close") or 0.0), is_buy=False):
                 continue
             order = PlannedOrder(
@@ -942,10 +950,11 @@ class QmtMicrocapTradingEngine:
                 continue
             position = planning_state.positions[symbol]
             row = day_frame.loc[symbol]
-            current_value = float(position.qty) * float(prices[symbol])
+            sell_price = _plan_price(symbol, row)
+            current_value = float(position.qty) * float(sell_price)
             if current_value <= each_target_value * self.cfg.max_overweight_ratio:
                 continue
-            target_amount = calc_target_amount_by_value(symbol, each_target_value, float(prices[symbol]))
+            target_amount = calc_target_amount_by_value(symbol, each_target_value, float(sell_price))
             adjusted_target = adjust_target_amount_for_rules(symbol, position.qty, target_amount)
             desired_sell = min(position.available_qty, max(position.qty - adjusted_target, 0))
             sell_qty = available_trade_shares(
@@ -957,7 +966,6 @@ class QmtMicrocapTradingEngine:
             )
             if sell_qty <= 0:
                 continue
-            sell_price = prices[symbol]
             if not can_trade(symbol, latest_date, float(sell_price), volumes.get(symbol, 0.0), float(row.get("prev_close") or 0.0), is_buy=False):
                 continue
             order = PlannedOrder(
@@ -977,7 +985,7 @@ class QmtMicrocapTradingEngine:
             if symbol not in day_frame.index:
                 continue
             row = day_frame.loc[symbol]
-            buy_price = prices[symbol]
+            buy_price = _plan_price(symbol, row)
             if not can_trade(symbol, latest_date, float(buy_price), volumes.get(symbol, 0.0), float(row.get("prev_close") or 0.0), is_buy=True):
                 continue
             current_value = 0.0
@@ -992,7 +1000,8 @@ class QmtMicrocapTradingEngine:
             remaining = len(buy_plan) - index
             if remaining <= 0:
                 continue
-            buy_price = prices[symbol]
+            row = day_frame.loc[symbol]
+            buy_price = _plan_price(symbol, row)
             budget = min(gap_value, float(planning_state.cash) / float(remaining) * 0.98)
             desired_buy = calc_amount_by_cash(symbol, budget, float(buy_price))
             buy_qty = available_trade_shares(

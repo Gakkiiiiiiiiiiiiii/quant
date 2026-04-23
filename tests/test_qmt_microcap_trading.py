@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from quant_demo.core.config import AppSettings, StrategySettings
+from quant_demo.core.events import AccountState, Position
 from quant_demo.core.exceptions import QmtUnavailableError
 from quant_demo.db.models import AssetSnapshotModel, AuditLogModel, OrderModel
 from quant_demo.db.session import create_session_factory, session_scope
@@ -337,6 +338,90 @@ def test_qmt_microcap_trading_engine_load_recent_history_window_keeps_high_low_c
 
     assert {"open", "high", "low", "close", "volume", "amount"}.issubset(frame.columns)
     assert not frame.empty
+
+
+def test_qmt_microcap_trading_engine_preview_uses_signal_close_as_plan_price(tmp_path: Path, monkeypatch) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    history_path = Path(app_settings.history_parquet)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_history(history_path)
+    session_factory = create_session_factory(app_settings.database_url)
+
+    instrument_frame = pd.DataFrame(
+        [
+            {"symbol": "AAA.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Alpha", "total_capital_current": 1_000_000.0},
+            {"symbol": "BBB.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Beta", "total_capital_current": 2_000_000.0},
+        ]
+    )
+    capital_frame = pd.DataFrame(columns=["symbol", "effective_date", "total_capital", "circulating_capital", "free_float_capital"])
+
+    monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
+        lambda self, symbols: instrument_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
+        lambda self, symbols: capital_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
+        lambda self: {
+            "account_id": "paper-account",
+            "asset": {"cash": 100000.0, "frozen_cash": 0.0, "total_asset": 100000.0},
+            "positions": [],
+            "orders": [],
+            "trades": [],
+        },
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
+        lambda self, symbols: {
+            "AAA.SZ": {"last_price": 11.5, "volume": 2_000_000},
+            "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
+        },
+    )
+
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+    _plan_path, payload = engine.preview(Decimal("100000"))
+
+    assert payload["preview_orders"]
+    assert payload["preview_orders"][0]["symbol"] == "AAA.SZ"
+    assert payload["preview_orders"][0]["price"] == 10.0
+
+
+def test_qmt_microcap_trading_engine_preview_raises_when_signal_close_missing(tmp_path: Path, monkeypatch) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    session_factory = create_session_factory(app_settings.database_url)
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+
+    day_frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA.SZ",
+                "close": 0.0,
+                "prev_close": 10.0,
+                "avg_volume_20_prev": 20000.0,
+            }
+        ]
+    ).set_index("symbol", drop=False)
+    live_state = AccountState(
+        account_id="paper-account",
+        cash=Decimal("100000"),
+        positions={"AAA.SZ": Position(symbol="AAA.SZ", qty=100, available_qty=100, cost_price=Decimal("10"), last_price=Decimal("10"))},
+    )
+
+    with pytest.raises(RuntimeError, match="计划价格缺少有效收盘价"):
+        engine._build_order_plan(
+            latest_date=pd.Timestamp("2026-04-21"),
+            day_frame=day_frame,
+            live_state=live_state,
+            prices={"AAA.SZ": Decimal("11.5")},
+            volumes={"AAA.SZ": 2_000_000.0},
+            target_meta={"targets": [], "each_target_value": 1000.0},
+        )
 
 
 def test_qmt_microcap_trading_engine_uses_previous_completed_day_during_trading_hours(tmp_path: Path, monkeypatch) -> None:

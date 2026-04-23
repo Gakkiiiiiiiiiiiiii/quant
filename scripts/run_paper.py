@@ -28,6 +28,36 @@ MICROCAP_IMPLEMENTATIONS = {
 }
 
 
+def _build_preview_summary(payload: dict) -> dict:
+    preview_orders = payload.get("preview_orders") or []
+    buy_orders = [order for order in preview_orders if str(order.get("side", "")).lower() == "buy"]
+    sell_orders = [order for order in preview_orders if str(order.get("side", "")).lower() == "sell"]
+
+    def _compact_order(order: dict) -> dict:
+        return {
+            "symbol": order.get("symbol"),
+            "qty": order.get("qty"),
+            "price": order.get("price"),
+            "reason": order.get("reason"),
+        }
+
+    return {
+        "environment": "paper",
+        "mode": "preview",
+        "plan_path": payload.get("plan_path"),
+        "signal_trade_date": payload.get("signal_trade_date"),
+        "planned_execution_date": payload.get("planned_execution_date"),
+        "strategy_total_asset": payload.get("strategy_total_asset"),
+        "preview_order_count": len(preview_orders),
+        "buy_order_count": len(buy_orders),
+        "sell_order_count": len(sell_orders),
+        "buy_symbols": [order.get("symbol") for order in buy_orders],
+        "sell_symbols": [order.get("symbol") for order in sell_orders],
+        "buy_orders": [_compact_order(order) for order in buy_orders],
+        "sell_orders": [_compact_order(order) for order in sell_orders],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行仿真盘")
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
@@ -46,21 +76,8 @@ def main() -> None:
         engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
         if args.mode == "preview":
             plan_path, payload = engine.preview(initial_cash)
-            print(
-                json.dumps(
-                    {
-                        "environment": app_settings.environment.value,
-                        "mode": args.mode,
-                        "plan_path": str(plan_path),
-                        "signal_trade_date": payload.get("signal_trade_date"),
-                        "planned_execution_date": payload.get("planned_execution_date"),
-                        "strategy_total_asset": payload.get("strategy_total_asset"),
-                        "preview_order_count": len(payload.get("preview_orders") or []),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
+            payload["plan_path"] = str(plan_path)
+            print(json.dumps(_build_preview_summary(payload), ensure_ascii=False, indent=2))
             return
         result = engine.execute_plan(args.plan)
         print(
