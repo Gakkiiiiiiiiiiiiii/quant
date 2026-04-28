@@ -16,7 +16,7 @@ qmt_userdata_dir: runtime/qmt_client/installed/userdata_mini
 qmt_bridge_python: .venv-qmt36/Scripts/python.exe
 qmt_bridge_script: scripts/qmt_bridge.py
 qmt_trade_enabled: true
-default_strategy: joinquant_microcap_alpha
+default_strategy: joinquant_microcap_alpha_cc
 history_universe_sector: 沪深京A股
 symbols: []
 risk:

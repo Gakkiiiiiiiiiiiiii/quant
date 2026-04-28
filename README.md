@@ -99,7 +99,8 @@ cd ..\..
 - `joinquant_microcap_alpha_zr.yaml`
   - 聚宽微盘 Alpha（庄股最终替换）
 - `joinquant_microcap_alpha_zro.yaml`
-  - 聚宽微盘 Alpha（优化版）
+- 聚宽微盘 Alpha（优化版）
+- 聚宽微盘 Alpha（月历暴跌加仓）: 当前主策略
 
 ### 微盘扩展实验策略
 

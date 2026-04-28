@@ -4,9 +4,12 @@ import pandas as pd
 
 from quant_demo.experiment.joinquant_microcap_engine import (
     MicrocapStrategyConfig,
+    _apply_st_risk_announcement_flags,
     _build_segmented_special_treatment_for_symbol,
     _build_sz_special_treatment_for_symbol,
+    _classify_st_risk_announcement_title,
     _monster_exit_reason,
+    _normalize_a_share_symbol,
     _special_treatment_flags_from_name,
     _surge_exit_reason,
     _should_rebalance_on_date,
@@ -16,6 +19,7 @@ from quant_demo.experiment.joinquant_microcap_engine import (
     calendar_hedge_ratio,
     execution_price,
     fit_target_count_by_cash,
+    resolve_effective_microcap_config,
     volume_units_to_shares,
 )
 
@@ -204,6 +208,105 @@ def test_build_target_portfolio_allows_st_and_beijing_but_still_excludes_star_st
 
     assert ranked_count == 2
     assert target == ["000001.SZ", "430001.BJ"]
+
+
+def test_build_target_portfolio_blocks_preannounce_risk_for_new_buys_only() -> None:
+    cfg = MicrocapStrategyConfig(target_hold_num=2, buy_rank=2, keep_rank=2, query_limit=10)
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "open": 10.0,
+                "prev_close": 10.0,
+                "volume": 1_000_000,
+                "listed_days": 300,
+                "avg_amount_20_prev": 20_000_000.0,
+                "market_cap_prev": 100.0,
+                "is_st_name": False,
+                "is_beijing_stock": False,
+                "is_b_share": False,
+                "st_preannounce_block_buy": True,
+            },
+            {
+                "symbol": "000002.SZ",
+                "open": 9.0,
+                "prev_close": 9.0,
+                "volume": 1_000_000,
+                "listed_days": 300,
+                "avg_amount_20_prev": 20_000_000.0,
+                "market_cap_prev": 120.0,
+                "is_st_name": False,
+                "is_beijing_stock": False,
+                "is_b_share": False,
+                "st_preannounce_block_buy": False,
+            },
+            {
+                "symbol": "000003.SZ",
+                "open": 8.0,
+                "prev_close": 8.0,
+                "volume": 1_000_000,
+                "listed_days": 300,
+                "avg_amount_20_prev": 20_000_000.0,
+                "market_cap_prev": 140.0,
+                "is_st_name": False,
+                "is_beijing_stock": False,
+                "is_b_share": False,
+                "st_preannounce_block_buy": False,
+            },
+        ]
+    )
+
+    target, ranked_count = build_target_portfolio(frame, holdings=["000001.SZ"], total_value_open=100_000.0, cfg=cfg)
+
+    assert ranked_count == 3
+    assert target == ["000001.SZ", "000002.SZ"]
+
+
+def test_classify_st_risk_announcement_title_detects_possible_and_final() -> None:
+    assert _classify_st_risk_announcement_title("关于公司股票交易可能被实施退市风险警示的提示公告") == "possible"
+    assert _classify_st_risk_announcement_title("关于公司股票交易被实施退市风险警示暨停牌的公告") == "final"
+    assert _classify_st_risk_announcement_title("关于披露重组报告书暨一般风险提示性公告") == ""
+
+
+def test_apply_st_risk_announcement_flags_marks_watch_and_effective_window() -> None:
+    day_frame = pd.DataFrame(
+        [
+            {"symbol": "300295.SZ", "open": 10.0, "prev_close": 10.0, "volume": 1_000_000, "listed_days": 300, "avg_amount_20_prev": 20_000_000.0, "market_cap_prev": 100.0, "is_st_name": False, "is_beijing_stock": False, "is_b_share": False},
+            {"symbol": "000001.SZ", "open": 11.0, "prev_close": 11.0, "volume": 1_000_000, "listed_days": 300, "avg_amount_20_prev": 20_000_000.0, "market_cap_prev": 120.0, "is_st_name": False, "is_beijing_stock": False, "is_b_share": False},
+        ]
+    )
+    notices = pd.DataFrame(
+        [
+            {
+                "symbol": "300295.SZ",
+                "security_name": "三六五网",
+                "announce_date": pd.Timestamp("2026-04-11"),
+                "title": "关于公司股票交易可能被实施退市风险警示的第三次提示公告",
+                "notice_type": "其它风险提示公告",
+                "url": "https://example.test/300295",
+                "risk_stage": "possible",
+                "block_buy": True,
+                "prompt_sell": True,
+                "expected_effective_date": pd.NaT,
+                "active_from": pd.Timestamp("2026-04-11"),
+                "active_until": pd.Timestamp("2026-05-12"),
+            }
+        ]
+    )
+
+    enriched = _apply_st_risk_announcement_flags(day_frame, notices, pd.Timestamp("2026-04-20"))
+    flagged = enriched[enriched["symbol"] == "300295.SZ"].iloc[0]
+
+    assert bool(flagged["st_preannounce_block_buy"]) is True
+    assert bool(flagged["st_preannounce_prompt_sell"]) is True
+    assert str(flagged["st_preannounce_stage"]) == "possible"
+    assert "退市风险警示" in str(flagged["st_preannounce_title"])
+
+
+def test_normalize_a_share_symbol_maps_market_suffix() -> None:
+    assert _normalize_a_share_symbol("300295") == "300295.SZ"
+    assert _normalize_a_share_symbol("600000") == "600000.SH"
+    assert _normalize_a_share_symbol("920023") == "920023.BJ"
 
 
 def test_build_sz_special_treatment_for_symbol_uses_change_dates() -> None:
@@ -675,3 +778,42 @@ def test_calendar_hedge_ratio_reads_schedule_by_month() -> None:
     assert calendar_hedge_ratio(pd.Timestamp("2026-01-15"), cfg) == 0.2
     assert calendar_hedge_ratio(pd.Timestamp("2026-04-15"), cfg) == 0.5
     assert calendar_hedge_ratio(pd.Timestamp("2026-03-15"), cfg) == 0.0
+
+
+def test_resolve_effective_microcap_config_uses_april_strong_defense_profile() -> None:
+    cfg = MicrocapStrategyConfig(calendar_crash_profile_enabled=True)
+    benchmark_close = pd.Series(
+        [100.0, 101.0, 102.0, 103.0],
+        index=pd.to_datetime(["2026-04-01", "2026-04-02", "2026-04-03", "2026-04-06"]),
+        dtype=float,
+    )
+
+    effective_cfg, profile = resolve_effective_microcap_config(pd.Timestamp("2026-04-06"), cfg, benchmark_close)
+
+    assert effective_cfg.target_hold_num == 22
+    assert effective_cfg.buy_rank == 20
+    assert effective_cfg.keep_rank == 36
+    assert effective_cfg.min_avg_money_20 == 14_000_000.0
+    assert profile["profile_name"] == "strong_defense_apr"
+    assert profile["cash_weight"] == 0.5
+    assert calendar_hedge_ratio(pd.Timestamp("2026-04-06"), cfg, benchmark_close) == 0.5
+
+
+def test_resolve_effective_microcap_config_locks_crash_level_within_month() -> None:
+    cfg = MicrocapStrategyConfig(calendar_crash_profile_enabled=True)
+    benchmark_index = pd.bdate_range("2026-03-02", periods=50)
+    benchmark_close = pd.Series(
+        [100.0] * 22
+        + [96.0, 94.0, 92.0, 90.0, 88.0, 86.0, 84.0, 82.0, 80.0, 78.0, 76.0, 74.0, 72.0, 70.0]
+        + [71.0, 72.0, 73.0, 74.0, 75.0, 76.0, 77.0, 78.0, 79.0, 80.0, 81.0, 82.0, 83.0, 84.0],
+        index=benchmark_index,
+        dtype=float,
+    )
+
+    effective_cfg, profile = resolve_effective_microcap_config(pd.Timestamp("2026-04-30"), cfg, benchmark_close)
+
+    assert profile["instant_crash_level"] <= profile["crash_add_level"]
+    assert profile["crash_add_level"] >= 1
+    assert effective_cfg.target_hold_num >= 26
+    assert effective_cfg.buy_rank >= 24
+    assert effective_cfg.keep_rank >= 44

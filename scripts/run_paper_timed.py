@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +19,15 @@ sys.path.insert(0, str(SRC))
 from quant_demo.core.config import load_app_settings, load_strategy_settings
 from quant_demo.db.session import create_session_factory
 from quant_demo.experiment.qmt_microcap_trading import QmtMicrocapTradingEngine
+
+
+NOISY_PREVIEW_MARKERS = (
+    "服务器连接失败，请稍后再试。",
+    "接收数据异常，请稍后再试。",
+    "[WinError 10057]",
+    "login success!",
+    "logout success!",
+)
 
 
 def _load_plan(path: Path) -> dict:
@@ -55,6 +66,41 @@ def _seconds_until(target_hhmm: str, now: datetime) -> float:
     return (target_dt - now).total_seconds()
 
 
+def _summarize_preview_orders(payload: dict) -> dict:
+    orders = list(payload.get("preview_orders") or [])
+    target_meta = dict(payload.get("target_meta") or {})
+    buy_orders = [item for item in orders if str(item.get("side") or "").lower() == "buy"]
+    sell_orders = [item for item in orders if str(item.get("side") or "").lower() == "sell"]
+    return {
+        "preview_order_count": len(orders),
+        "buy_order_count": len(buy_orders),
+        "sell_order_count": len(sell_orders),
+        "buy_symbols": [str(item.get("symbol") or "") for item in buy_orders],
+        "sell_symbols": [str(item.get("symbol") or "") for item in sell_orders],
+        "buy_orders": buy_orders,
+        "sell_orders": sell_orders,
+        "st_risk_blocked_count": int(target_meta.get("st_risk_blocked_count", 0) or 0),
+        "st_risk_blocked_symbols": list(target_meta.get("st_risk_blocked_symbols") or []),
+        "st_risk_sell_watch": list(target_meta.get("st_risk_sell_watch") or []),
+    }
+
+
+def _run_preview_quietly(engine: QmtMicrocapTradingEngine, initial_cash: Decimal):
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+        result = engine.preview(initial_cash)
+    for stream in (stdout_buffer.getvalue(), stderr_buffer.getvalue()):
+        for line in stream.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(marker in stripped for marker in NOISY_PREVIEW_MARKERS):
+                continue
+            print(stripped, file=sys.stderr)
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行微盘股 T+1 定时仿真交易")
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
@@ -91,7 +137,7 @@ def main() -> None:
             plan_path = latest_plan_path
 
     if plan_payload is None or plan_path is None:
-        plan_path, plan_payload = engine.preview(initial_cash)
+        plan_path, plan_payload = _run_preview_quietly(engine, initial_cash)
 
     planned_execution_date = str(plan_payload.get("planned_execution_date") or "").strip()
     signal_trade_date = str(plan_payload.get("signal_trade_date") or "").strip()
@@ -107,6 +153,7 @@ def main() -> None:
         raise RuntimeError(f"今天 {today} 的执行回执已存在，疑似已经执行过，回执文件: {receipt_path}")
 
     preview_order_count = len(plan_payload.get("preview_orders") or [])
+    preview_summary = _summarize_preview_orders(plan_payload)
     if preview_order_count <= 0:
         print(
             json.dumps(
@@ -118,7 +165,7 @@ def main() -> None:
                     "planned_execution_date": planned_execution_date,
                     "execute_at": args.execute_at,
                     "strategy_total_asset": plan_payload.get("strategy_total_asset"),
-                    "preview_order_count": 0,
+                    **preview_summary,
                     "status": "noop",
                     "message": "计划文件中没有可执行委托，本次不执行自动交易。",
                 },
@@ -141,7 +188,7 @@ def main() -> None:
                     "execute_at": args.execute_at,
                     "wait_seconds": round(wait_seconds, 2),
                     "strategy_total_asset": plan_payload.get("strategy_total_asset"),
-                    "preview_order_count": preview_order_count,
+                    **preview_summary,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -152,6 +199,24 @@ def main() -> None:
             if remaining <= 0:
                 break
             time.sleep(min(max(args.poll_seconds, 1), 30))
+    else:
+        print(
+            json.dumps(
+                {
+                    "environment": app_settings.environment.value,
+                    "mode": "timed-execute",
+                    "plan_path": str(plan_path),
+                    "signal_trade_date": signal_trade_date,
+                    "planned_execution_date": planned_execution_date,
+                    "execute_at": args.execute_at,
+                    "wait_seconds": round(wait_seconds, 2),
+                    "strategy_total_asset": plan_payload.get("strategy_total_asset"),
+                    **preview_summary,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
     report_path, metrics, _equity_curve = engine.execute_plan(plan_path)
     print(

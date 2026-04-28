@@ -15,7 +15,7 @@ history_universe_limit: 0
 report_dir: data/reports
 qmt_install_dir: runtime/qmt_client/installed
 qmt_download_url: https://download.gjzq.com.cn/temp/organ/gjzqqmt_ceshi.rar
-default_strategy: first_alpha_v1
+default_strategy: joinquant_microcap_alpha_cc
 symbols: []
 backtest_engine: qlib
 qlib_source_dir: runtime/qlib_source

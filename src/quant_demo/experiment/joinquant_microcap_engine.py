@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import io
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
+from contextlib import redirect_stderr, redirect_stdout
 
 import numpy as np
 import pandas as pd
@@ -25,6 +27,7 @@ except ImportError:  # pragma: no cover - 依赖缺失时走降级逻辑
 from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient
 from quant_demo.audit.report_service import AuditReportService
 from quant_demo.core.config import AppSettings, StrategySettings
+from quant_demo.core.exceptions import QmtUnavailableError
 from quant_demo.db.models import (
     AssetSnapshotModel,
     AuditLogModel,
@@ -60,6 +63,16 @@ class MicrocapStrategyConfig:
     hedge_name: str = ""
     hedge_history_adjustment: str = "none"
     seasonal_hedge_schedule: dict[int, float] = field(default_factory=dict)
+    calendar_crash_profile_enabled: bool = False
+    calendar_crash_index_symbol: str = "399303.XSHE"
+    calendar_crash_bias_ma_n: int = 12
+    calendar_crash_lookback: int = 70
+    calendar_crash_bias_l1: float = -8.0
+    calendar_crash_ret20_l1: float = -0.08
+    calendar_crash_bias_l2: float = -12.0
+    calendar_crash_ret20_l2: float = -0.12
+    calendar_crash_bias_l3: float = -16.0
+    calendar_crash_dd60_l3: float = -0.18
     buy_slippage_bps: float = 35.0
     sell_slippage_bps: float = 35.0
     max_trade_volume_ratio: float = 0.03
@@ -68,6 +81,10 @@ class MicrocapStrategyConfig:
     historical_st_cache_path: str = "data/parquet/joinquant_microcap_st_status.parquet"
     historical_name_cache_path: str = "data/parquet/joinquant_microcap_name_history.parquet"
     historical_sz_change_name_cache_path: str = "data/parquet/joinquant_microcap_sz_change_name.parquet"
+    st_risk_announcement_enabled: bool = False
+    st_risk_announcement_cache_path: str = "data/parquet/st_risk_announcements.parquet"
+    st_risk_announcement_lookback_days: int = 30
+    st_risk_possible_active_days: int = 30
     historical_status_rank_buffer: int = 3000
     layer_rotation_enabled: bool = False
     layer_market_cap_bounds: list[float] = field(default_factory=lambda: [0.0, 2_000_000_000.0, 4_000_000_000.0, 6_000_000_000.0, 8_000_000_000.0, 10_000_000_000.0])
@@ -180,6 +197,16 @@ class MicrocapStrategyConfig:
             hedge_name=str(payload.get("hedge_name", "") or "").strip(),
             hedge_history_adjustment=str(payload.get("hedge_history_adjustment", "none") or "none").strip(),
             seasonal_hedge_schedule=_parse_seasonal_hedge_schedule(payload),
+            calendar_crash_profile_enabled=bool(payload.get("calendar_crash_profile_enabled")),
+            calendar_crash_index_symbol=str(payload.get("calendar_crash_index_symbol", payload.get("benchmark_symbol", "399303.XSHE")) or "399303.XSHE").strip() or "399303.XSHE",
+            calendar_crash_bias_ma_n=max(2, int(payload.get("calendar_crash_bias_ma_n", 12))),
+            calendar_crash_lookback=max(30, int(payload.get("calendar_crash_lookback", 70))),
+            calendar_crash_bias_l1=float(payload.get("calendar_crash_bias_l1", -8.0)),
+            calendar_crash_ret20_l1=float(payload.get("calendar_crash_ret20_l1", -0.08)),
+            calendar_crash_bias_l2=float(payload.get("calendar_crash_bias_l2", -12.0)),
+            calendar_crash_ret20_l2=float(payload.get("calendar_crash_ret20_l2", -0.12)),
+            calendar_crash_bias_l3=float(payload.get("calendar_crash_bias_l3", -16.0)),
+            calendar_crash_dd60_l3=float(payload.get("calendar_crash_dd60_l3", -0.18)),
             buy_slippage_bps=max(0.0, min(float(payload.get("buy_slippage_bps", 35.0)), 500.0)),
             sell_slippage_bps=max(0.0, min(float(payload.get("sell_slippage_bps", 35.0)), 500.0)),
             max_trade_volume_ratio=max(0.0, min(float(payload.get("max_trade_volume_ratio", 0.03)), 1.0)),
@@ -188,6 +215,10 @@ class MicrocapStrategyConfig:
             historical_st_cache_path=str(payload.get("historical_st_cache_path", "data/parquet/joinquant_microcap_st_status.parquet")),
             historical_name_cache_path=str(payload.get("historical_name_cache_path", "data/parquet/joinquant_microcap_name_history.parquet")),
             historical_sz_change_name_cache_path=str(payload.get("historical_sz_change_name_cache_path", "data/parquet/joinquant_microcap_sz_change_name.parquet")),
+            st_risk_announcement_enabled=bool(payload.get("st_risk_announcement_enabled")),
+            st_risk_announcement_cache_path=str(payload.get("st_risk_announcement_cache_path", "data/parquet/st_risk_announcements.parquet")),
+            st_risk_announcement_lookback_days=max(5, int(payload.get("st_risk_announcement_lookback_days", 30))),
+            st_risk_possible_active_days=max(5, int(payload.get("st_risk_possible_active_days", 30))),
             historical_status_rank_buffer=max(500, int(payload.get("historical_status_rank_buffer", 3000))),
             layer_rotation_enabled=bool(payload.get("layer_rotation_enabled")) or settings.implementation == "microcap_100b_layer_rot",
             layer_market_cap_bounds=_parse_float_list(payload.get("layer_market_cap_bounds"), [0.0, 2_000_000_000.0, 4_000_000_000.0, 6_000_000_000.0, 8_000_000_000.0, 10_000_000_000.0]),
@@ -398,6 +429,176 @@ def _to_baostock_symbol(symbol: str) -> str | None:
     if market == "SH":
         return f"sh.{code}"
     return None
+
+
+def _normalize_a_share_symbol(raw_code: Any) -> str:
+    code = str(raw_code or "").strip().upper()
+    if not code:
+        return ""
+    if "." in code:
+        return code
+    code = code.zfill(6)
+    if code.startswith(("600", "601", "603", "605", "688", "689", "900")):
+        return f"{code}.SH"
+    if code.startswith(("000", "001", "002", "003", "200", "300", "301")):
+        return f"{code}.SZ"
+    if code.startswith(("4", "8", "92")):
+        return f"{code}.BJ"
+    return code
+
+
+def _classify_st_risk_announcement_title(title: Any) -> str:
+    text = str(title or "").strip()
+    if not text:
+        return ""
+    if "退市风险警示" not in text and "其他风险警示" not in text and "退市整理" not in text:
+        return ""
+    if "可能被实施" in text or "可能被叠加实施" in text:
+        return "possible"
+    if "将被实施" in text or "将被叠加实施" in text:
+        return "final"
+    if "被实施" in text or "被叠加实施" in text or "实施退市风险警示暨停牌" in text or "实施其他风险警示暨停牌" in text:
+        return "final"
+    if "退市整理期" in text:
+        return "final"
+    return ""
+
+
+def _next_business_day(value: Any) -> pd.Timestamp:
+    return (pd.Timestamp(value).normalize() + pd.offsets.BDay(1)).normalize()
+
+
+def _finalize_st_risk_announcements(frame: pd.DataFrame, cfg: MicrocapStrategyConfig) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "security_name",
+                "announce_date",
+                "title",
+                "notice_type",
+                "url",
+                "risk_stage",
+                "block_buy",
+                "prompt_sell",
+                "expected_effective_date",
+                "active_from",
+                "active_until",
+            ]
+        )
+    working = frame.copy()
+    working["symbol"] = working["symbol"].astype(str)
+    working["security_name"] = working.get("security_name", "").fillna("").astype(str)
+    working["announce_date"] = pd.to_datetime(working["announce_date"], errors="coerce").dt.normalize()
+    working["title"] = working["title"].fillna("").astype(str)
+    working["notice_type"] = working.get("notice_type", "").fillna("").astype(str)
+    working["url"] = working.get("url", "").fillna("").astype(str)
+    working["risk_stage"] = working["title"].map(_classify_st_risk_announcement_title).fillna("")
+    working = working[working["risk_stage"].astype(bool)].copy()
+    if working.empty:
+        return _finalize_st_risk_announcements(pd.DataFrame(), cfg)
+    working["stage_priority"] = working["risk_stage"].map({"possible": 1, "final": 2}).fillna(0).astype(int)
+    working = working.sort_values(["symbol", "announce_date", "stage_priority", "title"], ascending=[True, True, True, True]).reset_index(drop=True)
+    expected_dates: list[pd.Timestamp] = []
+    active_until_values: list[pd.Timestamp] = []
+    default_possible_until = max(5, int(cfg.st_risk_possible_active_days))
+    for _symbol, group in working.groupby("symbol", sort=False):
+        symbol_rows = group.reset_index(drop=True)
+        future_final_dates = [
+            _next_business_day(item.announce_date)
+            for item in symbol_rows.itertuples(index=False)
+            if str(item.risk_stage) == "final"
+        ]
+        for row in symbol_rows.itertuples(index=False):
+            announce_date = pd.Timestamp(row.announce_date).normalize()
+            if str(row.risk_stage) == "final":
+                expected_effective_date = _next_business_day(announce_date)
+                active_until = expected_effective_date
+            else:
+                expected_effective_date = pd.NaT
+                active_until = (announce_date + pd.offsets.BDay(default_possible_until)).normalize()
+                candidate_final_dates = [item for item in future_final_dates if item >= announce_date]
+                if candidate_final_dates:
+                    active_until = min(active_until, min(candidate_final_dates))
+            expected_dates.append(expected_effective_date)
+            active_until_values.append(active_until)
+    working["expected_effective_date"] = expected_dates
+    working["active_from"] = working["announce_date"]
+    working["active_until"] = active_until_values
+    working["block_buy"] = True
+    working["prompt_sell"] = True
+    working = working.drop(columns=["stage_priority"], errors="ignore")
+    return working.loc[
+        :,
+        [
+            "symbol",
+            "security_name",
+            "announce_date",
+            "title",
+            "notice_type",
+            "url",
+            "risk_stage",
+            "block_buy",
+            "prompt_sell",
+            "expected_effective_date",
+            "active_from",
+            "active_until",
+        ],
+    ].drop_duplicates(["symbol", "announce_date", "title", "url"], keep="last").reset_index(drop=True)
+
+
+def _apply_st_risk_announcement_flags(day_frame: pd.DataFrame, announcements: pd.DataFrame, trade_date: pd.Timestamp) -> pd.DataFrame:
+    working = day_frame.copy()
+    if working.empty:
+        return working
+    working["st_preannounce_block_buy"] = False
+    working["st_preannounce_prompt_sell"] = False
+    working["st_preannounce_title"] = ""
+    working["st_preannounce_notice_date"] = pd.NaT
+    working["st_preannounce_effective_date"] = pd.NaT
+    working["st_preannounce_stage"] = ""
+    working["st_preannounce_url"] = ""
+    if announcements.empty:
+        return working
+    trade_dt = pd.Timestamp(trade_date).normalize()
+    active = announcements[
+        announcements["active_from"].le(trade_dt)
+        & announcements["active_until"].gt(trade_dt)
+    ].copy()
+    if active.empty:
+        return working
+    active["stage_priority"] = active["risk_stage"].map({"possible": 1, "final": 2}).fillna(0).astype(int)
+    active = active.sort_values(["symbol", "announce_date", "stage_priority"], ascending=[True, True, True])
+    latest = active.groupby("symbol", sort=False).tail(1).copy()
+    if latest.empty:
+        return working
+    latest = latest.set_index("symbol", drop=False)
+    symbols = working["symbol"].astype(str)
+    block_buy_series = symbols.map(latest["block_buy"])
+    prompt_sell_series = symbols.map(latest["prompt_sell"])
+    working["st_preannounce_block_buy"] = pd.Series(block_buy_series, index=working.index, dtype="boolean").fillna(False).astype(bool)
+    working["st_preannounce_prompt_sell"] = pd.Series(prompt_sell_series, index=working.index, dtype="boolean").fillna(False).astype(bool)
+    working["st_preannounce_title"] = symbols.map(latest["title"]).fillna("").astype(str)
+    working["st_preannounce_notice_date"] = pd.to_datetime(symbols.map(latest["announce_date"]), errors="coerce").dt.normalize()
+    working["st_preannounce_effective_date"] = pd.to_datetime(symbols.map(latest["expected_effective_date"]), errors="coerce").dt.normalize()
+    working["st_preannounce_stage"] = symbols.map(latest["risk_stage"]).fillna("").astype(str)
+    working["st_preannounce_url"] = symbols.map(latest["url"]).fillna("").astype(str)
+    return working
+
+
+def _apply_st_risk_buy_filter(working: pd.DataFrame, holdings: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    if working.empty or "st_preannounce_block_buy" not in working.columns:
+        return working, []
+    holding_set = {str(symbol) for symbol in holdings}
+    symbol_series = working["symbol"].astype(str)
+    preannounce_mask = pd.Series(working["st_preannounce_block_buy"], index=working.index, dtype="boolean").fillna(False)
+    blocked_symbols = (
+        symbol_series[preannounce_mask & (~symbol_series.isin(holding_set))]
+        .drop_duplicates()
+        .tolist()
+    )
+    filtered = working[(~preannounce_mask) | symbol_series.isin(holding_set)].copy()
+    return filtered, [str(symbol) for symbol in blocked_symbols]
 
 
 def _true_segments(flags: Iterable[bool]) -> list[tuple[int, int]]:
@@ -661,8 +862,238 @@ def available_trade_shares(symbol: str, desired_shares: int, remaining_shares: i
     return normalize_sell_amount(symbol, capped, current_amount)
 
 
-def calendar_hedge_ratio(trade_date: pd.Timestamp, cfg: MicrocapStrategyConfig) -> float:
-    return float(cfg.seasonal_hedge_schedule.get(int(pd.Timestamp(trade_date).month), 0.0))
+def _calendar_crash_base_profile(trade_date: pd.Timestamp) -> dict[str, Any]:
+    month = int(pd.Timestamp(trade_date).month)
+    if month == 4:
+        return {
+            "profile_name": "strong_defense_apr",
+            "profile_type": "strong_defense",
+            "micro_weight": 0.50,
+            "cash_weight": 0.50,
+            "target_hold_num": 22,
+            "buy_rank": 20,
+            "keep_rank": 36,
+            "min_avg_money_20": 14_000_000.0,
+        }
+    if month in {1, 12}:
+        return {
+            "profile_name": "defense_jan_dec",
+            "profile_type": "defense",
+            "micro_weight": 0.60,
+            "cash_weight": 0.40,
+            "target_hold_num": 26,
+            "buy_rank": 24,
+            "keep_rank": 42,
+            "min_avg_money_20": 12_000_000.0,
+        }
+    return {
+        "profile_name": "full_top",
+        "profile_type": "full",
+        "micro_weight": 1.00,
+        "cash_weight": 0.00,
+        "target_hold_num": 35,
+        "buy_rank": 35,
+        "keep_rank": 60,
+        "min_avg_money_20": 8_000_000.0,
+    }
+
+
+def _calendar_crash_market_state(
+    trade_date: pd.Timestamp,
+    benchmark_close: pd.Series,
+    cfg: MicrocapStrategyConfig,
+) -> dict[str, float]:
+    result = {
+        "bias12": 0.0,
+        "ret20": 0.0,
+        "drawdown60": 0.0,
+        "crash_add_level": 0.0,
+    }
+    if benchmark_close.empty:
+        return result
+    closes = benchmark_close.loc[: pd.Timestamp(trade_date)].dropna().astype(float)
+    if closes.empty:
+        return result
+    lookback = max(int(cfg.calendar_crash_lookback), int(cfg.calendar_crash_bias_ma_n) + 5)
+    closes = closes.tail(lookback)
+    if len(closes) < max(25, int(cfg.calendar_crash_bias_ma_n) + 2):
+        return result
+    current_close = float(closes.iloc[-1])
+    ma_window = closes.tail(int(cfg.calendar_crash_bias_ma_n))
+    ma_value = float(ma_window.mean()) if not ma_window.empty else 0.0
+    if ma_value > 0:
+        result["bias12"] = (current_close - ma_value) / ma_value * 100.0
+    if len(closes) >= 21 and float(closes.iloc[-21]) > 0:
+        result["ret20"] = current_close / float(closes.iloc[-21]) - 1.0
+    window60 = closes.tail(60)
+    if not window60.empty:
+        max60 = float(window60.max())
+        if max60 > 0:
+            result["drawdown60"] = current_close / max60 - 1.0
+    level = 0
+    if result["bias12"] <= float(cfg.calendar_crash_bias_l1) and result["ret20"] <= float(cfg.calendar_crash_ret20_l1):
+        level = 1
+    if result["bias12"] <= float(cfg.calendar_crash_bias_l2) and result["ret20"] <= float(cfg.calendar_crash_ret20_l2):
+        level = 2
+    if result["bias12"] <= float(cfg.calendar_crash_bias_l3) and result["drawdown60"] <= float(cfg.calendar_crash_dd60_l3):
+        level = 3
+    result["crash_add_level"] = float(level)
+    return result
+
+
+def _calendar_crash_locked_level(
+    trade_date: pd.Timestamp,
+    benchmark_close: pd.Series,
+    cfg: MicrocapStrategyConfig,
+    profile_type: str,
+) -> tuple[int, dict[str, float]]:
+    trade_date = pd.Timestamp(trade_date).normalize()
+    market_state = _calendar_crash_market_state(trade_date, benchmark_close, cfg)
+    if profile_type == "full":
+        return 0, market_state
+    month_start = trade_date.replace(day=1)
+    locked_level = 0
+    current_state = market_state
+    monthly_dates = benchmark_close.loc[(benchmark_close.index >= month_start) & (benchmark_close.index <= trade_date)].index
+    for current_date in monthly_dates:
+        daily_state = _calendar_crash_market_state(pd.Timestamp(current_date), benchmark_close, cfg)
+        locked_level = max(locked_level, int(daily_state["crash_add_level"]))
+        if pd.Timestamp(current_date).normalize() == trade_date:
+            current_state = daily_state
+    return locked_level, current_state
+
+
+def resolve_effective_microcap_config(
+    trade_date: pd.Timestamp,
+    cfg: MicrocapStrategyConfig,
+    benchmark_close: pd.Series | None = None,
+) -> tuple[MicrocapStrategyConfig, dict[str, Any]]:
+    trade_date = pd.Timestamp(trade_date).normalize()
+    if not cfg.calendar_crash_profile_enabled:
+        hedge_ratio = float(cfg.seasonal_hedge_schedule.get(int(trade_date.month), 0.0))
+        return cfg, {
+            "profile_name": "default_schedule",
+            "profile_type": "default",
+            "micro_weight": round(1.0 - hedge_ratio, 6),
+            "cash_weight": round(hedge_ratio, 6),
+            "instant_crash_level": 0,
+            "crash_add_level": 0,
+            "bias12": 0.0,
+            "ret20": 0.0,
+            "drawdown60": 0.0,
+            "hedge_ratio": hedge_ratio,
+        }
+
+    benchmark_series = benchmark_close if benchmark_close is not None else pd.Series(dtype=float)
+    profile = _calendar_crash_base_profile(trade_date)
+    profile_type = str(profile["profile_type"])
+    locked_level, market_state = _calendar_crash_locked_level(trade_date, benchmark_series, cfg, profile_type)
+    if profile_type == "strong_defense":
+        if locked_level == 1:
+            profile.update(
+                {
+                    "profile_name": "strong_defense_apr_add1",
+                    "micro_weight": 0.70,
+                    "cash_weight": 0.30,
+                    "target_hold_num": 26,
+                    "buy_rank": 24,
+                    "keep_rank": 44,
+                    "min_avg_money_20": 12_000_000.0,
+                }
+            )
+        elif locked_level == 2:
+            profile.update(
+                {
+                    "profile_name": "strong_defense_apr_add2",
+                    "micro_weight": 0.85,
+                    "cash_weight": 0.15,
+                    "target_hold_num": 30,
+                    "buy_rank": 30,
+                    "keep_rank": 52,
+                    "min_avg_money_20": 10_000_000.0,
+                }
+            )
+        elif locked_level >= 3:
+            profile.update(
+                {
+                    "profile_name": "strong_defense_apr_add3_full",
+                    "micro_weight": 1.00,
+                    "cash_weight": 0.00,
+                    "target_hold_num": 35,
+                    "buy_rank": 35,
+                    "keep_rank": 60,
+                    "min_avg_money_20": 8_000_000.0,
+                }
+            )
+    elif profile_type == "defense":
+        if locked_level == 1:
+            profile.update(
+                {
+                    "profile_name": "defense_jan_dec_add1",
+                    "micro_weight": 0.75,
+                    "cash_weight": 0.25,
+                    "target_hold_num": 30,
+                    "buy_rank": 28,
+                    "keep_rank": 48,
+                    "min_avg_money_20": 11_000_000.0,
+                }
+            )
+        elif locked_level == 2:
+            profile.update(
+                {
+                    "profile_name": "defense_jan_dec_add2",
+                    "micro_weight": 0.88,
+                    "cash_weight": 0.12,
+                    "target_hold_num": 33,
+                    "buy_rank": 32,
+                    "keep_rank": 54,
+                    "min_avg_money_20": 9_000_000.0,
+                }
+            )
+        elif locked_level >= 3:
+            profile.update(
+                {
+                    "profile_name": "defense_jan_dec_add3_full",
+                    "micro_weight": 1.00,
+                    "cash_weight": 0.00,
+                    "target_hold_num": 35,
+                    "buy_rank": 35,
+                    "keep_rank": 60,
+                    "min_avg_money_20": 8_000_000.0,
+                }
+            )
+    effective_cfg = replace(
+        cfg,
+        target_hold_num=int(profile["target_hold_num"]),
+        buy_rank=int(profile["buy_rank"]),
+        keep_rank=int(profile["keep_rank"]),
+        min_avg_money_20=float(profile["min_avg_money_20"]),
+        seasonal_hedge_schedule={int(trade_date.month): float(profile["cash_weight"])},
+    )
+    metadata = {
+        "profile_name": str(profile["profile_name"]),
+        "profile_type": profile_type,
+        "micro_weight": float(profile["micro_weight"]),
+        "cash_weight": float(profile["cash_weight"]),
+        "instant_crash_level": int(market_state["crash_add_level"]),
+        "crash_add_level": int(locked_level),
+        "bias12": float(market_state["bias12"]),
+        "ret20": float(market_state["ret20"]),
+        "drawdown60": float(market_state["drawdown60"]),
+        "hedge_ratio": float(profile["cash_weight"]),
+    }
+    return effective_cfg, metadata
+
+
+def calendar_hedge_ratio(
+    trade_date: pd.Timestamp,
+    cfg: MicrocapStrategyConfig,
+    benchmark_close: pd.Series | None = None,
+) -> float:
+    effective_cfg, metadata = resolve_effective_microcap_config(trade_date, cfg, benchmark_close)
+    if cfg.calendar_crash_profile_enabled:
+        return float(metadata["hedge_ratio"])
+    return float(effective_cfg.seasonal_hedge_schedule.get(int(pd.Timestamp(trade_date).month), 0.0))
 
 
 def get_dynamic_price_cap(symbol: str, slot_value: float, cfg: MicrocapStrategyConfig) -> float:
@@ -1261,7 +1692,7 @@ def build_portfolio_selection(
     cfg: MicrocapStrategyConfig,
 ) -> dict[str, Any]:
     if day_frame.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0}
+        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     invest_value = float(total_value_open) * (1.0 - cfg.cash_buffer)
     slot_value = invest_value / float(cfg.target_hold_num)
     working = day_frame
@@ -1299,18 +1730,21 @@ def build_portfolio_selection(
         & working["market_cap_prev"].fillna(float("inf")).gt(0.0)
     ].copy()
     if working.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0}
+        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     working["price_cap"] = working["symbol"].map(lambda symbol: get_dynamic_price_cap(symbol, slot_value, cfg))
     working = working[working["open"].le(working["price_cap"])].copy()
     if working.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0}
+        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     if cfg.layer_rotation_enabled:
         working = _apply_market_cap_layers(working, cfg)
         if working.empty:
-            return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0}
+            return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
+    working, st_risk_blocked_symbols = _apply_st_risk_buy_filter(working, holdings)
+    if working.empty:
+        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": len(st_risk_blocked_symbols), "st_risk_blocked_symbols": st_risk_blocked_symbols}
     working, zhuang_filtered_count = _apply_zhuang_buy_filter(working, holdings, cfg)
     if working.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": zhuang_filtered_count, "zhuang_replaced_count": 0}
+        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": zhuang_filtered_count, "zhuang_replaced_count": 0, "st_risk_blocked_count": len(st_risk_blocked_symbols), "st_risk_blocked_symbols": st_risk_blocked_symbols}
     suspect_lookup = (
         working.set_index(working["symbol"].astype(str))["is_old_zhuang_suspect_prev"].fillna(False).astype(bool).to_dict()
         if "is_old_zhuang_suspect_prev" in working.columns
@@ -1365,6 +1799,8 @@ def build_portfolio_selection(
                     "layer_allocations": layer_allocations,
                     "zhuang_filtered_count": zhuang_filtered_count,
                     "zhuang_replaced_count": zhuang_replaced_count,
+                    "st_risk_blocked_count": len(st_risk_blocked_symbols),
+                    "st_risk_blocked_symbols": st_risk_blocked_symbols,
                 }
     if cfg.industry_weighted_enabled and "industry_code" in working.columns:
         slot_table = _build_industry_slot_table(working, holdings, cfg)
@@ -1419,6 +1855,8 @@ def build_portfolio_selection(
                     "layer_allocations": [],
                     "zhuang_filtered_count": zhuang_filtered_count,
                     "zhuang_replaced_count": zhuang_replaced_count,
+                    "st_risk_blocked_count": len(st_risk_blocked_symbols),
+                    "st_risk_blocked_symbols": st_risk_blocked_symbols,
                 }
     if cfg.monster_prelude_enabled:
         ranked, ranked_count = _build_monster_prelude_ranked(working, holdings, cfg)
@@ -1432,6 +1870,8 @@ def build_portfolio_selection(
                 "layer_allocations": [],
                 "zhuang_filtered_count": zhuang_filtered_count,
                 "zhuang_replaced_count": zhuang_replaced_count,
+                "st_risk_blocked_count": len(st_risk_blocked_symbols),
+                "st_risk_blocked_symbols": st_risk_blocked_symbols,
             }
     working = working.sort_values(["market_cap_prev", "symbol"], ascending=[True, True]).head(cfg.query_limit).reset_index(drop=True)
     ranked = working["symbol"].astype(str).tolist()[:ranked_cap]
@@ -1444,6 +1884,8 @@ def build_portfolio_selection(
         "layer_allocations": [],
         "zhuang_filtered_count": zhuang_filtered_count,
         "zhuang_replaced_count": zhuang_replaced_count,
+        "st_risk_blocked_count": len(st_risk_blocked_symbols),
+        "st_risk_blocked_symbols": st_risk_blocked_symbols,
     }
 
 
@@ -1752,32 +2194,34 @@ class JoinQuantMicrocapBacktestEngine:
         ]
         rows: list[dict[str, Any]] = []
         if fetch_symbols and bs is not None:
-            login_result = bs.login()
-            if str(getattr(login_result, "error_code", "0")) == "0":
-                try:
-                    for symbol in fetch_symbols:
-                        query_symbol = _to_baostock_symbol(symbol)
-                        if not query_symbol:
-                            continue
-                        rs = bs.query_history_k_data_plus(
-                            query_symbol,
-                            "date,code,isST",
-                            start_date=start_date.strftime("%Y-%m-%d"),
-                            end_date=end_date.strftime("%Y-%m-%d"),
-                            frequency="d",
-                            adjustflag="3",
-                        )
-                        while rs.error_code == "0" and rs.next():
-                            current_row = rs.get_row_data()
-                            rows.append(
-                                {
-                                    "symbol": symbol,
-                                    "trading_date": pd.Timestamp(current_row[0]).normalize(),
-                                    "is_st_history": str(current_row[2]).strip() == "1",
-                                }
+            sink = io.StringIO()
+            with redirect_stdout(sink), redirect_stderr(sink):
+                login_result = bs.login()
+                if str(getattr(login_result, "error_code", "0")) == "0":
+                    try:
+                        for symbol in fetch_symbols:
+                            query_symbol = _to_baostock_symbol(symbol)
+                            if not query_symbol:
+                                continue
+                            rs = bs.query_history_k_data_plus(
+                                query_symbol,
+                                "date,code,isST",
+                                start_date=start_date.strftime("%Y-%m-%d"),
+                                end_date=end_date.strftime("%Y-%m-%d"),
+                                frequency="d",
+                                adjustflag="3",
                             )
-                finally:
-                    bs.logout()
+                            while rs.error_code == "0" and rs.next():
+                                current_row = rs.get_row_data()
+                                rows.append(
+                                    {
+                                        "symbol": symbol,
+                                        "trading_date": pd.Timestamp(current_row[0]).normalize(),
+                                        "is_st_history": str(current_row[2]).strip() == "1",
+                                    }
+                                )
+                    finally:
+                        bs.logout()
         if rows:
             fresh = pd.DataFrame(rows)
             if not cached.empty:
@@ -1787,17 +2231,172 @@ class JoinQuantMicrocapBacktestEngine:
                 combined = fresh
             combined["symbol"] = combined["symbol"].astype(str)
             combined["trading_date"] = pd.to_datetime(combined["trading_date"], errors="coerce").dt.normalize()
-            combined["is_st_history"] = combined["is_st_history"].fillna(False).astype(bool)
+            combined["is_st_history"] = pd.Series(combined["is_st_history"], dtype="boolean").fillna(False).astype(bool)
             combined = combined.drop_duplicates(["symbol", "trading_date"], keep="last").sort_values(["symbol", "trading_date"]).reset_index(drop=True)
             combined.to_parquet(cache_path, index=False)
             cached = combined
         if cached.empty:
             return pd.DataFrame(columns=["symbol", "trading_date", "is_st_history"])
-        cached["is_st_history"] = cached["is_st_history"].fillna(False).astype(bool)
+        cached["is_st_history"] = pd.Series(cached["is_st_history"], dtype="boolean").fillna(False).astype(bool)
         return cached[
             cached["symbol"].isin(set(symbols))
             & cached["trading_date"].between(start_date.normalize(), end_date.normalize())
         ].loc[:, ["symbol", "trading_date", "is_st_history"]].reset_index(drop=True)
+
+    def _load_st_risk_announcement_frame(
+        self,
+        symbols: list[str],
+        start_date: pd.Timestamp,
+        end_date: pd.Timestamp,
+    ) -> pd.DataFrame:
+        columns = [
+            "symbol",
+            "security_name",
+            "announce_date",
+            "title",
+            "notice_type",
+            "url",
+            "risk_stage",
+            "block_buy",
+            "prompt_sell",
+            "expected_effective_date",
+            "active_from",
+            "active_until",
+        ]
+        if not self.cfg.st_risk_announcement_enabled or ak is None or not symbols:
+            return pd.DataFrame(columns=columns)
+        cache_path = _resolve_path(self.cfg.st_risk_announcement_cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cached = pd.DataFrame(columns=columns)
+        if cache_path.exists():
+            cached = pd.read_parquet(cache_path)
+            for column in ["announce_date", "expected_effective_date", "active_from", "active_until"]:
+                if column in cached.columns:
+                    cached[column] = pd.to_datetime(cached[column], errors="coerce").dt.normalize()
+            for column in ["symbol", "security_name", "title", "notice_type", "url", "risk_stage"]:
+                if column in cached.columns:
+                    cached[column] = cached[column].fillna("").astype(str)
+            for column in ["block_buy", "prompt_sell"]:
+                if column in cached.columns:
+                    cached[column] = cached[column].fillna(False).astype(bool)
+        start_dt = pd.Timestamp(start_date).normalize()
+        end_dt = pd.Timestamp(end_date).normalize()
+        symbol_set = {str(symbol) for symbol in symbols}
+        notice_label = "\u98ce\u9669\u63d0\u793a"
+        rename_map = {
+            "\u4ee3\u7801": "code",
+            "\u540d\u79f0": "security_name",
+            "\u516c\u544a\u6807\u9898": "title",
+            "\u516c\u544a\u7c7b\u578b": "notice_type",
+            "\u516c\u544a\u65e5\u671f": "announce_date",
+            "\u7f51\u5740": "url",
+        }
+        fetched_rows: list[dict[str, Any]] = []
+        for current_date in pd.date_range(start_dt, end_dt, freq="D"):
+            try:
+                notice_frame = ak.stock_notice_report(symbol=notice_label, date=current_date.strftime("%Y%m%d"))
+            except Exception:
+                continue
+            if notice_frame is None or notice_frame.empty:
+                continue
+            normalized = notice_frame.rename(columns=rename_map).copy()
+            if "announce_date" not in normalized.columns or "code" not in normalized.columns:
+                continue
+            normalized["symbol"] = normalized["code"].map(_normalize_a_share_symbol)
+            normalized["announce_date"] = pd.to_datetime(normalized["announce_date"], errors="coerce").dt.normalize()
+            normalized["title"] = normalized["title"].fillna("").astype(str)
+            normalized["risk_stage"] = normalized["title"].map(_classify_st_risk_announcement_title).fillna("")
+            normalized = normalized[
+                normalized["symbol"].isin(symbol_set)
+                & normalized["risk_stage"].astype(bool)
+            ].copy()
+            if normalized.empty:
+                continue
+            for row in normalized.itertuples(index=False):
+                fetched_rows.append(
+                    {
+                        "symbol": str(row.symbol),
+                        "security_name": str(getattr(row, "security_name", "") or ""),
+                        "announce_date": pd.Timestamp(getattr(row, "announce_date")).normalize(),
+                        "title": str(getattr(row, "title", "") or ""),
+                        "notice_type": str(getattr(row, "notice_type", "") or ""),
+                        "url": str(getattr(row, "url", "") or ""),
+                    }
+                )
+        preserved = (
+            cached[~cached["announce_date"].between(start_dt, end_dt)].copy()
+            if not cached.empty and "announce_date" in cached.columns
+            else pd.DataFrame(columns=columns)
+        )
+        fresh = pd.DataFrame(fetched_rows)
+        combined = pd.concat([preserved, fresh], ignore_index=True) if not fresh.empty else preserved
+        combined = _finalize_st_risk_announcements(combined, self.cfg)
+        combined.to_parquet(cache_path, index=False)
+        return combined[
+            combined["symbol"].isin(symbol_set)
+            & combined["announce_date"].between(start_dt, end_dt)
+        ].reset_index(drop=True)
+        fetched_rows: list[dict[str, Any]] = []
+        notice_label = "\u98ce\u9669\u63d0\u793a"
+        rename_map = {
+            "\u4ee3\u7801": "code",
+            "\u540d\u79f0": "security_name",
+            "\u516c\u544a\u6807\u9898": "title",
+            "\u516c\u544a\u7c7b\u578b": "notice_type",
+            "\u516c\u544a\u65e5\u671f": "announce_date",
+            "\u7f51\u5740": "url",
+        }
+        for current_date in pd.date_range(start_dt, end_dt, freq="D"):
+            try:
+                notice_frame = ak.stock_notice_report(symbol="风险提示", date=current_date.strftime("%Y%m%d"))
+            except Exception:
+                continue
+            if notice_frame is None or notice_frame.empty:
+                continue
+            normalized = notice_frame.rename(
+                columns={
+                    "代码": "code",
+                    "名称": "security_name",
+                    "公告标题": "title",
+                    "公告类型": "notice_type",
+                    "公告日期": "announce_date",
+                    "网址": "url",
+                }
+            ).copy()
+            if "announce_date" not in normalized.columns or "code" not in normalized.columns:
+                continue
+            normalized["symbol"] = normalized["code"].map(_normalize_a_share_symbol)
+            normalized["announce_date"] = pd.to_datetime(normalized["announce_date"], errors="coerce").dt.normalize()
+            normalized["title"] = normalized["title"].fillna("").astype(str)
+            normalized["risk_stage"] = normalized["title"].map(_classify_st_risk_announcement_title).fillna("")
+            normalized = normalized[
+                normalized["symbol"].isin(set(symbols))
+                & normalized["risk_stage"].astype(bool)
+            ].copy()
+            if normalized.empty:
+                continue
+            for row in normalized.itertuples(index=False):
+                fetched_rows.append(
+                    {
+                        "symbol": str(row.symbol),
+                        "security_name": str(getattr(row, "security_name", "") or ""),
+                        "announce_date": pd.Timestamp(getattr(row, "announce_date")).normalize(),
+                        "title": str(getattr(row, "title", "") or ""),
+                        "notice_type": str(getattr(row, "notice_type", "") or ""),
+                        "url": str(getattr(row, "url", "") or ""),
+                    }
+                )
+        preserved = cached[
+            ~cached["announce_date"].between(start_dt, end_dt)
+        ].copy() if not cached.empty and "announce_date" in cached.columns else pd.DataFrame(columns=columns)
+        fresh = pd.DataFrame(fetched_rows)
+        combined = pd.concat([preserved, fresh], ignore_index=True) if not fresh.empty else preserved
+        combined = _finalize_st_risk_announcements(combined, self.cfg)
+        combined.to_parquet(cache_path, index=False)
+        return combined[
+            combined["symbol"].isin(set(symbols))
+            & combined["announce_date"].between(start_dt, end_dt)
+        ].reset_index(drop=True)
 
     def _load_historical_special_treatment_frame(
         self,
@@ -1918,13 +2517,16 @@ class JoinQuantMicrocapBacktestEngine:
         missing = sorted(set(symbols) - known)
         rows: list[dict[str, Any]] = []
         for batch in _batched(missing, 100):
-            payload = self.bridge.get_financial_data(
-                batch,
-                ["Capital"],
-                start_time=self.app_settings.history_start,
-                end_time=self.app_settings.history_end,
-                report_type="announce_time",
-            )
+            try:
+                payload = self.bridge.get_financial_data(
+                    batch,
+                    ["Capital"],
+                    start_time=self.app_settings.history_start,
+                    end_time=self.app_settings.history_end,
+                    report_type="announce_time",
+                )
+            except QmtUnavailableError:
+                continue
             for symbol, table_map in payload.items():
                 for item in table_map.get("Capital", []) or []:
                     rows.append(
@@ -2012,7 +2614,8 @@ class JoinQuantMicrocapBacktestEngine:
         else:
             frame["total_capital"] = pd.NA
 
-        frame["total_capital"] = frame["total_capital"].fillna(frame["symbol"].map(current_capital))
+        current_capital_series = pd.to_numeric(frame["symbol"].map(current_capital), errors="coerce")
+        frame["total_capital"] = pd.to_numeric(frame["total_capital"], errors="coerce").combine_first(current_capital_series)
         frame["total_capital"] = frame.groupby("symbol", sort=False)["total_capital"].ffill().bfill()
         frame["total_capital_prev"] = frame.groupby("symbol", sort=False)["total_capital"].shift(1).fillna(frame["total_capital"])
         frame["raw_vwap"] = np.where(
@@ -2030,9 +2633,21 @@ class JoinQuantMicrocapBacktestEngine:
                 on=["symbol", "trading_date"],
                 how="left",
             )
-            frame["is_st_name"] = frame["is_st_name"].fillna(fallback_flags["is_st_name"]).astype(bool)
-            frame["is_star_st_name"] = frame["is_star_st_name"].fillna(fallback_flags["is_star_st_name"]).astype(bool)
-            frame["is_delisting_name"] = frame["is_delisting_name"].fillna(fallback_flags["is_delisting_name"]).astype(bool)
+            frame["is_st_name"] = (
+                pd.Series(frame["is_st_name"], index=frame.index, dtype="boolean")
+                .combine_first(pd.Series(fallback_flags["is_st_name"], index=frame.index, dtype="boolean"))
+                .astype(bool)
+            )
+            frame["is_star_st_name"] = (
+                pd.Series(frame["is_star_st_name"], index=frame.index, dtype="boolean")
+                .combine_first(pd.Series(fallback_flags["is_star_st_name"], index=frame.index, dtype="boolean"))
+                .astype(bool)
+            )
+            frame["is_delisting_name"] = (
+                pd.Series(frame["is_delisting_name"], index=frame.index, dtype="boolean")
+                .combine_first(pd.Series(fallback_flags["is_delisting_name"], index=frame.index, dtype="boolean"))
+                .astype(bool)
+            )
             grouped = frame.groupby("symbol", sort=False)
         frame["close_prev_5"] = grouped["close"].shift(self.cfg.industry_breadth_lookback_days)
         frame["close_prev_20"] = grouped["close"].shift(self.cfg.industry_lookback_days)
@@ -2388,6 +3003,7 @@ class JoinQuantMicrocapBacktestEngine:
             name_map[overlay_symbol] = self.cfg.hedge_name or overlay_symbol
 
         for trade_date, day_frame in prepared.groupby("trading_date", sort=False):
+            active_cfg, profile_meta = resolve_effective_microcap_config(trade_date, self.cfg, benchmark_close)
             day_rows: dict[str, Any] = {}
             remaining_trade_capacity: dict[str, int] = {}
             price_lookup: dict[str, float] = {}
@@ -2395,7 +3011,7 @@ class JoinQuantMicrocapBacktestEngine:
                 symbol = str(row.symbol)
                 day_rows[symbol] = row
                 remaining_trade_capacity[symbol] = int(
-                    volume_units_to_shares(float(getattr(row, "avg_volume_20_prev", 0.0) or 0.0)) * self.cfg.max_trade_volume_ratio
+                    volume_units_to_shares(float(getattr(row, "avg_volume_20_prev", 0.0) or 0.0)) * active_cfg.max_trade_volume_ratio
                 )
                 price_lookup[symbol] = float(getattr(row, "open", 0.0) or 0.0)
             open_value = cash
@@ -2412,21 +3028,21 @@ class JoinQuantMicrocapBacktestEngine:
                 if row is None or meta is None:
                     continue
                 reason = None
-                if self.cfg.monster_prelude_enabled:
-                    reason = _monster_exit_reason(row, meta, trade_date, self.cfg)
-                elif self.cfg.surge_exit_enabled:
-                    reason = _surge_exit_reason(row, meta, self.cfg)
+                if active_cfg.monster_prelude_enabled:
+                    reason = _monster_exit_reason(row, meta, trade_date, active_cfg)
+                elif active_cfg.surge_exit_enabled:
+                    reason = _surge_exit_reason(row, meta, active_cfg)
                 if reason:
                     exit_signal_reasons[symbol] = reason
             protected_stock_holdings = [
                 symbol
                 for symbol in stock_holdings
                 if symbol not in exit_signal_reasons
-                and (trade_date.normalize() - pd.Timestamp(holdings[symbol].get("hold_since", trade_date)).normalize()).days < self.cfg.min_holding_days
+                and (trade_date.normalize() - pd.Timestamp(holdings[symbol].get("hold_since", trade_date)).normalize()).days < active_cfg.min_holding_days
             ]
-            rebalance_today = _should_rebalance_on_date(trade_date, last_rebalance_date, self.cfg)
-            hedge_ratio = calendar_hedge_ratio(trade_date, self.cfg)
-            invest_value = open_value * (1.0 - self.cfg.cash_buffer)
+            rebalance_today = _should_rebalance_on_date(trade_date, last_rebalance_date, active_cfg)
+            hedge_ratio = float(profile_meta["hedge_ratio"])
+            invest_value = open_value * (1.0 - active_cfg.cash_buffer)
             stock_invest_value = invest_value * (1.0 - hedge_ratio)
             hedge_target_value = invest_value * hedge_ratio if overlay_symbol else 0.0
             if rebalance_today:
@@ -2435,7 +3051,7 @@ class JoinQuantMicrocapBacktestEngine:
                     day_frame,
                     prioritized_holdings,
                     open_value * (1.0 - hedge_ratio),
-                    self.cfg,
+                    active_cfg,
                 )
                 target_stocks = list(selection["targets"])
                 ranked_count = int(selection["ranked_count"])
@@ -2447,11 +3063,11 @@ class JoinQuantMicrocapBacktestEngine:
                     target_stocks,
                     price_lookup=price_lookup,
                     invest_value=stock_invest_value,
-                    cfg=self.cfg,
+                    cfg=active_cfg,
                 )
-                if self.cfg.monster_prelude_enabled or self.cfg.surge_exit_enabled:
+                if active_cfg.monster_prelude_enabled or active_cfg.surge_exit_enabled:
                     surviving_holdings = [symbol for symbol in stock_holdings if symbol not in exit_signal_reasons]
-                    open_slots = max(0, self.cfg.target_hold_num - len(surviving_holdings))
+                    open_slots = max(0, active_cfg.target_hold_num - len(surviving_holdings))
                     add_candidates = [symbol for symbol in fitted_targets if symbol not in set(surviving_holdings) and symbol not in exit_signal_reasons]
                     fitted_targets = surviving_holdings + add_candidates[:open_slots]
                 last_rebalance_date = trade_date
@@ -2495,7 +3111,7 @@ class JoinQuantMicrocapBacktestEngine:
                         float(row.open),
                         float(row.prev_close or 0.0),
                         is_buy=False,
-                        slippage_bps=self.cfg.sell_slippage_bps,
+                        slippage_bps=active_cfg.sell_slippage_bps,
                     )
                     amount = sell_shares * price
                     fee = sell_fee(amount)
@@ -2518,7 +3134,7 @@ class JoinQuantMicrocapBacktestEngine:
                         }
                     )
                     holdings.pop(symbol, None)
-            if rebalance_today and not self.cfg.monster_prelude_enabled:
+            if rebalance_today and not active_cfg.monster_prelude_enabled:
                 for symbol in list(holdings.keys()):
                     row = day_rows.get(symbol)
                     if symbol == overlay_symbol or symbol in target_set or row is None:
@@ -2544,7 +3160,7 @@ class JoinQuantMicrocapBacktestEngine:
                         float(row.open),
                         float(row.prev_close or 0.0),
                         is_buy=False,
-                        slippage_bps=self.cfg.sell_slippage_bps,
+                        slippage_bps=active_cfg.sell_slippage_bps,
                     )
                     amount = sell_shares * price
                     fee = sell_fee(amount)
@@ -2581,7 +3197,7 @@ class JoinQuantMicrocapBacktestEngine:
                     open_price = float(row.open)
                     current_shares = int(holdings[symbol]["shares"])
                     current_value = current_shares * open_price
-                    if current_value <= each_target_value * self.cfg.max_overweight_ratio:
+                    if current_value <= each_target_value * active_cfg.max_overweight_ratio:
                         continue
                     target_amount = calc_target_amount_by_value(symbol, each_target_value, open_price)
                     adjusted_target = adjust_target_amount_for_rules(symbol, current_shares, target_amount)
@@ -2601,7 +3217,7 @@ class JoinQuantMicrocapBacktestEngine:
                         float(row.open),
                         float(row.prev_close or 0.0),
                         is_buy=False,
-                        slippage_bps=self.cfg.sell_slippage_bps,
+                        slippage_bps=active_cfg.sell_slippage_bps,
                     )
                     amount = sell_shares * sell_price
                     fee = sell_fee(amount)
@@ -2658,7 +3274,7 @@ class JoinQuantMicrocapBacktestEngine:
                             float(row.open),
                             float(row.prev_close or 0.0),
                             is_buy=False,
-                            slippage_bps=self.cfg.sell_slippage_bps,
+                            slippage_bps=active_cfg.sell_slippage_bps,
                         )
                         amount = sell_shares * sell_price
                         fee = sell_fee(amount)
@@ -2699,7 +3315,7 @@ class JoinQuantMicrocapBacktestEngine:
                         float(row.open),
                         float(row.prev_close or 0.0),
                         is_buy=True,
-                        slippage_bps=self.cfg.buy_slippage_bps,
+                        slippage_bps=active_cfg.buy_slippage_bps,
                     )
                     desired_buy = adjusted_target - current_shares
                     buy_shares = available_trade_shares(
@@ -2750,17 +3366,19 @@ class JoinQuantMicrocapBacktestEngine:
                     if not can_trade(symbol, trade_date, float(row.open), float(row.volume), float(row.prev_close or 0.0), is_buy=True):
                         continue
                     open_price = float(row.open)
-                    current_value = int(holdings.get(symbol, {}).get("shares", 0)) * open_price
-                    gap_value = each_target_value - current_value
-                    if gap_value <= 0:
+                    current_shares = int(holdings.get(symbol, {}).get("shares", 0))
+                    target_shares = calc_target_amount_by_value(symbol, each_target_value, open_price)
+                    desired_buy = max(int(target_shares) - int(current_shares), 0)
+                    if desired_buy <= 0:
                         continue
+                    current_value = current_shares * open_price
+                    gap_value = each_target_value - current_value
                     buy_plan.append((symbol, gap_value))
                 buy_plan.sort(key=lambda item: item[1], reverse=True)
 
-                for index, (symbol, gap_value) in enumerate(buy_plan):
-                    remaining = len(buy_plan) - index
+                for symbol, gap_value in buy_plan:
                     row = day_rows.get(symbol)
-                    if remaining <= 0 or row is None:
+                    if row is None:
                         continue
                     buy_price = execution_price(
                         symbol,
@@ -2768,17 +3386,16 @@ class JoinQuantMicrocapBacktestEngine:
                         float(row.open),
                         float(row.prev_close or 0.0),
                         is_buy=True,
-                        slippage_bps=self.cfg.buy_slippage_bps,
+                        slippage_bps=active_cfg.buy_slippage_bps,
                     )
-                    budget = min(float(gap_value), cash / float(remaining) * 0.98)
-                    if budget < estimate_min_order_cost(symbol, buy_price):
-                        continue
-                    desired_buy = calc_amount_by_cash(symbol, budget, buy_price)
+                    current_shares = int(holdings.get(symbol, {}).get("shares", 0))
+                    target_shares = calc_target_amount_by_value(symbol, each_target_value, buy_price)
+                    desired_buy = max(int(target_shares) - int(current_shares), 0)
                     buy_shares = available_trade_shares(
                         symbol,
                         desired_buy,
                         remaining_trade_capacity.get(symbol, 0),
-                        int(holdings.get(symbol, {}).get("shares", 0)),
+                        current_shares,
                         is_buy=True,
                     )
                     if buy_shares <= 0:
@@ -2868,13 +3485,26 @@ class JoinQuantMicrocapBacktestEngine:
                     "daily_fees": round(daily_fees, 2),
                     "industry_selection_mode": (
                         "monster_prelude"
-                        if self.cfg.monster_prelude_enabled
-                        else ("layer_rotation" if self.cfg.layer_rotation_enabled else ("industry_weighted" if self.cfg.industry_weighted_enabled else "microcap_global"))
+                        if active_cfg.monster_prelude_enabled
+                        else ("layer_rotation" if active_cfg.layer_rotation_enabled else ("industry_weighted" if active_cfg.industry_weighted_enabled else "microcap_global"))
                     ),
                     "industry_allocations": json.dumps(industry_allocations, ensure_ascii=False),
                     "layer_allocations": json.dumps(layer_allocations, ensure_ascii=False),
                     "zhuang_filtered_count": zhuang_filtered_count,
                     "zhuang_replaced_count": zhuang_replaced_count,
+                    "profile_name": str(profile_meta["profile_name"]),
+                    "profile_type": str(profile_meta["profile_type"]),
+                    "micro_weight": round(float(profile_meta["micro_weight"]), 4),
+                    "cash_weight": round(float(profile_meta["cash_weight"]), 4),
+                    "instant_crash_level": int(profile_meta["instant_crash_level"]),
+                    "crash_add_level": int(profile_meta["crash_add_level"]),
+                    "bias12": round(float(profile_meta["bias12"]), 4),
+                    "ret20": round(float(profile_meta["ret20"]), 6),
+                    "drawdown60": round(float(profile_meta["drawdown60"]), 6),
+                    "effective_target_hold_num": int(active_cfg.target_hold_num),
+                    "effective_buy_rank": int(active_cfg.buy_rank),
+                    "effective_keep_rank": int(active_cfg.keep_rank),
+                    "effective_min_avg_money_20": round(float(active_cfg.min_avg_money_20), 2),
                 }
             )
 
@@ -2953,6 +3583,16 @@ class JoinQuantMicrocapBacktestEngine:
                 "hedge_symbol": self.cfg.hedge_symbol,
                 "hedge_name": self.cfg.hedge_name or self.cfg.hedge_symbol,
                 "seasonal_hedge_schedule": self.cfg.seasonal_hedge_schedule,
+                "calendar_crash_profile_enabled": self.cfg.calendar_crash_profile_enabled,
+                "calendar_crash_index_symbol": self.cfg.calendar_crash_index_symbol,
+                "calendar_crash_bias_ma_n": self.cfg.calendar_crash_bias_ma_n,
+                "calendar_crash_lookback": self.cfg.calendar_crash_lookback,
+                "calendar_crash_bias_l1": self.cfg.calendar_crash_bias_l1,
+                "calendar_crash_ret20_l1": self.cfg.calendar_crash_ret20_l1,
+                "calendar_crash_bias_l2": self.cfg.calendar_crash_bias_l2,
+                "calendar_crash_ret20_l2": self.cfg.calendar_crash_ret20_l2,
+                "calendar_crash_bias_l3": self.cfg.calendar_crash_bias_l3,
+                "calendar_crash_dd60_l3": self.cfg.calendar_crash_dd60_l3,
                 "industry_weighted_enabled": self.cfg.industry_weighted_enabled,
                 "layer_rotation_enabled": self.cfg.layer_rotation_enabled,
                 "monster_prelude_enabled": self.cfg.monster_prelude_enabled,

@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 
 from _bootstrap import ROOT, SRC
@@ -21,15 +23,25 @@ MICROCAP_IMPLEMENTATIONS = {
     "joinquant_microcap_alpha_zfe",
     "joinquant_microcap_alpha_zr",
     "joinquant_microcap_alpha_zro",
+    "joinquant_microcap_alpha_cc",
     "monster_prelude_alpha",
     "microcap_100b_layer_rot",
     "microcap_50b_layer_rot",
     "industry_weighted_microcap_alpha",
 }
 
+NOISY_PREVIEW_MARKERS = (
+    "服务器连接失败，请稍后再试。",
+    "接收数据异常，请稍后再试。",
+    "[WinError 10057]",
+    "login success!",
+    "logout success!",
+)
+
 
 def _build_preview_summary(payload: dict) -> dict:
     preview_orders = payload.get("preview_orders") or []
+    target_meta = dict(payload.get("target_meta") or {})
     buy_orders = [order for order in preview_orders if str(order.get("side", "")).lower() == "buy"]
     sell_orders = [order for order in preview_orders if str(order.get("side", "")).lower() == "sell"]
 
@@ -55,7 +67,26 @@ def _build_preview_summary(payload: dict) -> dict:
         "sell_symbols": [order.get("symbol") for order in sell_orders],
         "buy_orders": [_compact_order(order) for order in buy_orders],
         "sell_orders": [_compact_order(order) for order in sell_orders],
+        "st_risk_blocked_count": int(target_meta.get("st_risk_blocked_count", 0) or 0),
+        "st_risk_blocked_symbols": list(target_meta.get("st_risk_blocked_symbols") or []),
+        "st_risk_sell_watch": list(target_meta.get("st_risk_sell_watch") or []),
     }
+
+
+def _run_preview_quietly(engine: QmtMicrocapTradingEngine, initial_cash: Decimal):
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+        result = engine.preview(initial_cash)
+    for stream in (stdout_buffer.getvalue(), stderr_buffer.getvalue()):
+        for line in stream.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(marker in stripped for marker in NOISY_PREVIEW_MARKERS):
+                continue
+            print(stripped, file=sys.stderr)
+    return result
 
 
 def main() -> None:
@@ -75,7 +106,7 @@ def main() -> None:
     if strategy_settings.implementation in MICROCAP_IMPLEMENTATIONS and app_settings.environment.value == "paper":
         engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
         if args.mode == "preview":
-            plan_path, payload = engine.preview(initial_cash)
+            plan_path, payload = _run_preview_quietly(engine, initial_cash)
             payload["plan_path"] = str(plan_path)
             print(json.dumps(_build_preview_summary(payload), ensure_ascii=False, indent=2))
             return

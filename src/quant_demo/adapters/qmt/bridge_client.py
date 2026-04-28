@@ -190,6 +190,7 @@ class QmtBridgeClient:
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             completed = subprocess.run(
                 cmd,
                 cwd=PROJECT_ROOT,
@@ -197,6 +198,7 @@ class QmtBridgeClient:
                 check=False,
                 env=env,
                 timeout=timeout_seconds or BRIDGE_TIMEOUT_SECONDS,
+                creationflags=creationflags,
             )
         except subprocess.TimeoutExpired as exc:
             timeout_text = timeout_seconds or BRIDGE_TIMEOUT_SECONDS

@@ -8,7 +8,7 @@ import MetricStrip from './components/MetricStrip.vue'
 import PerformanceTriptych from './components/PerformanceTriptych.vue'
 
 const sections = ['收益概述', 'QMT 交易看板', '交易详情', '每日持仓&收益', '日志输出', '性能分析', '策略代码', 'Qlib 全市场', '形态实验室']
-const microcapStrategyKeys = ['joinquant_microcap_alpha', 'joinquant_microcap_alpha_zf', 'joinquant_microcap_alpha_zfe', 'joinquant_microcap_alpha_zr', 'joinquant_microcap_alpha_zro', 'monster_prelude_alpha', 'microcap_100b_layer_rot', 'microcap_50b_layer_rot', 'industry_weighted_microcap_alpha']
+const microcapStrategyKeys = ['joinquant_microcap_alpha', 'joinquant_microcap_alpha_zf', 'joinquant_microcap_alpha_zfe', 'joinquant_microcap_alpha_zr', 'joinquant_microcap_alpha_zro', 'joinquant_microcap_alpha_cc', 'monster_prelude_alpha', 'microcap_100b_layer_rot', 'microcap_50b_layer_rot', 'industry_weighted_microcap_alpha']
 const tradeTabs = [
   { key: 'pattern_actions', label: '每日交易记录' },
   { key: 'pattern_decisions', label: '每日决策' },

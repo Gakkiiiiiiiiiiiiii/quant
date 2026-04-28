@@ -102,6 +102,7 @@ class ExperimentManager:
             "joinquant_microcap_alpha_zfe",
             "joinquant_microcap_alpha_zr",
             "joinquant_microcap_alpha_zro",
+            "joinquant_microcap_alpha_cc",
             "monster_prelude_alpha",
             "microcap_100b_layer_rot",
             "microcap_50b_layer_rot",
