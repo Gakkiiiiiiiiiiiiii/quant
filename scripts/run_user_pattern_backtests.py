@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import json
 import os
@@ -43,6 +44,24 @@ def load_user_module(module_path: Path):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_qlib_callable(module_name: str, attr_name: str):
+    try:
+        module = importlib.import_module(module_name)
+        return getattr(module, attr_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != "qlib.data._libs.rolling":
+            raise
+
+    qlib_root = str((ROOT / "runtime" / "qlib_source").resolve())
+    while qlib_root in sys.path:
+        sys.path.remove(qlib_root)
+    for name in list(sys.modules):
+        if name == "qlib" or name.startswith("qlib."):
+            sys.modules.pop(name, None)
+    module = importlib.import_module(module_name)
+    return getattr(module, attr_name)
 
 
 def configure_user_module(user_module, app_settings) -> None:
@@ -1239,7 +1258,7 @@ def simulate_pattern_backtest(
     lot_size: int = 100,
     show_progress: bool = False,
 ) -> dict[str, object]:
-    from qlib.contrib.evaluate import risk_analysis
+    risk_analysis = _load_qlib_callable("qlib.contrib.evaluate", "risk_analysis")
 
     start_dt = pd.Timestamp(start_time).normalize()
     end_dt = pd.Timestamp(end_time).normalize()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
@@ -774,7 +775,9 @@ def adjust_target_amount_for_rules(symbol: str, current_amount: int, raw_target_
 
 
 def calc_target_amount_by_value(symbol: str, target_value: float, price: float) -> int:
-    if price <= 0:
+    if not math.isfinite(target_value) or target_value <= 0:
+        return 0
+    if not math.isfinite(price) or price <= 0:
         return 0
     raw_amount = int(float(target_value) / float(price))
     if is_star_stock(symbol):
@@ -3388,7 +3391,7 @@ class JoinQuantMicrocapBacktestEngine:
                     row = day_rows.get(symbol)
                     if row is None:
                         continue
-                    if bool(row.get("st_preannounce_block_buy")):
+                    if bool(getattr(row, "st_preannounce_block_buy", False)):
                         continue
                     if not can_trade(symbol, trade_date, float(row.open), float(row.volume), float(row.prev_close or 0.0), is_buy=True):
                         continue
@@ -3407,7 +3410,7 @@ class JoinQuantMicrocapBacktestEngine:
                     row = day_rows.get(symbol)
                     if row is None:
                         continue
-                    if bool(row.get("st_preannounce_block_buy")):
+                    if bool(getattr(row, "st_preannounce_block_buy", False)):
                         continue
                     buy_price = execution_price(
                         symbol,

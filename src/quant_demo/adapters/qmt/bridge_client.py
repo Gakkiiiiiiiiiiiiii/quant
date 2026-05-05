@@ -15,6 +15,8 @@ from quant_demo.core.exceptions import QmtUnavailableError
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 BRIDGE_TIMEOUT_SECONDS = 30
 INDUSTRY_MAP_TIMEOUT_SECONDS = 300
+SECTOR_MEMBERS_TIMEOUT_SECONDS = 300
+HISTORY_TIMEOUT_SECONDS = 300
 
 
 class QmtBridgeClient:
@@ -62,6 +64,7 @@ class QmtBridgeClient:
             str(only_a_share).lower(),
             "--limit",
             str(limit),
+            timeout_seconds=SECTOR_MEMBERS_TIMEOUT_SECONDS,
         )
         return payload.get("symbols", [])
 
@@ -103,6 +106,7 @@ class QmtBridgeClient:
             dividend_type,
             "--fill-data",
             str(fill_data).lower(),
+            timeout_seconds=HISTORY_TIMEOUT_SECONDS,
         )
         frame = pd.DataFrame(payload.get("rows", []))
         if frame.empty:
@@ -224,6 +228,7 @@ class QmtBridgeClient:
             raise QmtUnavailableError(f"QMT 桥接 Python 不存在: {self.python_path}")
         if not self.script_path.exists():
             raise QmtUnavailableError(f"QMT 桥接脚本不存在: {self.script_path}")
+        self.install_dir = self._resolve_install_dir(self.install_dir)
         if not self.install_dir.exists():
             raise QmtUnavailableError(f"QMT 安装目录不存在: {self.install_dir}")
         if not self.userdata_dir.exists():
@@ -246,3 +251,16 @@ class QmtBridgeClient:
             except UnicodeDecodeError:
                 continue
         return payload.decode("utf-8", errors="ignore").strip()
+
+    @staticmethod
+    def _resolve_install_dir(path: Path) -> Path:
+        if path.exists():
+            return path
+        if path.name.lower() != "client":
+            return path
+        parent = path.parent
+        for candidate_name in ("installed", "live_installed"):
+            candidate = parent / candidate_name
+            if candidate.exists():
+                return candidate
+        return path

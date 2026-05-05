@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import holidays
 import pandas as pd
 import yaml
 from sqlalchemy import create_engine, delete, select
@@ -522,7 +523,11 @@ def _estimate_next_trading_day(raw_trade_date: Any) -> str | None:
     trade_date = pd.to_datetime(raw_trade_date, errors="coerce")
     if pd.isna(trade_date):
         return None
-    return (trade_date.normalize() + pd.offsets.BDay(1)).date().isoformat()
+    cn_holidays = holidays.country_holidays("CN")
+    candidate = trade_date.normalize() + pd.Timedelta(days=1)
+    while candidate.weekday() >= 5 or candidate.date() in cn_holidays:
+        candidate = candidate + pd.Timedelta(days=1)
+    return candidate.date().isoformat()
 
 
 def _format_side_label(side: str) -> str:

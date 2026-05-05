@@ -6,11 +6,39 @@ from typing import Dict, Literal
 
 import numpy as np
 import pandas as pd
-import qlib
-from qlib.constant import REG_CN
-from qlib.data import D
-from qlib.contrib.evaluate import backtest_daily, risk_analysis
-from qlib.contrib.strategy.signal_strategy import WeightStrategyBase
+import sys
+
+
+def _import_qlib_symbols():
+    try:
+        import qlib
+        from qlib.constant import REG_CN
+        from qlib.contrib.evaluate import backtest_daily, risk_analysis
+        from qlib.contrib.strategy.signal_strategy import WeightStrategyBase
+        from qlib.data import D
+
+        return qlib, REG_CN, D, backtest_daily, risk_analysis, WeightStrategyBase
+    except ModuleNotFoundError as exc:
+        if exc.name != "qlib.data._libs.rolling":
+            raise
+
+    qlib_root = str((Path(__file__).resolve().parents[1] / "runtime" / "qlib_source").resolve())
+    while qlib_root in sys.path:
+        sys.path.remove(qlib_root)
+    for name in list(sys.modules):
+        if name == "qlib" or name.startswith("qlib."):
+            sys.modules.pop(name, None)
+
+    import qlib
+    from qlib.constant import REG_CN
+    from qlib.contrib.evaluate import backtest_daily, risk_analysis
+    from qlib.contrib.strategy.signal_strategy import WeightStrategyBase
+    from qlib.data import D
+
+    return qlib, REG_CN, D, backtest_daily, risk_analysis, WeightStrategyBase
+
+
+qlib, REG_CN, D, backtest_daily, risk_analysis, WeightStrategyBase = _import_qlib_symbols()
 
 
 # =========================

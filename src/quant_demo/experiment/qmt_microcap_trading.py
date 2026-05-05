@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import holidays
 import pandas as pd
 from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
@@ -87,6 +88,17 @@ class QmtMicrocapTradingEngine:
     @staticmethod
     def _normalize_trade_date(raw_value: Any) -> pd.Timestamp:
         return pd.Timestamp(pd.to_datetime(raw_value, errors="coerce")).normalize()
+
+    @staticmethod
+    def _next_cn_trading_day(raw_trade_date: Any) -> pd.Timestamp:
+        trade_date = pd.Timestamp(pd.to_datetime(raw_trade_date, errors="coerce")).normalize()
+        if pd.isna(trade_date):
+            raise RuntimeError(f"无法解析交易日: {raw_trade_date}")
+        cn_holidays = holidays.country_holidays("CN")
+        candidate = trade_date + pd.Timedelta(days=1)
+        while candidate.weekday() >= 5 or candidate.date() in cn_holidays:
+            candidate = candidate + pd.Timedelta(days=1)
+        return candidate.normalize()
 
     def _protected_sell_symbols(self) -> set[str]:
         return {
@@ -591,6 +603,11 @@ class QmtMicrocapTradingEngine:
         now = pd.Timestamp(self._now_local()).tz_localize(None)
         today = pd.Timestamp(now.date()).normalize()
         if latest_date < today:
+            try:
+                if self._next_cn_trading_day(latest_date) > today:
+                    return True
+            except Exception:
+                return False
             return False
         raw_updated_at = str((metadata or {}).get("updated_at") or "").strip()
         if not raw_updated_at:
@@ -778,13 +795,8 @@ class QmtMicrocapTradingEngine:
         stock_holdings = list(live_state.positions)
         total_value = float(reported_total_asset)
         benchmark_close = self._load_benchmark_close_series()
-        execution_date = pd.Timestamp(latest_date + pd.offsets.BDay(1)).normalize()
-        effective_cfg, profile_meta = resolve_effective_microcap_config(
-            latest_date,
-            self.cfg,
-            benchmark_close,
-            allocation_trade_date=execution_date,
-        )
+        execution_date = self._next_cn_trading_day(latest_date)
+        effective_cfg, profile_meta = resolve_effective_microcap_config(latest_date, self.cfg, benchmark_close)
         hedge_ratio = float(profile_meta["hedge_ratio"])
         invest_value = total_value * (1.0 - effective_cfg.cash_buffer)
         stock_invest_value = invest_value * (1.0 - hedge_ratio)
@@ -843,7 +855,6 @@ class QmtMicrocapTradingEngine:
         blocked_symbols = list(selection.get("st_risk_blocked_symbols") or [])
         return {
             "trade_date": latest_date.date().isoformat(),
-            "profile_trade_date": str(profile_meta.get("profile_trade_date") or execution_date.date().isoformat()),
             "targets": fitted_targets,
             "ranked_count": ranked_count,
             "target_count": target_count,
@@ -860,7 +871,6 @@ class QmtMicrocapTradingEngine:
             "bias12": float(profile_meta["bias12"]),
             "ret20": float(profile_meta["ret20"]),
             "drawdown60": float(profile_meta["drawdown60"]),
-            "signal_trade_date": str(profile_meta.get("signal_trade_date") or latest_date.date().isoformat()),
             "effective_target_hold_num": int(effective_cfg.target_hold_num),
             "effective_buy_rank": int(effective_cfg.buy_rank),
             "effective_keep_rank": int(effective_cfg.keep_rank),
@@ -907,7 +917,7 @@ class QmtMicrocapTradingEngine:
         live_state: AccountState,
     ) -> dict[str, Any]:
         signal_trade_date = latest_date.date().isoformat()
-        planned_execution_date = str((latest_date + pd.offsets.BDay(1)).date())
+        planned_execution_date = str(self._next_cn_trading_day(latest_date).date())
         return {
             "strategy": self.strategy_settings.name,
             "generated_at": datetime.now().isoformat(),
@@ -918,7 +928,6 @@ class QmtMicrocapTradingEngine:
             "target_meta": {
                 "trade_date": signal_trade_date,
                 "planned_execution_date": planned_execution_date,
-                "profile_trade_date": str(target_meta.get("profile_trade_date") or planned_execution_date),
                 "targets": list(target_meta.get("targets") or []),
                 "ranked_count": int(target_meta.get("ranked_count", 0) or 0),
                 "target_count": int(target_meta.get("target_count", 0) or 0),
@@ -935,7 +944,6 @@ class QmtMicrocapTradingEngine:
                 "bias12": float(target_meta.get("bias12", 0.0) or 0.0),
                 "ret20": float(target_meta.get("ret20", 0.0) or 0.0),
                 "drawdown60": float(target_meta.get("drawdown60", 0.0) or 0.0),
-                "signal_trade_date": str(target_meta.get("signal_trade_date") or signal_trade_date),
                 "effective_target_hold_num": int(target_meta.get("effective_target_hold_num", 0) or 0),
                 "effective_buy_rank": int(target_meta.get("effective_buy_rank", 0) or 0),
                 "effective_keep_rank": int(target_meta.get("effective_keep_rank", 0) or 0),
