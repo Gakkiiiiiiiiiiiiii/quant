@@ -43,9 +43,9 @@ class SimulatedTradeClient(TradeClient):
 
 
 class XtQuantTradeClient(TradeClient):
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(self, settings: AppSettings, bridge: QmtBridgeClient | None = None) -> None:
         self.settings = settings
-        self.bridge = QmtBridgeClient(settings)
+        self.bridge = bridge or QmtBridgeClient(settings)
 
     def submit_order(self, order: OrderRecord, market_price: Decimal) -> TradeFill:
         if not self.settings.qmt_trade_enabled:

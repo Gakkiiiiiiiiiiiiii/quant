@@ -17,7 +17,7 @@ import streamlit as st
 import yaml
 from sqlalchemy import create_engine
 
-from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient
+from quant_demo.adapters.qmt.gateway import create_bridge_client
 from quant_demo.core.config import AppSettings, load_app_settings
 from quant_demo.core.enums import Environment
 from quant_demo.core.exceptions import QmtUnavailableError
@@ -181,8 +181,13 @@ def load_live_probe(config_path: str) -> dict[str, Any]:
     settings = load_app_settings(config_path)
     if settings.environment != Environment.LIVE:
         return {}
-    bridge = QmtBridgeClient(settings)
-    return {"health": bridge.healthcheck(), "quotes": bridge.get_quotes(settings.symbols), "account": bridge.get_account_snapshot()}
+    bridge = create_bridge_client(settings)
+    return {
+        "qmt_client_name": settings.qmt_client_name,
+        "health": bridge.healthcheck(),
+        "quotes": bridge.get_quotes(settings.symbols),
+        "account": bridge.get_account_snapshot(),
+    }
 
 
 @st.cache_data(ttl=8, show_spinner=False)

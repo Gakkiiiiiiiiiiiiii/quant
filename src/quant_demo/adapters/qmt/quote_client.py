@@ -57,9 +57,9 @@ class LocalParquetQuoteClient(QuoteClient):
 
 
 class XtQuantQuoteClient(QuoteClient):
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(self, settings: AppSettings, bridge: QmtBridgeClient | None = None) -> None:
         self.settings = settings
-        self.bridge = QmtBridgeClient(settings)
+        self.bridge = bridge or QmtBridgeClient(settings)
 
     def load_history(self, symbols: list[str], output_path: str) -> pd.DataFrame:
         frame, _ = self.update_history(symbols, output_path, mode="auto")

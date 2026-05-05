@@ -1,0 +1,4 @@
+qmt_account_id: "请填写实盘账号"
+qmt_trade_enabled: false
+qmt_protected_sell_symbols:
+  - 688095.SH

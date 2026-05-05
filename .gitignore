@@ -35,3 +35,10 @@ qmt.txt
 .DS_Store
 Thumbs.db
 frontend/joinquant-vue/node_modules/
+configs/*.local.yaml
+docs/
+migration_bundle_*/
+migration_bundle_*.zip
+_tmp_copy_data/
+pytest_*/
+pytest_vue_tmp/

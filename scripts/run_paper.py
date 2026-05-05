@@ -11,7 +11,7 @@ from _bootstrap import ROOT, SRC
 
 sys.path.insert(0, str(SRC))
 
-from quant_demo.core.config import load_app_settings, load_strategy_settings
+from quant_demo.core.config import load_app_settings, load_strategy_settings, resolve_strategy_config_path
 from quant_demo.db.session import create_session_factory
 from quant_demo.experiment.manager import ExperimentManager
 from quant_demo.experiment.qmt_microcap_trading import QmtMicrocapTradingEngine
@@ -39,7 +39,7 @@ NOISY_PREVIEW_MARKERS = (
 )
 
 
-def _build_preview_summary(payload: dict) -> dict:
+def _build_preview_summary(payload: dict, qmt_client_name: str = "") -> dict:
     preview_orders = payload.get("preview_orders") or []
     target_meta = dict(payload.get("target_meta") or {})
     buy_orders = [order for order in preview_orders if str(order.get("side", "")).lower() == "buy"]
@@ -55,6 +55,7 @@ def _build_preview_summary(payload: dict) -> dict:
 
     return {
         "environment": "paper",
+        "qmt_client_name": qmt_client_name,
         "mode": "preview",
         "plan_path": payload.get("plan_path"),
         "signal_trade_date": payload.get("signal_trade_date"),
@@ -70,6 +71,7 @@ def _build_preview_summary(payload: dict) -> dict:
         "st_risk_blocked_count": int(target_meta.get("st_risk_blocked_count", 0) or 0),
         "st_risk_blocked_symbols": list(target_meta.get("st_risk_blocked_symbols") or []),
         "st_risk_sell_watch": list(target_meta.get("st_risk_sell_watch") or []),
+        "forced_exit_untradable_symbols": list(target_meta.get("forced_exit_untradable_symbols") or []),
     }
 
 
@@ -92,14 +94,19 @@ def _run_preview_quietly(engine: QmtMicrocapTradingEngine, initial_cash: Decimal
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行仿真盘")
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
-    parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml"))
+    parser.add_argument("--strategy", default="")
     parser.add_argument("--mode", choices=["preview", "execute"], default="preview")
     parser.add_argument("--plan", default="")
     parser.add_argument("--capital", default="100000")
     args = parser.parse_args()
 
     app_settings = load_app_settings(args.config)
-    strategy_settings = load_strategy_settings(args.strategy)
+    strategy_path = resolve_strategy_config_path(
+        args.strategy,
+        ROOT / "configs" / "strategy",
+        default_implementation=app_settings.default_strategy,
+    )
+    strategy_settings = load_strategy_settings(strategy_path)
     session_factory = create_session_factory(app_settings.database_url)
     initial_cash = Decimal(str(args.capital))
 
@@ -108,13 +115,14 @@ def main() -> None:
         if args.mode == "preview":
             plan_path, payload = _run_preview_quietly(engine, initial_cash)
             payload["plan_path"] = str(plan_path)
-            print(json.dumps(_build_preview_summary(payload), ensure_ascii=False, indent=2))
+            print(json.dumps(_build_preview_summary(payload, app_settings.qmt_client_name), ensure_ascii=False, indent=2))
             return
         result = engine.execute_plan(args.plan)
         print(
             json.dumps(
                 {
                     "environment": app_settings.environment.value,
+                    "qmt_client_name": app_settings.qmt_client_name,
                     "mode": args.mode,
                     "report_path": str(result[0]),
                     "total_return": result[1].total_return,

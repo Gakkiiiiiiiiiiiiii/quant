@@ -24,7 +24,7 @@ try:
 except ImportError:  # pragma: no cover - 依赖缺失时走降级逻辑
     bs = None
 
-from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient
+from quant_demo.adapters.qmt.gateway import QmtBrokerClient, create_bridge_client
 from quant_demo.audit.report_service import AuditReportService
 from quant_demo.core.config import AppSettings, StrategySettings
 from quant_demo.core.exceptions import QmtUnavailableError
@@ -967,10 +967,13 @@ def resolve_effective_microcap_config(
     trade_date: pd.Timestamp,
     cfg: MicrocapStrategyConfig,
     benchmark_close: pd.Series | None = None,
+    *,
+    allocation_trade_date: pd.Timestamp | None = None,
 ) -> tuple[MicrocapStrategyConfig, dict[str, Any]]:
     trade_date = pd.Timestamp(trade_date).normalize()
+    allocation_date = pd.Timestamp(allocation_trade_date if allocation_trade_date is not None else trade_date).normalize()
     if not cfg.calendar_crash_profile_enabled:
-        hedge_ratio = float(cfg.seasonal_hedge_schedule.get(int(trade_date.month), 0.0))
+        hedge_ratio = float(cfg.seasonal_hedge_schedule.get(int(allocation_date.month), 0.0))
         return cfg, {
             "profile_name": "default_schedule",
             "profile_type": "default",
@@ -982,12 +985,18 @@ def resolve_effective_microcap_config(
             "ret20": 0.0,
             "drawdown60": 0.0,
             "hedge_ratio": hedge_ratio,
+            "profile_trade_date": allocation_date.date().isoformat(),
+            "signal_trade_date": trade_date.date().isoformat(),
         }
 
     benchmark_series = benchmark_close if benchmark_close is not None else pd.Series(dtype=float)
-    profile = _calendar_crash_base_profile(trade_date)
+    profile = _calendar_crash_base_profile(allocation_date)
     profile_type = str(profile["profile_type"])
-    locked_level, market_state = _calendar_crash_locked_level(trade_date, benchmark_series, cfg, profile_type)
+    market_state = _calendar_crash_market_state(trade_date, benchmark_series, cfg)
+    if allocation_date.year == trade_date.year and allocation_date.month == trade_date.month:
+        locked_level, market_state = _calendar_crash_locked_level(trade_date, benchmark_series, cfg, profile_type)
+    else:
+        locked_level = 0 if profile_type != "full" else 0
     if profile_type == "strong_defense":
         if locked_level == 1:
             profile.update(
@@ -1068,7 +1077,7 @@ def resolve_effective_microcap_config(
         buy_rank=int(profile["buy_rank"]),
         keep_rank=int(profile["keep_rank"]),
         min_avg_money_20=float(profile["min_avg_money_20"]),
-        seasonal_hedge_schedule={int(trade_date.month): float(profile["cash_weight"])},
+        seasonal_hedge_schedule={int(allocation_date.month): float(profile["cash_weight"])},
     )
     metadata = {
         "profile_name": str(profile["profile_name"]),
@@ -1081,6 +1090,8 @@ def resolve_effective_microcap_config(
         "ret20": float(market_state["ret20"]),
         "drawdown60": float(market_state["drawdown60"]),
         "hedge_ratio": float(profile["cash_weight"]),
+        "profile_trade_date": allocation_date.date().isoformat(),
+        "signal_trade_date": trade_date.date().isoformat(),
     }
     return effective_cfg, metadata
 
@@ -1089,11 +1100,19 @@ def calendar_hedge_ratio(
     trade_date: pd.Timestamp,
     cfg: MicrocapStrategyConfig,
     benchmark_close: pd.Series | None = None,
+    *,
+    allocation_trade_date: pd.Timestamp | None = None,
 ) -> float:
-    effective_cfg, metadata = resolve_effective_microcap_config(trade_date, cfg, benchmark_close)
+    allocation_date = pd.Timestamp(allocation_trade_date if allocation_trade_date is not None else trade_date).normalize()
+    effective_cfg, metadata = resolve_effective_microcap_config(
+        trade_date,
+        cfg,
+        benchmark_close,
+        allocation_trade_date=allocation_trade_date,
+    )
     if cfg.calendar_crash_profile_enabled:
         return float(metadata["hedge_ratio"])
-    return float(effective_cfg.seasonal_hedge_schedule.get(int(pd.Timestamp(trade_date).month), 0.0))
+    return float(effective_cfg.seasonal_hedge_schedule.get(int(allocation_date.month), 0.0))
 
 
 def get_dynamic_price_cap(symbol: str, slot_value: float, cfg: MicrocapStrategyConfig) -> float:
@@ -1900,13 +1919,19 @@ def build_target_portfolio(
 
 
 class JoinQuantMicrocapBacktestEngine:
-    def __init__(self, session_factory: sessionmaker, app_settings: AppSettings, strategy_settings: StrategySettings) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        app_settings: AppSettings,
+        strategy_settings: StrategySettings,
+        bridge_client: QmtBrokerClient | None = None,
+    ) -> None:
         self.session_factory = session_factory
         self.app_settings = app_settings
         self.strategy_settings = strategy_settings
         self.cfg = MicrocapStrategyConfig.from_strategy_settings(strategy_settings)
         self.account_id = self.strategy_settings.implementation
-        self.bridge = QmtBridgeClient(app_settings)
+        self.bridge = bridge_client or create_bridge_client(app_settings)
 
     def run(self, initial_cash: Decimal) -> tuple[Path, EvaluationResult, pd.DataFrame]:
         self._emit_progress(1, 5, "加载日线历史")
@@ -3363,6 +3388,8 @@ class JoinQuantMicrocapBacktestEngine:
                     row = day_rows.get(symbol)
                     if row is None:
                         continue
+                    if bool(row.get("st_preannounce_block_buy")):
+                        continue
                     if not can_trade(symbol, trade_date, float(row.open), float(row.volume), float(row.prev_close or 0.0), is_buy=True):
                         continue
                     open_price = float(row.open)
@@ -3379,6 +3406,8 @@ class JoinQuantMicrocapBacktestEngine:
                 for symbol, gap_value in buy_plan:
                     row = day_rows.get(symbol)
                     if row is None:
+                        continue
+                    if bool(row.get("st_preannounce_block_buy")):
                         continue
                     buy_price = execution_price(
                         symbol,

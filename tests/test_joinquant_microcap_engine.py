@@ -817,3 +817,28 @@ def test_resolve_effective_microcap_config_locks_crash_level_within_month() -> N
     assert effective_cfg.target_hold_num >= 26
     assert effective_cfg.buy_rank >= 24
     assert effective_cfg.keep_rank >= 44
+
+
+def test_resolve_effective_microcap_config_uses_execution_month_for_profile() -> None:
+    cfg = MicrocapStrategyConfig(calendar_crash_profile_enabled=True)
+    benchmark_close = pd.Series(
+        [100.0, 101.0, 102.0, 103.0],
+        index=pd.to_datetime(["2026-04-27", "2026-04-28", "2026-04-29", "2026-04-30"]),
+        dtype=float,
+    )
+
+    effective_cfg, profile = resolve_effective_microcap_config(
+        pd.Timestamp("2026-04-30"),
+        cfg,
+        benchmark_close,
+        allocation_trade_date=pd.Timestamp("2026-05-01"),
+    )
+
+    assert effective_cfg.target_hold_num == 35
+    assert effective_cfg.buy_rank == 35
+    assert effective_cfg.keep_rank == 60
+    assert effective_cfg.min_avg_money_20 == 8_000_000.0
+    assert profile["profile_name"] == "full_top"
+    assert profile["cash_weight"] == 0.0
+    assert profile["signal_trade_date"] == "2026-04-30"
+    assert profile["profile_trade_date"] == "2026-05-01"

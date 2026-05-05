@@ -16,7 +16,7 @@ from _bootstrap import ROOT, SRC
 
 sys.path.insert(0, str(SRC))
 
-from quant_demo.core.config import load_app_settings, load_strategy_settings
+from quant_demo.core.config import load_app_settings, load_strategy_settings, resolve_strategy_config_path
 from quant_demo.db.session import create_session_factory
 from quant_demo.experiment.qmt_microcap_trading import QmtMicrocapTradingEngine
 
@@ -66,13 +66,14 @@ def _seconds_until(target_hhmm: str, now: datetime) -> float:
     return (target_dt - now).total_seconds()
 
 
-def _summarize_preview_orders(payload: dict) -> dict:
+def _summarize_preview_orders(payload: dict, qmt_client_name: str = "") -> dict:
     orders = list(payload.get("preview_orders") or [])
     target_meta = dict(payload.get("target_meta") or {})
     buy_orders = [item for item in orders if str(item.get("side") or "").lower() == "buy"]
     sell_orders = [item for item in orders if str(item.get("side") or "").lower() == "sell"]
     return {
         "preview_order_count": len(orders),
+        "qmt_client_name": qmt_client_name,
         "buy_order_count": len(buy_orders),
         "sell_order_count": len(sell_orders),
         "buy_symbols": [str(item.get("symbol") or "") for item in buy_orders],
@@ -104,7 +105,7 @@ def _run_preview_quietly(engine: QmtMicrocapTradingEngine, initial_cash: Decimal
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行微盘股 T+1 定时仿真交易")
     parser.add_argument("--config", default=str(ROOT / "configs" / "paper.yaml"))
-    parser.add_argument("--strategy", default=str(ROOT / "configs" / "strategy" / "joinquant_microcap_alpha.yaml"))
+    parser.add_argument("--strategy", default="")
     parser.add_argument("--capital", default="100000")
     parser.add_argument("--plan", default="")
     parser.add_argument("--execute-at", default="09:35")
@@ -113,7 +114,12 @@ def main() -> None:
     args = parser.parse_args()
 
     app_settings = load_app_settings(args.config)
-    strategy_settings = load_strategy_settings(args.strategy)
+    strategy_path = resolve_strategy_config_path(
+        args.strategy,
+        ROOT / "configs" / "strategy",
+        default_implementation=app_settings.default_strategy,
+    )
+    strategy_settings = load_strategy_settings(strategy_path)
     session_factory = create_session_factory(app_settings.database_url)
     initial_cash = Decimal(str(args.capital))
     engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
@@ -153,12 +159,13 @@ def main() -> None:
         raise RuntimeError(f"今天 {today} 的执行回执已存在，疑似已经执行过，回执文件: {receipt_path}")
 
     preview_order_count = len(plan_payload.get("preview_orders") or [])
-    preview_summary = _summarize_preview_orders(plan_payload)
+    preview_summary = _summarize_preview_orders(plan_payload, app_settings.qmt_client_name)
     if preview_order_count <= 0:
         print(
             json.dumps(
                 {
                     "environment": app_settings.environment.value,
+                    "qmt_client_name": app_settings.qmt_client_name,
                     "mode": "timed-execute",
                     "plan_path": str(plan_path),
                     "signal_trade_date": signal_trade_date,
@@ -181,6 +188,7 @@ def main() -> None:
             json.dumps(
                 {
                     "environment": app_settings.environment.value,
+                    "qmt_client_name": app_settings.qmt_client_name,
                     "mode": "timed-execute",
                     "plan_path": str(plan_path),
                     "signal_trade_date": signal_trade_date,
@@ -204,6 +212,7 @@ def main() -> None:
             json.dumps(
                 {
                     "environment": app_settings.environment.value,
+                    "qmt_client_name": app_settings.qmt_client_name,
                     "mode": "timed-execute",
                     "plan_path": str(plan_path),
                     "signal_trade_date": signal_trade_date,
@@ -223,6 +232,7 @@ def main() -> None:
         json.dumps(
             {
                 "environment": app_settings.environment.value,
+                "qmt_client_name": app_settings.qmt_client_name,
                 "mode": "timed-execute",
                 "report_path": str(report_path),
                 "signal_trade_date": signal_trade_date,

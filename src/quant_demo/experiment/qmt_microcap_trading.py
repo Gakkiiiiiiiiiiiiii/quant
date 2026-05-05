@@ -13,6 +13,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
 
 from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient
+from quant_demo.adapters.qmt.gateway import QmtBrokerClient, create_bridge_client
 from quant_demo.audit.report_service import AuditReportService
 from quant_demo.core.config import AppSettings, StrategySettings
 from quant_demo.core.enums import Environment, IntentSource, OrderSide
@@ -87,6 +88,13 @@ class QmtMicrocapTradingEngine:
     def _normalize_trade_date(raw_value: Any) -> pd.Timestamp:
         return pd.Timestamp(pd.to_datetime(raw_value, errors="coerce")).normalize()
 
+    def _protected_sell_symbols(self) -> set[str]:
+        return {
+            str(symbol).strip()
+            for symbol in (self.app_settings.qmt_protected_sell_symbols or [])
+            if str(symbol).strip()
+        }
+
     def _load_current_special_treatment_flags(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
         normalized_symbols = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
         if not normalized_symbols:
@@ -133,6 +141,8 @@ class QmtMicrocapTradingEngine:
             symbol = str(item.get("symbol") or "").strip()
             if not symbol:
                 continue
+            if bool(item.get("block_buy")):
+                blocked_buy_symbols.add(symbol)
             risk_stage = str(item.get("risk_stage") or "").strip().lower()
             expected_effective_date = pd.to_datetime(item.get("expected_effective_date"), errors="coerce")
             if risk_stage != "final" or pd.isna(expected_effective_date):
@@ -171,12 +181,18 @@ class QmtMicrocapTradingEngine:
                 details[symbol] = dict(item)
         return details
 
-    def __init__(self, session_factory: sessionmaker, app_settings: AppSettings, strategy_settings: StrategySettings) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        app_settings: AppSettings,
+        strategy_settings: StrategySettings,
+        bridge_client: QmtBrokerClient | None = None,
+    ) -> None:
         self.session_factory = session_factory
         self.app_settings = app_settings
         self.strategy_settings = strategy_settings
         self.cfg = MicrocapStrategyConfig.from_strategy_settings(strategy_settings)
-        self.bridge = QmtBridgeClient(app_settings)
+        self.bridge = bridge_client or create_bridge_client(app_settings)
 
     def _now_local(self) -> datetime:
         return datetime.now()
@@ -200,16 +216,32 @@ class QmtMicrocapTradingEngine:
             allow_quote_fallback=True,
             prefer_quote_fallback=True,
             require_realtime_positions=True,
+            assume_all_positions_available_next_session=True,
         )
+        planned_orders, blocked_sell_symbols = self._filter_protected_sell_orders(context["planned_orders"])
         plan_payload = self._build_plan_payload(
             latest_date=context["latest_date"],
             strategy_total_asset=context["strategy_total_asset"],
             target_meta=context["target_meta"],
-            planned_orders=context["planned_orders"],
+            planned_orders=planned_orders,
             live_state=context["live_state"],
         )
+        plan_payload["blocked_sell_symbols"] = blocked_sell_symbols
         plan_path = self._write_trade_plan(plan_payload)
         return plan_path, plan_payload
+
+    def _filter_protected_sell_orders(self, planned_orders: list[PlannedOrder]) -> tuple[list[PlannedOrder], list[str]]:
+        protected_sell_symbols = self._protected_sell_symbols()
+        if not protected_sell_symbols:
+            return planned_orders, []
+        remaining_orders: list[PlannedOrder] = []
+        blocked_symbols: list[str] = []
+        for item in planned_orders:
+            if item.side == OrderSide.SELL and item.symbol in protected_sell_symbols:
+                blocked_symbols.append(item.symbol)
+                continue
+            remaining_orders.append(item)
+        return remaining_orders, sorted(set(blocked_symbols))
 
     def execute_plan(self, plan_path: str | Path) -> tuple[Path, EvaluationResult, pd.DataFrame]:
         payload = self._load_trade_plan(plan_path)
@@ -221,26 +253,45 @@ class QmtMicrocapTradingEngine:
         if expected_signal_date and expected_signal_date != actual_signal_date:
             raise RuntimeError(f"计划信号日为 {expected_signal_date}，当前可执行信号日为 {actual_signal_date}，请先重新生成计划")
         planned_orders = self._planned_orders_from_payload(payload)
+        planned_orders, protected_sell_symbols = self._filter_protected_sell_orders(planned_orders)
         fallback_prices = {item.symbol: item.price for item in planned_orders}
         account_snapshot = self.bridge.get_account_snapshot()
         live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
+        protected_sell_cancellations = self._cancel_protected_sell_open_orders(
+            account_snapshot=account_snapshot,
+            trade_date=str(payload.get("planned_execution_date") or "").strip(),
+        )
         stale_cancellations = self._cancel_stale_open_orders(
             account_snapshot=account_snapshot,
             trade_date=str(payload.get("planned_execution_date") or "").strip(),
         )
         planned_orders, execution_day_st_summary = self._recheck_execution_day_special_treatment(payload, planned_orders, live_state)
+        same_direction_cancellations = self._cancel_same_direction_open_orders(
+            account_snapshot=account_snapshot,
+            planned_orders=planned_orders,
+            trade_date=str(payload.get("planned_execution_date") or "").strip(),
+        )
+        if protected_sell_cancellations or stale_cancellations or same_direction_cancellations:
+            account_snapshot = self.bridge.get_account_snapshot()
+            live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
         self._emit_execution_log(
             "execution_day_special_treatment_recheck",
             planned_execution_date=str(payload.get("planned_execution_date") or "").strip(),
             blocked_buy_symbols=execution_day_st_summary["blocked_buy_symbols"],
             forced_exit_symbols=execution_day_st_summary["forced_exit_symbols"],
             skipped_unavailable_symbols=execution_day_st_summary["skipped_unavailable_symbols"],
+            skipped_halted_buy_symbols=execution_day_st_summary.get("skipped_halted_buy_symbols", []),
+            same_direction_canceled_symbols=[item["symbol"] for item in same_direction_cancellations],
+            protected_sell_symbols=protected_sell_symbols,
+            protected_sell_canceled_symbols=[item["symbol"] for item in protected_sell_cancellations],
+            blocked_sell_symbols=execution_day_st_summary.get("blocked_sell_symbols", []),
         )
         diff_summary = self._diff_plan_against_today_activity(
             account_snapshot=account_snapshot,
             planned_orders=planned_orders,
             planned_execution_date=str(payload.get("planned_execution_date") or "").strip(),
             stale_cancellations=stale_cancellations,
+            same_direction_cancellations=same_direction_cancellations,
         )
         planned_orders = diff_summary["remaining_orders"]
         self._emit_execution_log(
@@ -253,6 +304,8 @@ class QmtMicrocapTradingEngine:
             sell_count=sum(1 for item in planned_orders if item.side == OrderSide.SELL),
             buy_symbols=[item.symbol for item in planned_orders if item.side == OrderSide.BUY],
             sell_symbols=[item.symbol for item in planned_orders if item.side == OrderSide.SELL],
+            protected_sell_symbols=protected_sell_symbols,
+            blocked_sell_symbols=execution_day_st_summary.get("blocked_sell_symbols", []),
         )
         quote_symbols = sorted(set(fallback_prices) | set(live_state.positions))
         quotes = self._get_quotes_payload(quote_symbols, allow_quote_fallback=True)
@@ -393,6 +446,7 @@ class QmtMicrocapTradingEngine:
         prefer_snapshot_fallback: bool = False,
         prefer_quote_fallback: bool = False,
         require_realtime_positions: bool = False,
+        assume_all_positions_available_next_session: bool = False,
     ) -> dict[str, Any]:
         self._refresh_history()
         prepared, instrument_frame, loader = self._load_prepared_history()
@@ -416,6 +470,8 @@ class QmtMicrocapTradingEngine:
             require_realtime_positions=require_realtime_positions,
         )
         live_state, reported_total_asset = self._build_account_state(account_snapshot, fallback_prices)
+        if assume_all_positions_available_next_session:
+            live_state = self._normalize_preview_live_state_for_next_session(live_state)
         strategy_total_asset = self._resolve_strategy_total_asset(initial_cash, reported_total_asset)
         strategy_total_asset = self._apply_strategy_capital(live_state, strategy_total_asset, fallback_prices)
         day_frame = self._apply_st_risk_notice_state(day_frame, latest_date, live_state, loader)
@@ -502,6 +558,7 @@ class QmtMicrocapTradingEngine:
             "execution_day_buy_blocked_symbols": list(planned_target_meta.get("execution_day_buy_blocked_symbols") or []),
             "execution_day_forced_exit_symbols": list(planned_target_meta.get("execution_day_forced_exit_symbols") or []),
             "execution_day_forced_exit_details": list(planned_target_meta.get("execution_day_forced_exit_details") or []),
+            "forced_exit_untradable_symbols": list(planned_target_meta.get("forced_exit_untradable_symbols") or []),
         }
 
     def _refresh_history(self) -> None:
@@ -721,7 +778,13 @@ class QmtMicrocapTradingEngine:
         stock_holdings = list(live_state.positions)
         total_value = float(reported_total_asset)
         benchmark_close = self._load_benchmark_close_series()
-        effective_cfg, profile_meta = resolve_effective_microcap_config(latest_date, self.cfg, benchmark_close)
+        execution_date = pd.Timestamp(latest_date + pd.offsets.BDay(1)).normalize()
+        effective_cfg, profile_meta = resolve_effective_microcap_config(
+            latest_date,
+            self.cfg,
+            benchmark_close,
+            allocation_trade_date=execution_date,
+        )
         hedge_ratio = float(profile_meta["hedge_ratio"])
         invest_value = total_value * (1.0 - effective_cfg.cash_buffer)
         stock_invest_value = invest_value * (1.0 - hedge_ratio)
@@ -762,7 +825,7 @@ class QmtMicrocapTradingEngine:
                         }
                     )
         execution_controls = self._build_execution_day_special_treatment_controls(
-            execution_date=latest_date + pd.offsets.BDay(1),
+            execution_date=execution_date,
             live_state=live_state,
             target_symbols=target_stocks,
             risk_sell_watch=risk_sell_watch,
@@ -780,6 +843,7 @@ class QmtMicrocapTradingEngine:
         blocked_symbols = list(selection.get("st_risk_blocked_symbols") or [])
         return {
             "trade_date": latest_date.date().isoformat(),
+            "profile_trade_date": str(profile_meta.get("profile_trade_date") or execution_date.date().isoformat()),
             "targets": fitted_targets,
             "ranked_count": ranked_count,
             "target_count": target_count,
@@ -796,6 +860,7 @@ class QmtMicrocapTradingEngine:
             "bias12": float(profile_meta["bias12"]),
             "ret20": float(profile_meta["ret20"]),
             "drawdown60": float(profile_meta["drawdown60"]),
+            "signal_trade_date": str(profile_meta.get("signal_trade_date") or latest_date.date().isoformat()),
             "effective_target_hold_num": int(effective_cfg.target_hold_num),
             "effective_buy_rank": int(effective_cfg.buy_rank),
             "effective_keep_rank": int(effective_cfg.keep_rank),
@@ -806,6 +871,7 @@ class QmtMicrocapTradingEngine:
             "execution_day_buy_blocked_symbols": list(execution_controls["execution_day_buy_blocked_symbols"]),
             "execution_day_forced_exit_symbols": list(execution_controls["execution_day_forced_exit_symbols"]),
             "execution_day_forced_exit_details": list(execution_controls["execution_day_forced_exit_details"]),
+            "protected_sell_symbols": sorted(self._protected_sell_symbols()),
         }
 
     def _apply_st_risk_notice_state(
@@ -852,6 +918,7 @@ class QmtMicrocapTradingEngine:
             "target_meta": {
                 "trade_date": signal_trade_date,
                 "planned_execution_date": planned_execution_date,
+                "profile_trade_date": str(target_meta.get("profile_trade_date") or planned_execution_date),
                 "targets": list(target_meta.get("targets") or []),
                 "ranked_count": int(target_meta.get("ranked_count", 0) or 0),
                 "target_count": int(target_meta.get("target_count", 0) or 0),
@@ -868,6 +935,7 @@ class QmtMicrocapTradingEngine:
                 "bias12": float(target_meta.get("bias12", 0.0) or 0.0),
                 "ret20": float(target_meta.get("ret20", 0.0) or 0.0),
                 "drawdown60": float(target_meta.get("drawdown60", 0.0) or 0.0),
+                "signal_trade_date": str(target_meta.get("signal_trade_date") or signal_trade_date),
                 "effective_target_hold_num": int(target_meta.get("effective_target_hold_num", 0) or 0),
                 "effective_buy_rank": int(target_meta.get("effective_buy_rank", 0) or 0),
                 "effective_keep_rank": int(target_meta.get("effective_keep_rank", 0) or 0),
@@ -878,6 +946,8 @@ class QmtMicrocapTradingEngine:
                 "execution_day_buy_blocked_symbols": list(target_meta.get("execution_day_buy_blocked_symbols") or []),
                 "execution_day_forced_exit_symbols": list(target_meta.get("execution_day_forced_exit_symbols") or []),
                 "execution_day_forced_exit_details": list(target_meta.get("execution_day_forced_exit_details") or []),
+                "forced_exit_untradable_symbols": list(target_meta.get("forced_exit_untradable_symbols") or []),
+                "protected_sell_symbols": list(target_meta.get("protected_sell_symbols") or []),
             },
             "preview_orders": [
                 {
@@ -890,6 +960,7 @@ class QmtMicrocapTradingEngine:
                 }
                 for item in planned_orders
             ],
+            "blocked_sell_symbols": [],
             "current_positions": [
                 {
                     "symbol": item.symbol,
@@ -1001,6 +1072,7 @@ class QmtMicrocapTradingEngine:
                 "blocked_buy_symbols": [],
                 "forced_exit_symbols": [],
                 "skipped_unavailable_symbols": [],
+                "skipped_halted_buy_symbols": [],
             }
         execution_controls = self._build_execution_day_special_treatment_controls(
             execution_date=execution_date,
@@ -1010,6 +1082,7 @@ class QmtMicrocapTradingEngine:
         )
         blocked_buy_symbols = set(execution_controls["execution_day_buy_blocked_symbols"])
         forced_exit_symbols = set(execution_controls["execution_day_forced_exit_symbols"])
+        protected_sell_symbols = self._protected_sell_symbols()
         forced_exit_detail_map = {
             str(item.get("symbol") or ""): dict(item)
             for item in execution_controls["execution_day_forced_exit_details"]
@@ -1017,16 +1090,43 @@ class QmtMicrocapTradingEngine:
         }
         adjusted_orders: list[PlannedOrder] = []
         skipped_buy_symbols: list[str] = []
+        skipped_halted_buy_symbols: list[str] = []
         existing_sell_symbols: set[str] = set()
         for order in planned_orders:
             if order.side == OrderSide.BUY and order.symbol in blocked_buy_symbols:
                 skipped_buy_symbols.append(order.symbol)
                 continue
+            if order.side == OrderSide.SELL and order.symbol in protected_sell_symbols:
+                continue
             if order.side == OrderSide.SELL:
                 existing_sell_symbols.add(order.symbol)
             adjusted_orders.append(order)
+        pending_buy_symbols = sorted(
+            {
+                order.symbol
+                for order in adjusted_orders
+                if order.side == OrderSide.BUY and order.symbol not in blocked_buy_symbols
+            }
+        )
+        if pending_buy_symbols:
+            quotes = self._get_quotes_payload(pending_buy_symbols, allow_quote_fallback=True)
+            for symbol in pending_buy_symbols:
+                quote = quotes.get(symbol, {}) if isinstance(quotes, dict) else {}
+                if self._quote_indicates_halt(quote):
+                    blocked_buy_symbols.add(symbol)
+                    skipped_halted_buy_symbols.append(symbol)
+        if blocked_buy_symbols:
+            rechecked_orders: list[PlannedOrder] = []
+            for order in adjusted_orders:
+                if order.side == OrderSide.BUY and order.symbol in blocked_buy_symbols:
+                    skipped_buy_symbols.append(order.symbol)
+                    continue
+                rechecked_orders.append(order)
+            adjusted_orders = rechecked_orders
         skipped_unavailable_symbols: list[str] = []
         for symbol in sorted(forced_exit_symbols):
+            if symbol in protected_sell_symbols:
+                continue
             if symbol in existing_sell_symbols:
                 continue
             position = live_state.positions.get(symbol)
@@ -1047,6 +1147,14 @@ class QmtMicrocapTradingEngine:
             "blocked_buy_symbols": sorted(set(skipped_buy_symbols) | blocked_buy_symbols),
             "forced_exit_symbols": sorted(forced_exit_symbols),
             "skipped_unavailable_symbols": sorted(skipped_unavailable_symbols),
+            "skipped_halted_buy_symbols": sorted(set(skipped_halted_buy_symbols)),
+            "blocked_sell_symbols": sorted(
+                protected_sell_symbols
+                & (
+                    {item.symbol for item in planned_orders if item.side == OrderSide.SELL}
+                    | forced_exit_symbols
+                )
+            ),
         }
 
     def _diff_plan_against_today_activity(
@@ -1056,6 +1164,7 @@ class QmtMicrocapTradingEngine:
         planned_orders: list[PlannedOrder],
         planned_execution_date: str,
         stale_cancellations: list[dict[str, Any]] | None = None,
+        same_direction_cancellations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         activity_entries = self._extract_today_activity(account_snapshot, planned_execution_date)
         activity_qty: dict[tuple[str, str], int] = {}
@@ -1100,6 +1209,7 @@ class QmtMicrocapTradingEngine:
             "differences": differences,
             "existing_activity": activity_entries,
             "stale_cancellations": stale_cancellations or [],
+            "same_direction_cancellations": same_direction_cancellations or [],
             "remaining_orders": remaining_orders,
         }
 
@@ -1147,14 +1257,8 @@ class QmtMicrocapTradingEngine:
             )
             symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
             occurred_at = self._pick_text(item, "order_time", "created_at", "entrust_time", default="")
-            status_code = self._coerce_int(item.get("order_status", item.get("status")))
             traded_qty = int(round(self._pick_number(item, "traded_volume", "filled_qty", "volume", default=0.0)))
-            order_qty = int(round(self._pick_number(item, "order_volume", "qty", "volume", default=0.0)))
             qty = traded_qty
-            if qty <= 0 and not self._is_active_order_status(status_code):
-                qty = order_qty
-            if qty <= 0 and self._is_active_order_status(status_code) and not self._is_order_stale(item):
-                qty = order_qty
             if side not in {"buy", "sell"} or not symbol or qty <= 0 or not _match_trade_date(occurred_at):
                 continue
             broker_order_id = self._pick_text(item, "order_id", "order_sysid", "entrust_no", default="")
@@ -1195,6 +1299,107 @@ class QmtMicrocapTradingEngine:
                     "cancel_result": cancel_result,
                     "traded_volume": int(round(self._pick_number(item, "traded_volume", "filled_qty", default=0.0))),
                 }
+            )
+        return cancellations
+
+    def _cancel_same_direction_open_orders(
+        self,
+        account_snapshot: dict[str, Any],
+        planned_orders: list[PlannedOrder],
+        trade_date: str,
+    ) -> list[dict[str, Any]]:
+        cancellations: list[dict[str, Any]] = []
+        target_trade_date = pd.to_datetime(trade_date, errors="coerce")
+        planned_keys = {(item.symbol, item.side.value) for item in planned_orders}
+        if not planned_keys:
+            return cancellations
+        for item in account_snapshot.get("orders", []) or []:
+            status_code = self._coerce_int(item.get("order_status", item.get("status")))
+            if not self._is_active_order_status(status_code):
+                continue
+            side = self._normalize_activity_side(
+                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
+                or item.get("order_type")
+                or item.get("m_nOrderType")
+            )
+            symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
+            if (symbol, side) not in planned_keys:
+                continue
+            occurred_at = self._pick_text(item, "order_time", "created_at", "entrust_time", default="")
+            occurred_day = pd.to_datetime(occurred_at, errors="coerce")
+            if pd.notna(target_trade_date) and pd.notna(occurred_day) and occurred_day.date() != target_trade_date.date():
+                continue
+            order_qty = int(round(self._pick_number(item, "order_volume", "volume", "qty", "entrust_amount", default=0.0)))
+            traded_qty = int(round(self._pick_number(item, "traded_volume", "filled_qty", default=0.0)))
+            remaining_qty = max(order_qty - traded_qty, 0)
+            if remaining_qty <= 0:
+                continue
+            broker_order_id = self._pick_text(item, "order_id", "order_sysid", "entrust_no", default="")
+            cancel_result = self._cancel_broker_order(broker_order_id)
+            cancellations.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "broker_order_id": broker_order_id,
+                    "order_status": status_code,
+                    "cancel_result": cancel_result,
+                    "order_qty": order_qty,
+                    "traded_volume": traded_qty,
+                    "remaining_qty": remaining_qty,
+                    "reason": "same_direction_replace",
+                }
+            )
+            self._emit_execution_log(
+                "same_direction_open_order_cancelled",
+                symbol=symbol,
+                side=side,
+                broker_order_id=broker_order_id,
+                order_status=status_code,
+                remaining_qty=remaining_qty,
+                cancel_result=cancel_result,
+            )
+        return cancellations
+
+    def _cancel_protected_sell_open_orders(self, account_snapshot: dict[str, Any], trade_date: str) -> list[dict[str, Any]]:
+        cancellations: list[dict[str, Any]] = []
+        protected_sell_symbols = self._protected_sell_symbols()
+        if not protected_sell_symbols:
+            return cancellations
+        target_trade_date = pd.to_datetime(trade_date, errors="coerce")
+        for item in account_snapshot.get("orders", []) or []:
+            status_code = self._coerce_int(item.get("order_status", item.get("status")))
+            if not self._is_active_order_status(status_code):
+                continue
+            side = self._normalize_activity_side(
+                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
+                or item.get("order_type")
+                or item.get("m_nOrderType")
+            )
+            symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
+            if side != "sell" or symbol not in protected_sell_symbols:
+                continue
+            occurred_at = self._pick_text(item, "order_time", "created_at", "entrust_time", default="")
+            occurred_day = pd.to_datetime(occurred_at, errors="coerce")
+            if pd.notna(target_trade_date) and pd.notna(occurred_day) and occurred_day.date() != target_trade_date.date():
+                continue
+            broker_order_id = self._pick_text(item, "order_id", "order_sysid", "entrust_no", default="")
+            cancel_result = self._cancel_broker_order(broker_order_id)
+            cancellations.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "broker_order_id": broker_order_id,
+                    "order_status": status_code,
+                    "cancel_result": cancel_result,
+                    "reason": "protected_sell_cancel",
+                }
+            )
+            self._emit_execution_log(
+                "protected_sell_open_order_cancelled",
+                symbol=symbol,
+                broker_order_id=broker_order_id,
+                order_status=status_code,
+                cancel_result=cancel_result,
             )
         return cancellations
 
@@ -1278,15 +1483,21 @@ class QmtMicrocapTradingEngine:
         }
         target_set = set(target_meta["targets"])
         forced_exit_symbols = set(target_meta.get("execution_day_forced_exit_symbols") or [])
+        protected_sell_symbols = self._protected_sell_symbols()
         forced_exit_details = self._forced_exit_detail_map(target_meta)
         each_target_value = float(target_meta["each_target_value"])
         planning_state = self._clone_account_state(live_state)
         planned_orders: list[PlannedOrder] = []
+        forced_exit_untradable_symbols: set[str] = set()
 
         for symbol in list(planning_state.positions):
+            if symbol in protected_sell_symbols:
+                continue
             if symbol not in forced_exit_symbols and symbol in target_set:
                 continue
             if symbol not in day_frame.index:
+                if symbol in forced_exit_symbols:
+                    forced_exit_untradable_symbols.add(symbol)
                 continue
             position = planning_state.positions[symbol]
             sell_qty = available_trade_shares(
@@ -1297,10 +1508,14 @@ class QmtMicrocapTradingEngine:
                 is_buy=False,
             )
             if sell_qty <= 0:
+                if symbol in forced_exit_symbols:
+                    forced_exit_untradable_symbols.add(symbol)
                 continue
             row = day_frame.loc[symbol]
             sell_price = _plan_price(symbol, row)
             if not can_trade(symbol, latest_date, float(sell_price), volumes.get(symbol, 0.0), float(row.get("prev_close") or 0.0), is_buy=False):
+                if symbol in forced_exit_symbols:
+                    forced_exit_untradable_symbols.add(symbol)
                 continue
             order = PlannedOrder(
                 symbol=symbol,
@@ -1318,8 +1533,10 @@ class QmtMicrocapTradingEngine:
             self._apply_planned_order(planning_state, order)
             remaining_trade_capacity[symbol] = max(0, remaining_trade_capacity.get(symbol, 0) - sell_qty)
 
+        target_meta["forced_exit_untradable_symbols"] = sorted(forced_exit_untradable_symbols)
+
         for symbol in target_meta["targets"]:
-            if symbol in forced_exit_symbols or symbol not in planning_state.positions or symbol not in day_frame.index:
+            if symbol in protected_sell_symbols or symbol in forced_exit_symbols or symbol not in planning_state.positions or symbol not in day_frame.index:
                 continue
             position = planning_state.positions[symbol]
             row = day_frame.loc[symbol]
@@ -1358,6 +1575,8 @@ class QmtMicrocapTradingEngine:
             if symbol in forced_exit_symbols or symbol not in day_frame.index:
                 continue
             row = day_frame.loc[symbol]
+            if bool(row.get("st_preannounce_block_buy")):
+                continue
             buy_price = _plan_price(symbol, row)
             current_qty = planning_state.positions.get(symbol).qty if symbol in planning_state.positions else 0
             target_qty = calc_target_amount_by_value(symbol, each_target_value, float(buy_price))
@@ -1373,6 +1592,8 @@ class QmtMicrocapTradingEngine:
 
         for symbol, gap_value in buy_plan:
             row = day_frame.loc[symbol]
+            if bool(row.get("st_preannounce_block_buy")):
+                continue
             buy_price = _plan_price(symbol, row)
             current_qty = planning_state.positions.get(symbol).qty if symbol in planning_state.positions else 0
             target_qty = calc_target_amount_by_value(symbol, each_target_value, float(buy_price))
@@ -1435,7 +1656,7 @@ class QmtMicrocapTradingEngine:
             oms_service = OmsService(session)
             sell_orders = [item for item in planned_orders if item.side == OrderSide.SELL]
             buy_orders = [item for item in planned_orders if item.side == OrderSide.BUY]
-            turnover += self._submit_planned_order_batch(
+            sell_turnover, sell_pending_orders = self._submit_planned_order_batch(
                 sell_orders,
                 latest_date=latest_date,
                 planning_state=planning_state,
@@ -1445,10 +1666,12 @@ class QmtMicrocapTradingEngine:
                 oms_service=oms_service,
                 session=session,
                 qmt_enabled=qmt_enabled,
+                drain_pending=False,
             )
+            turnover += sell_turnover
             if qmt_enabled and sell_orders and buy_orders:
                 planning_state = self._refresh_planning_state_after_sell_batch(planning_state, prices, quotes, session)
-            turnover += self._submit_planned_order_batch(
+            buy_turnover, buy_pending_orders = self._submit_planned_order_batch(
                 buy_orders,
                 latest_date=latest_date,
                 planning_state=planning_state,
@@ -1458,7 +1681,13 @@ class QmtMicrocapTradingEngine:
                 oms_service=oms_service,
                 session=session,
                 qmt_enabled=qmt_enabled,
+                drain_pending=False,
             )
+            turnover += buy_turnover
+            if qmt_enabled:
+                pending_retry_orders = list(sell_pending_orders) + list(buy_pending_orders)
+                if pending_retry_orders:
+                    self._drain_pending_retry_orders(pending_retry_orders, prices, session)
 
             snapshot_payload = account_snapshot
             snapshot_source = "input_snapshot"
@@ -1563,7 +1792,8 @@ class QmtMicrocapTradingEngine:
         oms_service: OmsService,
         session,
         qmt_enabled: bool,
-    ) -> Decimal:
+        drain_pending: bool = True,
+    ) -> tuple[Decimal, list[PendingRetryOrder]]:
         turnover = Decimal("0")
         pending_retry_orders: list[PendingRetryOrder] = []
         for planned in planned_orders:
@@ -1668,9 +1898,10 @@ class QmtMicrocapTradingEngine:
                 )
             turnover += Decimal(str(executed_planned.qty)) * executed_planned.price
             self._apply_planned_order(planning_state, executed_planned)
-        if qmt_enabled and pending_retry_orders:
+        if qmt_enabled and drain_pending and pending_retry_orders:
             self._drain_pending_retry_orders(pending_retry_orders, prices, session)
-        return turnover
+            pending_retry_orders = []
+        return turnover, pending_retry_orders
 
     def _refresh_planning_state_after_sell_batch(
         self,
@@ -1685,21 +1916,45 @@ class QmtMicrocapTradingEngine:
             refreshed_quotes = self._get_quotes_payload(sorted(set(quotes) | set(refreshed_state.positions)), allow_quote_fallback=True)
             quotes.clear()
             quotes.update(refreshed_quotes)
+            merged_state = self._clone_account_state(planning_state)
+            merged_state.cash = max(Decimal(str(planning_state.cash)), Decimal(str(refreshed_state.cash)))
+            merged_state.frozen_cash = Decimal(str(refreshed_state.frozen_cash))
+            merged_state.peak_total_asset = max(
+                Decimal(str(planning_state.peak_total_asset)),
+                Decimal(str(refreshed_state.peak_total_asset)),
+            )
+            for symbol, position in refreshed_state.positions.items():
+                if symbol in merged_state.positions:
+                    merged_state.positions[symbol].available_qty = position.available_qty
+                    merged_state.positions[symbol].last_price = position.last_price
+                else:
+                    merged_state.positions[symbol] = Position(
+                        symbol=position.symbol,
+                        qty=position.qty,
+                        available_qty=position.available_qty,
+                        cost_price=Decimal(str(position.cost_price)),
+                        last_price=Decimal(str(position.last_price)),
+                    )
             self._emit_execution_log(
                 "sell_batch_refreshed_snapshot",
                 account_id=refreshed_state.account_id,
                 cash=float(refreshed_state.cash),
+                optimistic_cash=float(merged_state.cash),
                 position_count=len(refreshed_state.positions),
             )
             session.add(
                 AuditLogModel(
                     object_type="account_snapshot",
                     object_id=refreshed_state.account_id,
-                    message="卖出批次后已刷新账户状态，后续买单将基于最新账户快照评估",
-                    payload={"positions": len(refreshed_state.positions), "cash": float(refreshed_state.cash)},
+                    message="卖出批次后已刷新账户状态，后续买单将基于最新快照与卖出乐观现金合并评估",
+                    payload={
+                        "positions": len(refreshed_state.positions),
+                        "cash": float(refreshed_state.cash),
+                        "optimistic_cash": float(merged_state.cash),
+                    },
                 )
             )
-            return self._clone_account_state(refreshed_state)
+            return merged_state
         except QmtUnavailableError as exc:
             self._emit_execution_log(
                 "sell_batch_refresh_failed",
@@ -1867,6 +2122,34 @@ class QmtMicrocapTradingEngine:
                 refreshed_price, refreshed_price_source = self._resolve_submit_price(pending.planned, prices)
                 should_requote = pending.price_source == "plan_fallback" and refreshed_price_source != "plan_fallback"
                 canceled_active_order = False
+                if wait_result.get("is_active", False) and pending.planned.side == OrderSide.SELL:
+                    latest_quote = self._get_quotes_payload([pending.planned.symbol], allow_quote_fallback=True).get(pending.planned.symbol, {})
+                    hold_special_treatment_exit = pending.planned.reason == "execution_day_special_treatment_exit"
+                    if self._quote_indicates_limit_down(latest_quote) or hold_special_treatment_exit:
+                        session.add(
+                            AuditLogModel(
+                                object_type="order_retry",
+                                object_id=pending.broker_order_id or pending.planned.symbol,
+                                message=f"{pending.planned.symbol} 卖单检测到跌停或属于特殊处理强制卖出，保留当前挂单，不执行撤单补挂",
+                                payload={
+                                    "attempt": pending.attempts,
+                                    "remaining_qty": remaining_qty,
+                                    "price_source": pending.price_source,
+                                    "reason": pending.planned.reason,
+                                    "limit_down_detected": self._quote_indicates_limit_down(latest_quote),
+                                },
+                            )
+                        )
+                        self._emit_execution_log(
+                            "pending_order_limit_down_hold",
+                            symbol=pending.planned.symbol,
+                            side=pending.planned.side.value,
+                            attempt=pending.attempts,
+                            broker_order_id=pending.broker_order_id,
+                            remaining_qty=remaining_qty,
+                            reason=pending.planned.reason,
+                        )
+                        continue
                 if should_requote and wait_result.get("is_active", False):
                     cancel_result = self._cancel_broker_order(pending.broker_order_id)
                     session.add(
@@ -2273,6 +2556,13 @@ class QmtMicrocapTradingEngine:
             peak_total_asset=Decimal(str(state.peak_total_asset)),
         )
 
+    def _normalize_preview_live_state_for_next_session(self, state: AccountState) -> AccountState:
+        normalized = self._clone_account_state(state)
+        for position in normalized.positions.values():
+            # 预览的是下一交易日计划，收盘后当日买入的仓位到次日开盘即转为可卖。
+            position.available_qty = max(position.available_qty, position.qty)
+        return normalized
+
     def _apply_planned_order(self, state: AccountState, planned: PlannedOrder) -> None:
         notional = Decimal(str(planned.qty)) * planned.price
         if planned.side == OrderSide.BUY:
@@ -2376,6 +2666,52 @@ class QmtMicrocapTradingEngine:
         if pd.isna(number) or number == float("inf") or number == float("-inf"):
             return 0.0
         return number
+
+    @staticmethod
+    def _coerce_boolish(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value or "").strip().lower()
+        return text in {"1", "true", "yes", "y", "on", "halt", "paused", "suspended", "停牌"}
+
+    @classmethod
+    def _quote_indicates_halt(cls, quote: dict[str, Any]) -> bool:
+        if not isinstance(quote, dict) or not quote:
+            return False
+        for key in (
+            "paused",
+            "is_paused",
+            "suspended",
+            "is_suspended",
+            "halted",
+            "is_halted",
+            "停牌",
+            "是否停牌",
+        ):
+            if key in quote and cls._coerce_boolish(quote.get(key)):
+                return True
+        status_text = cls._pick_text(quote, "status", "trade_status", "security_status", default="").lower()
+        return any(token in status_text for token in ("halt", "pause", "suspend", "停牌"))
+
+    @classmethod
+    def _quote_indicates_limit_down(cls, quote: dict[str, Any]) -> bool:
+        if not isinstance(quote, dict) or not quote:
+            return False
+        low_limit = cls._pick_number(quote, "low_limit", "limit_down", "跌停价", default=0.0)
+        if low_limit <= 0:
+            return False
+        last_price = cls._pick_number(quote, "last_price", "price", default=0.0)
+        bid_price = cls._pick_number(quote, "bid_price", "bid1", "buy1_price", default=0.0)
+        compare_price = 0.0
+        if bid_price > 0:
+            compare_price = bid_price
+        elif last_price > 0:
+            compare_price = last_price
+        else:
+            compare_price = low_limit
+        return compare_price <= low_limit * 1.001
 
     def _reset_non_live_state(self, session) -> None:
         if self.app_settings.environment == Environment.LIVE:
