@@ -796,7 +796,12 @@ class QmtMicrocapTradingEngine:
         total_value = float(reported_total_asset)
         benchmark_close = self._load_benchmark_close_series()
         execution_date = self._next_cn_trading_day(latest_date)
-        effective_cfg, profile_meta = resolve_effective_microcap_config(latest_date, self.cfg, benchmark_close)
+        effective_cfg, profile_meta = resolve_effective_microcap_config(
+            latest_date,
+            self.cfg,
+            benchmark_close,
+            allocation_trade_date=execution_date,
+        )
         hedge_ratio = float(profile_meta["hedge_ratio"])
         invest_value = total_value * (1.0 - effective_cfg.cash_buffer)
         stock_invest_value = invest_value * (1.0 - hedge_ratio)
@@ -855,6 +860,8 @@ class QmtMicrocapTradingEngine:
         blocked_symbols = list(selection.get("st_risk_blocked_symbols") or [])
         return {
             "trade_date": latest_date.date().isoformat(),
+            "profile_trade_date": execution_date.date().isoformat(),
+            "signal_trade_date": latest_date.date().isoformat(),
             "targets": fitted_targets,
             "ranked_count": ranked_count,
             "target_count": target_count,
@@ -928,6 +935,8 @@ class QmtMicrocapTradingEngine:
             "target_meta": {
                 "trade_date": signal_trade_date,
                 "planned_execution_date": planned_execution_date,
+                "profile_trade_date": str(target_meta.get("profile_trade_date") or planned_execution_date),
+                "signal_trade_date": str(target_meta.get("signal_trade_date") or signal_trade_date),
                 "targets": list(target_meta.get("targets") or []),
                 "ranked_count": int(target_meta.get("ranked_count", 0) or 0),
                 "target_count": int(target_meta.get("target_count", 0) or 0),

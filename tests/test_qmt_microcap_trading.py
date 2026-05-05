@@ -1059,9 +1059,15 @@ def test_qmt_microcap_trading_engine_preview_writes_t1_plan_without_submitting(t
     assert payload["planned_execution_date"] == "2026-04-13"
     assert payload["strategy_total_asset"] == 100000.0
     assert len(payload["preview_orders"]) == 1
+    assert payload["target_meta"]["profile_trade_date"] == "2026-04-13"
+    assert payload["target_meta"]["signal_trade_date"] == "2026-04-10"
+    assert payload["target_meta"]["profile_name"] == "default_schedule"
 
     stored = json.loads(plan_path.read_text(encoding="utf-8"))
     assert stored["target_meta"]["targets"] == ["AAA.SZ"]
+    assert stored["target_meta"]["profile_trade_date"] == "2026-04-13"
+    assert stored["target_meta"]["signal_trade_date"] == "2026-04-10"
+    assert stored["target_meta"]["profile_name"] == "default_schedule"
 
     with session_scope(session_factory) as session:
         orders = list(session.scalars(select(OrderModel)))
