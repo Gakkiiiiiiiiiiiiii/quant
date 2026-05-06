@@ -1074,6 +1074,65 @@ def test_qmt_microcap_trading_engine_preview_writes_t1_plan_without_submitting(t
     assert not orders
 
 
+def test_qmt_microcap_trading_engine_preview_replaces_halted_buy_targets(tmp_path: Path, monkeypatch) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    history_path = Path(app_settings.history_parquet)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_history(history_path)
+    session_factory = create_session_factory(app_settings.database_url)
+
+    instrument_frame = pd.DataFrame(
+        [
+            {"symbol": "AAA.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Alpha", "total_capital_current": 1_000_000.0},
+            {"symbol": "BBB.SZ", "open_date": pd.Timestamp("2010-01-01"), "instrument_name": "Beta", "total_capital_current": 2_000_000.0},
+        ]
+    )
+    capital_frame = pd.DataFrame(columns=["symbol", "effective_date", "total_capital", "circulating_capital", "free_float_capital"])
+
+    monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
+        lambda self, symbols: instrument_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
+        lambda self, symbols: capital_frame.copy(),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
+        lambda self: {
+            "account_id": "paper-account",
+            "asset": {"cash": 100000.0, "frozen_cash": 0.0, "total_asset": 100000.0},
+            "positions": [],
+            "orders": [],
+            "trades": [],
+        },
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_instrument_details",
+        lambda self, symbols: {
+            "AAA.SZ": {"status": "停牌"},
+            "BBB.SZ": {"status": "交易中"},
+        },
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
+        lambda self, symbols: {
+            "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000, "status": "停牌"},
+            "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000, "status": "交易中"},
+        },
+    )
+
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+    _plan_path, payload = engine.preview(Decimal("100000"))
+
+    assert payload["target_meta"]["targets"] == ["BBB.SZ"]
+    assert payload["target_meta"]["preview_halted_buy_symbols"] == ["AAA.SZ"]
+    assert len(payload["preview_orders"]) == 1
+    assert payload["preview_orders"][0]["symbol"] == "BBB.SZ"
+
+
 def test_qmt_microcap_trading_engine_execute_plan_uses_saved_targets(tmp_path: Path, monkeypatch) -> None:
     app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
     strategy_settings = _build_strategy_settings()

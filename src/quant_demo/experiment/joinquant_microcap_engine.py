@@ -1714,7 +1714,7 @@ def build_portfolio_selection(
     cfg: MicrocapStrategyConfig,
 ) -> dict[str, Any]:
     if day_frame.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
+        return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     invest_value = float(total_value_open) * (1.0 - cfg.cash_buffer)
     slot_value = invest_value / float(cfg.target_hold_num)
     working = day_frame
@@ -1752,21 +1752,21 @@ def build_portfolio_selection(
         & working["market_cap_prev"].fillna(float("inf")).gt(0.0)
     ].copy()
     if working.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
+        return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     working["price_cap"] = working["symbol"].map(lambda symbol: get_dynamic_price_cap(symbol, slot_value, cfg))
     working = working[working["open"].le(working["price_cap"])].copy()
     if working.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
+        return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     if cfg.layer_rotation_enabled:
         working = _apply_market_cap_layers(working, cfg)
         if working.empty:
-            return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
+            return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     working, st_risk_blocked_symbols = _apply_st_risk_buy_filter(working, holdings)
     if working.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": len(st_risk_blocked_symbols), "st_risk_blocked_symbols": st_risk_blocked_symbols}
+        return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": len(st_risk_blocked_symbols), "st_risk_blocked_symbols": st_risk_blocked_symbols}
     working, zhuang_filtered_count = _apply_zhuang_buy_filter(working, holdings, cfg)
     if working.empty:
-        return {"targets": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": zhuang_filtered_count, "zhuang_replaced_count": 0, "st_risk_blocked_count": len(st_risk_blocked_symbols), "st_risk_blocked_symbols": st_risk_blocked_symbols}
+        return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": zhuang_filtered_count, "zhuang_replaced_count": 0, "st_risk_blocked_count": len(st_risk_blocked_symbols), "st_risk_blocked_symbols": st_risk_blocked_symbols}
     suspect_lookup = (
         working.set_index(working["symbol"].astype(str))["is_old_zhuang_suspect_prev"].fillna(False).astype(bool).to_dict()
         if "is_old_zhuang_suspect_prev" in working.columns
@@ -1816,6 +1816,7 @@ def build_portfolio_selection(
                 target, zhuang_replaced_count = _apply_zhuang_final_replacements(target[: cfg.target_hold_num], replace_ranked, holdings, suspect_lookup, cfg)
                 return {
                     "targets": target[: cfg.target_hold_num],
+                    "ranked_symbols": replace_ranked,
                     "ranked_count": int(len(working)),
                     "industry_allocations": [],
                     "layer_allocations": layer_allocations,
@@ -1872,6 +1873,7 @@ def build_portfolio_selection(
                 target, zhuang_replaced_count = _apply_zhuang_final_replacements(target[: cfg.target_hold_num], replace_ranked, holdings, suspect_lookup, cfg)
                 return {
                     "targets": target[: cfg.target_hold_num],
+                    "ranked_symbols": replace_ranked,
                     "ranked_count": int(len(working)),
                     "industry_allocations": allocations,
                     "layer_allocations": [],
@@ -1887,6 +1889,7 @@ def build_portfolio_selection(
             targets, zhuang_replaced_count = _apply_zhuang_final_replacements(targets, ranked, holdings, suspect_lookup, cfg)
             return {
                 "targets": targets,
+                "ranked_symbols": ranked,
                 "ranked_count": ranked_count,
                 "industry_allocations": [],
                 "layer_allocations": [],
@@ -1901,6 +1904,7 @@ def build_portfolio_selection(
     targets, zhuang_replaced_count = _apply_zhuang_final_replacements(targets, ranked, holdings, suspect_lookup, cfg)
     return {
         "targets": targets,
+        "ranked_symbols": ranked,
         "ranked_count": len(ranked),
         "industry_allocations": [],
         "layer_allocations": [],

@@ -71,6 +71,7 @@ def _build_preview_summary(payload: dict, qmt_client_name: str = "") -> dict:
         "st_risk_blocked_count": int(target_meta.get("st_risk_blocked_count", 0) or 0),
         "st_risk_blocked_symbols": list(target_meta.get("st_risk_blocked_symbols") or []),
         "st_risk_sell_watch": list(target_meta.get("st_risk_sell_watch") or []),
+        "preview_halted_buy_symbols": list(target_meta.get("preview_halted_buy_symbols") or []),
         "forced_exit_untradable_symbols": list(target_meta.get("forced_exit_untradable_symbols") or []),
     }
 

@@ -58,6 +58,8 @@ from quant_demo.risk.rules.position_limit import PositionLimitRule
 from quant_demo.risk.rules.trading_window import TradingWindowRule
 from quant_demo.risk.service import RiskService
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 
 @dataclass(slots=True)
 class PlannedOrder:
@@ -567,6 +569,7 @@ class QmtMicrocapTradingEngine:
             "st_risk_blocked_count": int(planned_target_meta.get("st_risk_blocked_count", 0) or 0),
             "st_risk_blocked_symbols": list(planned_target_meta.get("st_risk_blocked_symbols") or []),
             "st_risk_sell_watch": list(planned_target_meta.get("st_risk_sell_watch") or []),
+            "preview_halted_buy_symbols": list(planned_target_meta.get("preview_halted_buy_symbols") or []),
             "execution_day_buy_blocked_symbols": list(planned_target_meta.get("execution_day_buy_blocked_symbols") or []),
             "execution_day_forced_exit_symbols": list(planned_target_meta.get("execution_day_forced_exit_symbols") or []),
             "execution_day_forced_exit_details": list(planned_target_meta.get("execution_day_forced_exit_details") or []),
@@ -812,6 +815,7 @@ class QmtMicrocapTradingEngine:
             effective_cfg,
         )
         target_stocks = list(selection["targets"])
+        ranked_symbols = [str(symbol) for symbol in selection.get("ranked_symbols") or [] if str(symbol).strip()]
         ranked_count = int(selection["ranked_count"])
         price_lookup = {str(symbol): float(row.get("open") or 0.0) for symbol, row in day_frame.iterrows()}
         risk_sell_watch: list[dict[str, Any]] = []
@@ -848,7 +852,18 @@ class QmtMicrocapTradingEngine:
             risk_sell_watch=risk_sell_watch,
         )
         blocked_buy_symbols = set(execution_controls["execution_day_buy_blocked_symbols"])
-        eligible_targets = [symbol for symbol in target_stocks if symbol not in blocked_buy_symbols]
+        halted_buy_symbols = self._identify_halted_buy_symbols(ranked_symbols or target_stocks)
+        holding_set = set(stock_holdings)
+        eligible_targets: list[str] = []
+        for symbol in ranked_symbols or target_stocks:
+            normalized = str(symbol).strip()
+            if not normalized or normalized in eligible_targets:
+                continue
+            if normalized in blocked_buy_symbols:
+                continue
+            if normalized in halted_buy_symbols and normalized not in holding_set:
+                continue
+            eligible_targets.append(normalized)
         fitted_targets = fit_target_count_by_cash(
             eligible_targets,
             price_lookup=price_lookup,
@@ -885,6 +900,7 @@ class QmtMicrocapTradingEngine:
             "st_risk_blocked_count": int(selection.get("st_risk_blocked_count", len(blocked_symbols)) or 0),
             "st_risk_blocked_symbols": blocked_symbols,
             "st_risk_sell_watch": risk_sell_watch,
+            "preview_halted_buy_symbols": sorted(halted_buy_symbols - holding_set),
             "execution_day_buy_blocked_symbols": list(execution_controls["execution_day_buy_blocked_symbols"]),
             "execution_day_forced_exit_symbols": list(execution_controls["execution_day_forced_exit_symbols"]),
             "execution_day_forced_exit_details": list(execution_controls["execution_day_forced_exit_details"]),
@@ -960,6 +976,7 @@ class QmtMicrocapTradingEngine:
                 "st_risk_blocked_count": int(target_meta.get("st_risk_blocked_count", 0) or 0),
                 "st_risk_blocked_symbols": list(target_meta.get("st_risk_blocked_symbols") or []),
                 "st_risk_sell_watch": list(target_meta.get("st_risk_sell_watch") or []),
+                "preview_halted_buy_symbols": list(target_meta.get("preview_halted_buy_symbols") or []),
                 "execution_day_buy_blocked_symbols": list(target_meta.get("execution_day_buy_blocked_symbols") or []),
                 "execution_day_forced_exit_symbols": list(target_meta.get("execution_day_forced_exit_symbols") or []),
                 "execution_day_forced_exit_details": list(target_meta.get("execution_day_forced_exit_details") or []),
@@ -991,7 +1008,10 @@ class QmtMicrocapTradingEngine:
         }
 
     def _trade_plan_dir(self) -> Path:
-        return Path(self.app_settings.report_dir) / "trade_plans"
+        report_dir = Path(self.app_settings.report_dir)
+        if not report_dir.is_absolute():
+            report_dir = (PROJECT_ROOT / report_dir).resolve()
+        return report_dir / "trade_plans"
 
     def _write_trade_plan(self, payload: dict[str, Any]) -> Path:
         plan_dir = self._trade_plan_dir()
@@ -1006,15 +1026,25 @@ class QmtMicrocapTradingEngine:
         return dated_path
 
     def _load_trade_plan(self, plan_path: str | Path) -> dict[str, Any]:
-        path = Path(plan_path)
-        if not path.is_absolute():
-            path = (Path.cwd() / path).resolve()
-        if not path.exists():
-            latest_path = self._trade_plan_dir() / "microcap_t1_plan_latest.json"
-            if latest_path.exists():
+        latest_path = self._trade_plan_dir() / "microcap_t1_plan_latest.json"
+
+        raw_text = str(plan_path or "").strip()
+        if not raw_text:
+            path = latest_path
+        else:
+            path = Path(raw_text)
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            if path.is_dir():
+                candidate = path / "microcap_t1_plan_latest.json"
+                path = candidate if candidate.exists() else latest_path
+            elif not path.exists():
                 path = latest_path
-            else:
-                raise FileNotFoundError(f"未找到计划文件: {path}")
+
+        if not path.exists():
+            raise FileNotFoundError(f"未找到计划文件: {path}")
+        if path.is_dir():
+            raise IsADirectoryError(f"计划路径指向目录而不是文件: {path}")
         return json.loads(path.read_text(encoding="utf-8"))
 
     def _write_execution_receipt(
@@ -2711,6 +2741,56 @@ class QmtMicrocapTradingEngine:
                 return True
         status_text = cls._pick_text(quote, "status", "trade_status", "security_status", default="").lower()
         return any(token in status_text for token in ("halt", "pause", "suspend", "停牌"))
+
+    @classmethod
+    def _instrument_detail_indicates_halt(cls, detail: dict[str, Any]) -> bool:
+        if not isinstance(detail, dict) or not detail:
+            return False
+        for key in (
+            "paused",
+            "is_paused",
+            "suspended",
+            "is_suspended",
+            "halted",
+            "is_halted",
+            "StopFlag",
+            "IsSuspended",
+            "停牌",
+            "是否停牌",
+        ):
+            if key in detail and cls._coerce_boolish(detail.get(key)):
+                return True
+        status_text = cls._pick_text(
+            detail,
+            "status",
+            "Status",
+            "trade_status",
+            "TradeStatus",
+            "security_status",
+            "SecurityStatus",
+            default="",
+        ).lower()
+        return any(token in status_text for token in ("halt", "pause", "suspend", "停牌"))
+
+    def _identify_halted_buy_symbols(self, symbols: list[str]) -> set[str]:
+        normalized_symbols = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
+        if not normalized_symbols:
+            return set()
+        halted: set[str] = set()
+        try:
+            details = self.bridge.get_instrument_details(normalized_symbols)
+        except QmtUnavailableError:
+            details = {}
+        if isinstance(details, dict):
+            for symbol in normalized_symbols:
+                if self._instrument_detail_indicates_halt(details.get(symbol) or {}):
+                    halted.add(symbol)
+        quotes = self._get_quotes_payload(normalized_symbols, allow_quote_fallback=True)
+        if isinstance(quotes, dict):
+            for symbol in normalized_symbols:
+                if self._quote_indicates_halt(quotes.get(symbol) or {}):
+                    halted.add(symbol)
+        return halted
 
     @classmethod
     def _quote_indicates_limit_down(cls, quote: dict[str, Any]) -> bool:
