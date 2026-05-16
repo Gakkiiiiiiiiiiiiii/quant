@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
 from contextlib import redirect_stderr, redirect_stdout
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,55 @@ from quant_demo.db.models import (
 from quant_demo.experiment.evaluator import EvaluationResult, Evaluator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _json_scalar(value: Any) -> Any:
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except ValueError:
+            return value
+    return value
+
+
+def _jsonify(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _jsonify(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonify(item) for item in value]
+    if isinstance(value, tuple):
+        return [_jsonify(item) for item in value]
+    return _json_scalar(value)
+
+
+def _resolve_price_value(*candidates: Any, default: float = 0.0) -> float:
+    for candidate in candidates:
+        try:
+            if pd.isna(candidate):
+                continue
+        except TypeError:
+            pass
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(value) or math.isinf(value) or value <= 0:
+            continue
+        return value
+    return float(default)
 
 
 @dataclass(slots=True)
@@ -896,7 +946,6 @@ def _calendar_crash_base_profile(trade_date: pd.Timestamp) -> dict[str, Any]:
         "cash_weight": 0.00,
         "target_hold_num": 35,
         "buy_rank": 35,
-        "keep_rank": 60,
         "min_avg_money_20": 8_000_000.0,
     }
 
@@ -1074,14 +1123,15 @@ def resolve_effective_microcap_config(
                     "min_avg_money_20": 8_000_000.0,
                 }
             )
-    effective_cfg = replace(
-        cfg,
-        target_hold_num=int(profile["target_hold_num"]),
-        buy_rank=int(profile["buy_rank"]),
-        keep_rank=int(profile["keep_rank"]),
-        min_avg_money_20=float(profile["min_avg_money_20"]),
-        seasonal_hedge_schedule={int(allocation_date.month): float(profile["cash_weight"])},
-    )
+    effective_kwargs = {
+        "target_hold_num": int(profile["target_hold_num"]),
+        "buy_rank": int(profile["buy_rank"]),
+        "min_avg_money_20": float(profile["min_avg_money_20"]),
+        "seasonal_hedge_schedule": {int(allocation_date.month): float(profile["cash_weight"])},
+    }
+    if "keep_rank" in profile:
+        effective_kwargs["keep_rank"] = int(profile["keep_rank"])
+    effective_cfg = replace(cfg, **effective_kwargs)
     metadata = {
         "profile_name": str(profile["profile_name"]),
         "profile_type": profile_type,
@@ -1162,23 +1212,28 @@ def _select_from_ranked_symbols(ranked: list[str], holdings: list[str], target_c
         return []
     keep_rank = min(len(ranked), _scaled_rank_limit(cfg.keep_rank, target_count, cfg.target_hold_num))
     buy_rank = min(len(ranked), _scaled_rank_limit(cfg.buy_rank, target_count, cfg.target_hold_num))
+    ranked_set = set(ranked)
+    keep_rank_set = set(ranked[:keep_rank])
     target: list[str] = []
-    protected = [symbol for symbol in holdings if symbol in ranked]
-    for symbol in protected:
-        if symbol not in target:
+    # keep_rank 以内的持仓股优先保留
+    for symbol in holdings:
+        if symbol in keep_rank_set and symbol not in target:
             target.append(symbol)
         if len(target) >= target_count:
             return target[:target_count]
-    for symbol in ranked[:keep_rank]:
-        if symbol in holdings and symbol not in target:
+    # keep_rank 以外、仍在 ranked 中的持仓股保留（排名下滑但未完全出局）
+    for symbol in holdings:
+        if symbol in ranked_set and symbol not in keep_rank_set and symbol not in target:
             target.append(symbol)
         if len(target) >= target_count:
             return target[:target_count]
+    # buy_rank 以内的新候选
     for symbol in ranked[:buy_rank]:
         if symbol not in target:
             target.append(symbol)
         if len(target) >= target_count:
             return target[:target_count]
+    # 其余补满
     for symbol in ranked:
         if symbol not in target:
             target.append(symbol)
@@ -3045,11 +3100,21 @@ class JoinQuantMicrocapBacktestEngine:
                 remaining_trade_capacity[symbol] = int(
                     volume_units_to_shares(float(getattr(row, "avg_volume_20_prev", 0.0) or 0.0)) * active_cfg.max_trade_volume_ratio
                 )
-                price_lookup[symbol] = float(getattr(row, "open", 0.0) or 0.0)
+                price_lookup[symbol] = _resolve_price_value(
+                    getattr(row, "open", None),
+                    getattr(row, "prev_close", None),
+                    getattr(row, "close", None),
+                )
             open_value = cash
             for symbol, meta in holdings.items():
                 day_row = day_rows.get(symbol)
-                open_price = float(day_row.open) if day_row is not None else float(meta.get("last_close", meta["avg_cost"]))
+                open_price = _resolve_price_value(
+                    getattr(day_row, "open", None) if day_row is not None else None,
+                    getattr(day_row, "prev_close", None) if day_row is not None else None,
+                    getattr(day_row, "close", None) if day_row is not None else None,
+                    meta.get("last_close"),
+                    meta.get("avg_cost"),
+                )
                 open_value += int(meta["shares"]) * open_price
 
             stock_holdings = [symbol for symbol in holdings.keys() if symbol != overlay_symbol]
@@ -3399,7 +3464,7 @@ class JoinQuantMicrocapBacktestEngine:
                         continue
                     if not can_trade(symbol, trade_date, float(row.open), float(row.volume), float(row.prev_close or 0.0), is_buy=True):
                         continue
-                    open_price = float(row.open)
+                    open_price = _resolve_price_value(row.open, row.prev_close, row.close)
                     current_shares = int(holdings.get(symbol, {}).get("shares", 0))
                     target_shares = calc_target_amount_by_value(symbol, each_target_value, open_price)
                     desired_buy = max(int(target_shares) - int(current_shares), 0)
@@ -3441,9 +3506,10 @@ class JoinQuantMicrocapBacktestEngine:
                     total_cash = amount + fee
                     if total_cash > cash:
                         continue
+                    entry_price = _resolve_price_value(row.open, row.prev_close, row.close, buy_price)
                     position = holdings.setdefault(
                         symbol,
-                        {"shares": 0, "avg_cost": 0.0, "last_close": float(row.open), "hold_since": trade_date, "peak_close": float(row.open)},
+                        {"shares": 0, "avg_cost": 0.0, "last_close": entry_price, "hold_since": trade_date, "peak_close": entry_price},
                     )
                     prev_shares = int(position["shares"])
                     new_shares = prev_shares + buy_shares
@@ -3475,7 +3541,13 @@ class JoinQuantMicrocapBacktestEngine:
             end_value = cash
             for symbol, meta in list(holdings.items()):
                 day_row = day_rows.get(symbol)
-                close_price = float(day_row.close) if day_row is not None else float(meta.get("last_close", meta["avg_cost"]))
+                close_price = _resolve_price_value(
+                    getattr(day_row, "close", None) if day_row is not None else None,
+                    getattr(day_row, "prev_close", None) if day_row is not None else None,
+                    getattr(day_row, "open", None) if day_row is not None else None,
+                    meta.get("last_close"),
+                    meta.get("avg_cost"),
+                )
                 meta["last_close"] = close_price
                 meta["peak_close"] = max(float(meta.get("peak_close", close_price) or close_price), close_price)
                 if int(meta["shares"]) <= 0:
@@ -3604,6 +3676,69 @@ class JoinQuantMicrocapBacktestEngine:
                     )
                 if position_rows:
                     session.bulk_insert_mappings(PositionSnapshotModel, position_rows)
+            if not trades.empty:
+                intent_rows = []
+                order_rows = []
+                trade_model_rows = []
+                for row in trades.to_dict(orient="records"):
+                    trade_time = datetime.combine(pd.Timestamp(row["trading_date"]).date(), datetime.min.time())
+                    order_intent_id = str(uuid4())
+                    order_id = str(uuid4())
+                    qty = int(row["shares"])
+                    price = Decimal(str(row["price"]))
+                    fee = Decimal(str(row.get("fee", 0.0)))
+                    side = str(row["side"]).strip().lower()
+                    intent_rows.append(
+                        {
+                            "order_intent_id": order_intent_id,
+                            "strategy_version_id": None,
+                            "account_id": self.account_id,
+                            "trading_date": pd.Timestamp(row["trading_date"]).date(),
+                            "symbol": str(row["symbol"]),
+                            "side": side,
+                            "qty": qty,
+                            "limit_price": price,
+                            "reference_price": price,
+                            "source": "strategy",
+                            "metadata_json": {"reason": str(row.get("reason", "")), "instrument_name": str(row.get("instrument_name", ""))},
+                            "created_at": trade_time,
+                        }
+                    )
+                    order_rows.append(
+                        {
+                            "order_id": order_id,
+                            "order_intent_id": order_intent_id,
+                            "risk_decision_id": None,
+                            "broker_order_id": None,
+                            "status": "filled",
+                            "account_id": self.account_id,
+                            "symbol": str(row["symbol"]),
+                            "side": side,
+                            "qty": qty,
+                            "filled_qty": qty,
+                            "avg_price": price,
+                            "created_at": trade_time,
+                            "updated_at": trade_time,
+                        }
+                    )
+                    trade_model_rows.append(
+                        {
+                            "trade_id": str(uuid4()),
+                            "order_id": order_id,
+                            "symbol": str(row["symbol"]),
+                            "side": side,
+                            "fill_qty": qty,
+                            "fill_price": price,
+                            "commission": fee,
+                            "trade_time": trade_time,
+                        }
+                    )
+                if intent_rows:
+                    session.bulk_insert_mappings(OrderIntentModel, intent_rows)
+                if order_rows:
+                    session.bulk_insert_mappings(OrderModel, order_rows)
+                if trade_model_rows:
+                    session.bulk_insert_mappings(TradeModel, trade_model_rows)
             summary_payload = {
                 "strategy": self.strategy_settings.implementation,
                 "history_start": self.app_settings.history_start,
@@ -3665,6 +3800,7 @@ class JoinQuantMicrocapBacktestEngine:
                     "停牌与当日无成交的识别仍依赖日线结果，无法完全复原 09:35 盘中可成交状态。",
                 ],
             }
+            summary_payload = _jsonify(summary_payload)
             session.bulk_insert_mappings(
                 AuditLogModel,
                 [

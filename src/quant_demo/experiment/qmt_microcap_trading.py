@@ -329,7 +329,8 @@ class QmtMicrocapTradingEngine:
         if not planned_orders:
             equity_curve = self._build_equity_curve_snapshot(pd.Timestamp(actual_signal_date), live_state, price_map, turnover=Decimal("0"))
             metrics = Evaluator().evaluate(equity_curve)
-            receipt_path = self._write_execution_receipt(payload, [], Path(plan_path), execution_summary=diff_summary)
+            final_execution_summary = self._attach_failed_order_summary({**diff_summary, "can_determine_failures": True, "execution_summary_error": ""})
+            receipt_path = self._write_execution_receipt(payload, [], Path(plan_path), execution_summary=final_execution_summary)
             self._emit_execution_log(
                 "execute_plan_noop",
                 receipt_path=str(receipt_path),
@@ -362,7 +363,23 @@ class QmtMicrocapTradingEngine:
             strategy_total_asset=strategy_total_asset,
         )
         metrics = Evaluator().evaluate(equity_curve)
-        self._write_execution_receipt(payload, planned_orders, report_path, execution_summary=diff_summary)
+        final_execution_summary = self._summarize_post_execution_activity(
+            planned_orders=planned_orders,
+            planned_execution_date=str(payload.get("planned_execution_date") or "").strip(),
+            stale_cancellations=stale_cancellations,
+            same_direction_cancellations=same_direction_cancellations,
+        )
+        receipt_path = self._write_execution_receipt(payload, planned_orders, report_path, execution_summary=final_execution_summary)
+        self._emit_execution_log(
+            "execute_plan_result_summary",
+            receipt_path=str(receipt_path),
+            signal_trade_date=expected_signal_date,
+            planned_execution_date=str(payload.get("planned_execution_date") or "").strip(),
+            can_determine_failures=bool(final_execution_summary.get("can_determine_failures", True)),
+            failed_buy_symbols=list(final_execution_summary.get("failed_buy_symbols") or []),
+            failed_sell_symbols=list(final_execution_summary.get("failed_sell_symbols") or []),
+            execution_summary_error=str(final_execution_summary.get("execution_summary_error") or ""),
+        )
         self._emit_execution_log(
             "execute_plan_finished",
             report_path=str(report_path),
@@ -845,17 +862,18 @@ class QmtMicrocapTradingEngine:
                             "url": str(getattr(row, "st_preannounce_url", "") or ""),
                         }
                     )
+        execution_check_symbols = ranked_symbols or target_stocks
         execution_controls = self._build_execution_day_special_treatment_controls(
             execution_date=execution_date,
             live_state=live_state,
-            target_symbols=target_stocks,
+            target_symbols=execution_check_symbols,
             risk_sell_watch=risk_sell_watch,
         )
         blocked_buy_symbols = set(execution_controls["execution_day_buy_blocked_symbols"])
-        halted_buy_symbols = self._identify_halted_buy_symbols(ranked_symbols or target_stocks)
+        halted_buy_symbols = self._identify_halted_buy_symbols(execution_check_symbols)
         holding_set = set(stock_holdings)
         eligible_targets: list[str] = []
-        for symbol in ranked_symbols or target_stocks:
+        for symbol in execution_check_symbols:
             normalized = str(symbol).strip()
             if not normalized or normalized in eligible_targets:
                 continue
@@ -1013,6 +1031,12 @@ class QmtMicrocapTradingEngine:
             report_dir = (PROJECT_ROOT / report_dir).resolve()
         return report_dir / "trade_plans"
 
+    def _resolve_execution_receipt_path(self, signal_trade_date: str, planned_execution_date: str) -> Path:
+        receipt_dir = self._trade_plan_dir()
+        signal_date = str(signal_trade_date or "").replace("-", "")
+        execution_date = str(planned_execution_date or "").replace("-", "")
+        return receipt_dir / f"microcap_t1_execution_{signal_date}_for_{execution_date}.json"
+
     def _write_trade_plan(self, payload: dict[str, Any]) -> Path:
         plan_dir = self._trade_plan_dir()
         plan_dir.mkdir(parents=True, exist_ok=True)
@@ -1074,11 +1098,11 @@ class QmtMicrocapTradingEngine:
                 for item in planned_orders
             ],
         }
-        receipt_dir = self._trade_plan_dir()
-        receipt_dir.mkdir(parents=True, exist_ok=True)
-        signal_date = str(plan_payload.get("signal_trade_date") or "").replace("-", "")
-        execution_date = str(plan_payload.get("planned_execution_date") or "").replace("-", "")
-        receipt_path = receipt_dir / f"microcap_t1_execution_{signal_date}_for_{execution_date}.json"
+        receipt_path = self._resolve_execution_receipt_path(
+            str(plan_payload.get("signal_trade_date") or "").strip(),
+            str(plan_payload.get("planned_execution_date") or "").strip(),
+        )
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
         receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
         return receipt_path
 
@@ -1274,11 +1298,7 @@ class QmtMicrocapTradingEngine:
 
         trades = account_snapshot.get("trades", []) or []
         for item in trades:
-            side = self._normalize_activity_side(
-                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
-                or item.get("order_type")
-                or item.get("m_nOrderType")
-            )
+            side = self._resolve_activity_side_from_payload(item)
             symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
             occurred_at = self._pick_text(item, "traded_time", "trade_time", "business_time", "成交时间", default="")
             qty = int(round(self._pick_number(item, "traded_volume", "fill_qty", "volume", "business_amount", "qty")))
@@ -1297,11 +1317,7 @@ class QmtMicrocapTradingEngine:
 
         orders = account_snapshot.get("orders", []) or []
         for item in orders:
-            side = self._normalize_activity_side(
-                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
-                or item.get("order_type")
-                or item.get("m_nOrderType")
-            )
+            side = self._resolve_activity_side_from_payload(item)
             symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
             occurred_at = self._pick_text(item, "order_time", "created_at", "entrust_time", default="")
             traded_qty = int(round(self._pick_number(item, "traded_volume", "filled_qty", "volume", default=0.0)))
@@ -1364,11 +1380,7 @@ class QmtMicrocapTradingEngine:
             status_code = self._coerce_int(item.get("order_status", item.get("status")))
             if not self._is_active_order_status(status_code):
                 continue
-            side = self._normalize_activity_side(
-                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
-                or item.get("order_type")
-                or item.get("m_nOrderType")
-            )
+            side = self._resolve_activity_side_from_payload(item)
             symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
             if (symbol, side) not in planned_keys:
                 continue
@@ -1417,11 +1429,7 @@ class QmtMicrocapTradingEngine:
             status_code = self._coerce_int(item.get("order_status", item.get("status")))
             if not self._is_active_order_status(status_code):
                 continue
-            side = self._normalize_activity_side(
-                self._pick_text(item, "side", "order_side", "direction", "entrust_bs", "bs_flag", "operation")
-                or item.get("order_type")
-                or item.get("m_nOrderType")
-            )
+            side = self._resolve_activity_side_from_payload(item)
             symbol = self._pick_text(item, "stock_code", "symbol", "ticker", "instrument_id")
             if side != "sell" or symbol not in protected_sell_symbols:
                 continue
@@ -1465,6 +1473,66 @@ class QmtMicrocapTradingEngine:
                 for item in serialized.get("remaining_orders") or []
             ]
         return serialized
+
+    @staticmethod
+    def _attach_failed_order_summary(payload: dict[str, Any]) -> dict[str, Any]:
+        serialized = dict(payload)
+        failed_orders: list[dict[str, Any]] = []
+        for item in serialized.get("differences") or []:
+            remaining_qty = int(item.get("remaining_qty") or 0)
+            if remaining_qty <= 0:
+                continue
+            failed_orders.append(
+                {
+                    "symbol": str(item.get("symbol") or ""),
+                    "side": str(item.get("side") or ""),
+                    "planned_qty": int(item.get("planned_qty") or 0),
+                    "existing_qty": int(item.get("existing_qty") or 0),
+                    "remaining_qty": remaining_qty,
+                    "reason": str(item.get("reason") or ""),
+                }
+            )
+        serialized["failed_orders"] = failed_orders
+        serialized["failed_buy_symbols"] = sorted({item["symbol"] for item in failed_orders if item["side"] == "buy" and item["symbol"]})
+        serialized["failed_sell_symbols"] = sorted({item["symbol"] for item in failed_orders if item["side"] == "sell" and item["symbol"]})
+        return serialized
+
+    def _summarize_post_execution_activity(
+        self,
+        *,
+        planned_orders: list[PlannedOrder],
+        planned_execution_date: str,
+        stale_cancellations: list[dict[str, Any]] | None = None,
+        same_direction_cancellations: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            account_snapshot = self.bridge.get_account_snapshot()
+        except QmtUnavailableError as exc:
+            return self._attach_failed_order_summary(
+                {
+                    "planned_order_count": len(planned_orders),
+                    "existing_activity_count": 0,
+                    "remaining_order_count": 0,
+                    "has_difference": False,
+                    "differences": [],
+                    "existing_activity": [],
+                    "stale_cancellations": stale_cancellations or [],
+                    "same_direction_cancellations": same_direction_cancellations or [],
+                    "remaining_orders": [],
+                    "can_determine_failures": False,
+                    "execution_summary_error": str(exc),
+                }
+            )
+        summary = self._diff_plan_against_today_activity(
+            account_snapshot=account_snapshot,
+            planned_orders=planned_orders,
+            planned_execution_date=planned_execution_date,
+            stale_cancellations=stale_cancellations,
+            same_direction_cancellations=same_direction_cancellations,
+        )
+        summary["can_determine_failures"] = True
+        summary["execution_summary_error"] = ""
+        return self._attach_failed_order_summary(summary)
 
     def _build_quote_maps_from_quotes(
         self,
@@ -2680,6 +2748,23 @@ class QmtMicrocapTradingEngine:
         if "卖" in raw:
             return "sell"
         return raw
+
+    @classmethod
+    def _resolve_activity_side_from_payload(cls, payload: dict[str, Any]) -> str:
+        candidates = [
+            payload.get("order_type"),
+            payload.get("m_nOrderType"),
+            payload.get("offset_flag"),
+            payload.get("m_nOffsetFlag"),
+            cls._pick_text(payload, "side", "order_side", "entrust_bs", "bs_flag", "operation"),
+            payload.get("direction"),
+            payload.get("m_nDirection"),
+        ]
+        for value in candidates:
+            side = cls._normalize_activity_side(value)
+            if side in {"buy", "sell"}:
+                return side
+        return ""
 
     @staticmethod
     def _pick_text(payload: dict[str, Any], *keys: str, default: str = "") -> str:

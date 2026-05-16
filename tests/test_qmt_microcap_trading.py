@@ -1205,6 +1205,42 @@ def test_qmt_microcap_trading_engine_execute_plan_uses_saved_targets(tmp_path: P
     assert receipt_path.exists()
 
 
+def test_qmt_microcap_trading_engine_extract_today_activity_prefers_order_type_over_direction(tmp_path: Path) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="live", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    session_factory = create_session_factory(app_settings.database_url)
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+
+    account_snapshot = {
+        "orders": [
+            {
+                "stock_code": "600303.SH",
+                "direction": 48,
+                "order_type": 24,
+                "offset_flag": 49,
+                "order_time": "2026-05-15 09:35:03",
+                "traded_volume": 900,
+            },
+            {
+                "stock_code": "300923.SZ",
+                "direction": 48,
+                "order_type": 23,
+                "offset_flag": 48,
+                "order_time": "2026-05-15 09:35:13",
+                "traded_volume": 100,
+            },
+        ],
+        "trades": [],
+    }
+
+    activity = engine._extract_today_activity(account_snapshot, "2026-05-15")
+    summary = {(item["symbol"], item["side"]): int(item["qty"]) for item in activity}
+
+    assert summary[("600303.SH", "sell")] == 900
+    assert summary[("300923.SZ", "buy")] == 100
+    assert ("600303.SH", "buy") not in summary
+
+
 def test_qmt_microcap_trading_engine_execute_plan_survives_post_submit_snapshot_timeout(tmp_path: Path, monkeypatch) -> None:
     app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
     strategy_settings = _build_strategy_settings()
