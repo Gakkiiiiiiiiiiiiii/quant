@@ -6,7 +6,7 @@ top_n: 35
 lot_size: 100
 target_hold_num: 35
 buy_rank: 35
-keep_rank: 60
+keep_rank: 80
 query_limit: 1500
 min_list_days: 60
 min_avg_money_20: 8000000

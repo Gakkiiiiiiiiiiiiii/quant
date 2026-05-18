@@ -85,7 +85,6 @@ class PendingRetryOrder:
 class QmtMicrocapTradingEngine:
     ORDER_RETRY_TIMEOUT_SECONDS = 60
     ORDER_RETRY_POLL_SECONDS = 5
-    ORDER_RETRY_MAX_ATTEMPTS = 3
 
     @staticmethod
     def _normalize_trade_date(raw_value: Any) -> pd.Timestamp:
@@ -2237,32 +2236,43 @@ class QmtMicrocapTradingEngine:
                 refreshed_price, refreshed_price_source = self._resolve_submit_price(pending.planned, prices)
                 should_requote = pending.price_source == "plan_fallback" and refreshed_price_source != "plan_fallback"
                 canceled_active_order = False
-                if wait_result.get("is_active", False) and pending.planned.side == OrderSide.SELL:
+                if wait_result.get("is_active", False):
                     latest_quote = self._get_quotes_payload([pending.planned.symbol], allow_quote_fallback=True).get(pending.planned.symbol, {})
-                    hold_special_treatment_exit = pending.planned.reason == "execution_day_special_treatment_exit"
-                    if self._quote_indicates_limit_down(latest_quote) or hold_special_treatment_exit:
+                    hold_special_treatment_exit = (
+                        pending.planned.side == OrderSide.SELL
+                        and pending.planned.reason == "execution_day_special_treatment_exit"
+                    )
+                    hold_limit_order = (
+                        (pending.planned.side == OrderSide.SELL and self._quote_indicates_limit_down(latest_quote))
+                        or (pending.planned.side == OrderSide.BUY and self._quote_indicates_limit_up(latest_quote))
+                    )
+                    if hold_limit_order or hold_special_treatment_exit:
+                        hold_reason = "limit_move" if hold_limit_order else "execution_day_special_treatment_exit"
                         session.add(
                             AuditLogModel(
                                 object_type="order_retry",
                                 object_id=pending.broker_order_id or pending.planned.symbol,
-                                message=f"{pending.planned.symbol} 卖单检测到跌停或属于特殊处理强制卖出，保留当前挂单，不执行撤单补挂",
+                                message=f"{pending.planned.symbol} 检测到涨跌停或属于特殊处理强制卖出，保留当前挂单，不执行撤单补挂",
                                 payload={
                                     "attempt": pending.attempts,
                                     "remaining_qty": remaining_qty,
                                     "price_source": pending.price_source,
                                     "reason": pending.planned.reason,
+                                    "hold_reason": hold_reason,
                                     "limit_down_detected": self._quote_indicates_limit_down(latest_quote),
+                                    "limit_up_detected": self._quote_indicates_limit_up(latest_quote),
                                 },
                             )
                         )
                         self._emit_execution_log(
-                            "pending_order_limit_down_hold",
+                            "pending_order_limit_hold",
                             symbol=pending.planned.symbol,
                             side=pending.planned.side.value,
                             attempt=pending.attempts,
                             broker_order_id=pending.broker_order_id,
                             remaining_qty=remaining_qty,
                             reason=pending.planned.reason,
+                            hold_reason=hold_reason,
                         )
                         continue
                 if should_requote and wait_result.get("is_active", False):
@@ -2333,23 +2343,6 @@ class QmtMicrocapTradingEngine:
                         pending.submitted_at = datetime.now()
                         next_round.append(pending)
                         continue
-                if pending.attempts >= self.ORDER_RETRY_MAX_ATTEMPTS:
-                    session.add(
-                        AuditLogModel(
-                            object_type="order_retry",
-                            object_id=pending.broker_order_id or pending.planned.symbol,
-                            message=f"{pending.planned.symbol} 未成交剩余数量已达到最大补挂次数，停止继续补挂",
-                            payload={"attempt": pending.attempts, "remaining_qty": remaining_qty},
-                        )
-                    )
-                    self._emit_execution_log(
-                        "pending_order_retry_stopped",
-                        symbol=pending.planned.symbol,
-                        side=pending.planned.side.value,
-                        attempt=pending.attempts,
-                        remaining_qty=remaining_qty,
-                    )
-                    continue
                 resubmit_result = self._submit_order_attempt(
                     pending.planned,
                     remaining_qty,
@@ -2894,6 +2887,24 @@ class QmtMicrocapTradingEngine:
         else:
             compare_price = low_limit
         return compare_price <= low_limit * 1.001
+
+    @classmethod
+    def _quote_indicates_limit_up(cls, quote: dict[str, Any]) -> bool:
+        if not isinstance(quote, dict) or not quote:
+            return False
+        high_limit = cls._pick_number(quote, "high_limit", "limit_up", "涨停价", default=0.0)
+        if high_limit <= 0:
+            return False
+        last_price = cls._pick_number(quote, "last_price", "price", default=0.0)
+        ask_price = cls._pick_number(quote, "ask_price", "ask1", "sell1_price", default=0.0)
+        compare_price = 0.0
+        if ask_price > 0:
+            compare_price = ask_price
+        elif last_price > 0:
+            compare_price = last_price
+        else:
+            compare_price = high_limit
+        return compare_price >= high_limit * 0.999
 
     def _reset_non_live_state(self, session) -> None:
         if self.app_settings.environment == Environment.LIVE:

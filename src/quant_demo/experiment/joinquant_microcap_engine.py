@@ -1208,22 +1208,20 @@ def _scaled_rank_limit(base_rank: int, target_count: int, total_target_count: in
 
 
 def _select_from_ranked_symbols(ranked: list[str], holdings: list[str], target_count: int, cfg: MicrocapStrategyConfig) -> list[str]:
+    """硬截断：只在 keep_rank 范围内的持仓股才保留，排名滑出 keep_rank 的不保留。
+
+    微盘策略按市值从小到大排序，排名下滑意味着市值涨大了，
+    应果断卖出换入更小标的，保持小盘纯度。
+    """
     if target_count <= 0 or not ranked:
         return []
     keep_rank = min(len(ranked), _scaled_rank_limit(cfg.keep_rank, target_count, cfg.target_hold_num))
     buy_rank = min(len(ranked), _scaled_rank_limit(cfg.buy_rank, target_count, cfg.target_hold_num))
-    ranked_set = set(ranked)
     keep_rank_set = set(ranked[:keep_rank])
     target: list[str] = []
-    # keep_rank 以内的持仓股优先保留
+    # keep_rank 范围内的持仓股保留
     for symbol in holdings:
         if symbol in keep_rank_set and symbol not in target:
-            target.append(symbol)
-        if len(target) >= target_count:
-            return target[:target_count]
-    # keep_rank 以外、仍在 ranked 中的持仓股保留（排名下滑但未完全出局）
-    for symbol in holdings:
-        if symbol in ranked_set and symbol not in keep_rank_set and symbol not in target:
             target.append(symbol)
         if len(target) >= target_count:
             return target[:target_count]

@@ -451,6 +451,134 @@ def test_qmt_microcap_trading_engine_keeps_limit_down_sell_order_without_cancel(
     assert resubmit_calls == []
 
 
+def test_qmt_microcap_trading_engine_keeps_limit_up_buy_order_without_cancel(tmp_path: Path, monkeypatch) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    session_factory = create_session_factory(app_settings.database_url)
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+
+    planned = engine._planned_orders_from_payload(
+        {
+            "preview_orders": [
+                {"symbol": "AAA.SZ", "side": "buy", "qty": 100, "price": 10.0, "reason": "rebalance_buy"},
+            ]
+        }
+    )[0]
+    pending = PendingRetryOrder(
+        planned=planned,
+        broker_order_id="limitup-1",
+        submitted_qty=100,
+        remaining_qty=100,
+        attempts=1,
+        submitted_at=datetime.now(),
+        price_source="best_ask",
+    )
+    cancel_calls: list[str] = []
+    resubmit_calls: list[int] = []
+
+    monkeypatch.setattr("quant_demo.experiment.qmt_microcap_trading.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        engine,
+        "_check_order_status_once",
+        lambda broker_order_id, submitted_qty: {
+            "status_available": True,
+            "status_text": "未成",
+            "status_code": 50,
+            "filled_qty": 0,
+            "is_active": True,
+            "timed_out": False,
+        },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_get_quotes_payload",
+        lambda symbols, allow_quote_fallback=True: {"AAA.SZ": {"high_limit": 10.0, "last_price": 10.0, "ask_price": [10.0]}},
+    )
+    monkeypatch.setattr(engine, "_cancel_broker_order", lambda broker_order_id: cancel_calls.append(str(broker_order_id)) or 0)
+
+    def _fake_submit(planned, submitted_qty, prices, session, *, attempts, quote=None):  # type: ignore[no-untyped-def]
+        resubmit_calls.append(submitted_qty)
+        return {
+            "broker_order_id": "limitup-2",
+            "attempts": attempts,
+            "remaining_qty": 0,
+            "pending_retry": False,
+            "pending_order": None,
+            "submitted_price": Decimal("10.0"),
+            "price_source": "best_ask",
+        }
+
+    monkeypatch.setattr(engine, "_submit_order_attempt", _fake_submit)
+
+    with session_scope(session_factory) as session:
+        engine._drain_pending_retry_orders([pending], {"AAA.SZ": Decimal("10.0")}, session)
+
+    assert cancel_calls == []
+    assert resubmit_calls == []
+
+
+def test_qmt_microcap_trading_engine_continues_retry_after_large_attempt_count(tmp_path: Path, monkeypatch) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    session_factory = create_session_factory(app_settings.database_url)
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+
+    planned = engine._planned_orders_from_payload(
+        {
+            "preview_orders": [
+                {"symbol": "AAA.SZ", "side": "buy", "qty": 100, "price": 10.0, "reason": "rebalance_buy"},
+            ]
+        }
+    )[0]
+    pending = PendingRetryOrder(
+        planned=planned,
+        broker_order_id="retry-999",
+        submitted_qty=100,
+        remaining_qty=100,
+        attempts=999,
+        submitted_at=datetime.now() - pd.Timedelta(seconds=120),
+        price_source="best_ask",
+    )
+    cancel_calls: list[str] = []
+    resubmit_calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr("quant_demo.experiment.qmt_microcap_trading.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        engine,
+        "_check_order_status_once",
+        lambda broker_order_id, submitted_qty: {
+            "status_available": True,
+            "status_text": "未成",
+            "status_code": 50,
+            "filled_qty": 0,
+            "is_active": True,
+            "timed_out": False,
+        },
+    )
+    monkeypatch.setattr(engine, "_cancel_broker_order", lambda broker_order_id: cancel_calls.append(str(broker_order_id)) or 0)
+    monkeypatch.setattr(engine, "_resolve_submit_price", lambda planned, prices, quote=None: (Decimal("10.23"), "best_ask"))
+
+    def _fake_submit(planned, submitted_qty, prices, session, *, attempts, quote=None):  # type: ignore[no-untyped-def]
+        resubmit_calls.append((submitted_qty, attempts))
+        return {
+            "broker_order_id": "retry-1000",
+            "attempts": attempts,
+            "remaining_qty": 0,
+            "pending_retry": False,
+            "pending_order": None,
+            "submitted_price": Decimal("10.23"),
+            "price_source": "best_ask",
+        }
+
+    monkeypatch.setattr(engine, "_submit_order_attempt", _fake_submit)
+
+    with session_scope(session_factory) as session:
+        engine._drain_pending_retry_orders([pending], {"AAA.SZ": Decimal("10.0")}, session)
+
+    assert cancel_calls == ["retry-999"]
+    assert resubmit_calls == [(100, 1000)]
+
+
 def test_qmt_microcap_trading_engine_keeps_special_treatment_exit_sell_order_without_cancel_when_quote_missing(tmp_path: Path, monkeypatch) -> None:
     app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
     strategy_settings = _build_strategy_settings()
