@@ -103,3 +103,12 @@ def test_quote_client_next_start_time_refetches_same_day_if_latest_matches_metad
     metadata = {"updated_at": "2026-04-21T12:32:34"}
 
     assert XtQuantQuoteClient._next_start_time(frame, metadata) == "20260421"
+
+
+def test_quote_client_prefers_cache_first_only_for_latest_day_incremental(tmp_path: Path) -> None:
+    settings, _history_path = _build_settings(tmp_path)
+    client = XtQuantQuoteClient(settings)
+
+    assert client._should_prefer_cache_first_history("20260422", "") is True
+    assert client._should_prefer_cache_first_history("20200101", "") is False
+    assert client._should_prefer_cache_first_history("20260422", "20260423") is False

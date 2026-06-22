@@ -284,6 +284,89 @@ def test_qmt_microcap_trading_engine_preview_uses_next_day_available_qty(tmp_pat
     assert state.positions["AAA.SZ"].available_qty == 100
 
 
+def test_qmt_microcap_trading_engine_build_target_metadata_preserves_keep_rank_holdings_during_cash_fit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    session_factory = create_session_factory(app_settings.database_url)
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+    engine.cfg.target_hold_num = 2
+    engine.cfg.buy_rank = 2
+    engine.cfg.keep_rank = 4
+
+    monkeypatch.setattr(engine, "_load_benchmark_close_series", lambda: pd.Series(dtype=float))
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.resolve_effective_microcap_config",
+        lambda *args, **kwargs: (
+            engine.cfg,
+            {
+                "hedge_ratio": 0.0,
+                "profile_name": "test_profile",
+                "profile_type": "unit_test",
+                "micro_weight": 1.0,
+                "cash_weight": 0.0,
+                "instant_crash_level": 0,
+                "crash_add_level": 0,
+                "bias12": 0.0,
+                "ret20": 0.0,
+                "drawdown60": 0.0,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "quant_demo.experiment.qmt_microcap_trading.build_portfolio_selection",
+        lambda *args, **kwargs: {
+            "targets": ["OLD.SZ", "NEW.SZ"],
+            "ranked_symbols": ["NEW.SZ", "ALT.SZ", "OLD.SZ"],
+            "ranked_count": 3,
+            "st_risk_blocked_symbols": [],
+            "st_risk_blocked_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_build_execution_day_special_treatment_controls",
+        lambda **kwargs: {
+            "execution_day_buy_blocked_symbols": [],
+            "execution_day_forced_exit_symbols": [],
+            "execution_day_forced_exit_details": [],
+        },
+    )
+    monkeypatch.setattr(engine, "_identify_halted_buy_symbols", lambda symbols: set())
+
+    live_state = AccountState(
+        account_id="paper-account",
+        cash=Decimal("100000"),
+        positions={
+            "OLD.SZ": Position(
+                symbol="OLD.SZ",
+                qty=100,
+                available_qty=100,
+                cost_price=Decimal("10.0"),
+                last_price=Decimal("10.0"),
+            )
+        },
+    )
+    day_frame = pd.DataFrame(
+        [
+            {"symbol": "OLD.SZ", "open": 10.0},
+            {"symbol": "NEW.SZ", "open": 10.0},
+            {"symbol": "ALT.SZ", "open": 10.0},
+        ]
+    ).set_index("symbol", drop=False)
+
+    target_meta = engine._build_target_metadata(
+        latest_date=pd.Timestamp("2026-05-18"),
+        day_frame=day_frame,
+        live_state=live_state,
+        reported_total_asset=Decimal("100000"),
+    )
+
+    assert target_meta["targets"] == ["OLD.SZ", "NEW.SZ"]
+
+
 def test_qmt_microcap_trading_engine_collects_forced_exit_untradable_symbols(tmp_path: Path) -> None:
     app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
     strategy_settings = _build_strategy_settings()
@@ -332,6 +415,55 @@ def test_qmt_microcap_trading_engine_collects_forced_exit_untradable_symbols(tmp
 
     assert planned_orders == []
     assert target_meta["forced_exit_untradable_symbols"] == ["AAA.SZ"]
+
+
+def test_qmt_microcap_trading_engine_does_not_trim_overweight_target_positions(tmp_path: Path) -> None:
+    app_settings = _build_app_settings(tmp_path, environment="paper", trade_enabled=True)
+    strategy_settings = _build_strategy_settings()
+    session_factory = create_session_factory(app_settings.database_url)
+    engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
+
+    target_meta = {
+        "targets": ["AAA.SZ"],
+        "each_target_value": 1000.0,
+        "execution_day_forced_exit_symbols": [],
+        "execution_day_forced_exit_details": [],
+    }
+    live_state = AccountState(
+        account_id="paper-account",
+        cash=Decimal("10000"),
+        frozen_cash=Decimal("0"),
+        positions={
+            "AAA.SZ": Position(
+                symbol="AAA.SZ",
+                qty=1000,
+                available_qty=1000,
+                cost_price=Decimal("10.0"),
+                last_price=Decimal("10.0"),
+            )
+        },
+    )
+    day_frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA.SZ",
+                "close": 10.0,
+                "prev_close": 10.0,
+                "avg_volume_20_prev": 1_000_000.0,
+            }
+        ]
+    ).set_index("symbol", drop=False)
+
+    planned_orders = engine._build_order_plan(
+        latest_date=pd.Timestamp("2026-04-30"),
+        day_frame=day_frame,
+        live_state=live_state,
+        prices={"AAA.SZ": Decimal("10.0")},
+        volumes={"AAA.SZ": 1_000_000.0},
+        target_meta=target_meta,
+    )
+
+    assert planned_orders == []
 
 
 def test_qmt_microcap_trading_engine_requotes_plan_fallback_order_when_best_quote_appears(tmp_path: Path, monkeypatch) -> None:

@@ -150,6 +150,7 @@ class XtQuantQuoteClient(QuoteClient):
         batches = self._iter_batches(symbols)
         total_batches = len(batches)
         cumulative_rows = 0
+        prefer_cache_first = self._should_prefer_cache_first_history(start_time, end_time)
         LOGGER.info(
             "开始抓取 QMT 历史批次: batches=%s batch_size=%s start=%s end=%s",
             total_batches,
@@ -168,6 +169,7 @@ class XtQuantQuoteClient(QuoteClient):
                 end_time=end_time,
                 dividend_type=self.settings.history_adjustment,
                 fill_data=self.settings.history_fill_data,
+                prefer_cache_first=prefer_cache_first,
             )
             elapsed = time.perf_counter() - started_at
             batch_rows = len(batch_frame)
@@ -199,6 +201,13 @@ class XtQuantQuoteClient(QuoteClient):
             str(frame["trading_date"].max()) if not frame.empty else "",
         )
         return frame.sort_values(["trading_date", "symbol"]).reset_index(drop=True)
+
+    def _should_prefer_cache_first_history(self, start_time: str, end_time: str) -> bool:
+        if self.settings.history_period != "1d":
+            return False
+        if not start_time or end_time:
+            return False
+        return str(start_time).strip() != str(self.settings.history_start or "").strip()
 
     def _resolve_mode(self, output_path: Path, signature: dict[str, Any], requested_mode: str) -> str:
         if requested_mode == "full":

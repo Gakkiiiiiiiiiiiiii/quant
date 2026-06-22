@@ -77,6 +77,34 @@ def _jsonify(value: Any) -> Any:
     return _json_scalar(value)
 
 
+def _normalize_open_date_series(values: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(values):
+        return pd.to_datetime(values, errors="coerce").dt.normalize()
+    def _parse_one(raw: Any) -> pd.Timestamp | pd.NaT:
+        text = "" if raw is None else str(raw).strip()
+        if text in {"", "0", "00000000", "nan", "NaT", "None"}:
+            return pd.NaT
+        if len(text) == 8 and text.isdigit():
+            return pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+        return pd.to_datetime(text, errors="coerce")
+
+    return pd.to_datetime(values.map(_parse_one), errors="coerce").dt.normalize()
+
+
+def _resolve_listing_reference_dates(
+    frame: pd.DataFrame,
+    instrument_base: pd.DataFrame,
+    capital_frame: pd.DataFrame,
+) -> pd.Series:
+    listing_dates = frame["symbol"].map(instrument_base["open_date"])
+    if not capital_frame.empty and "effective_date" in capital_frame.columns:
+        capital_dates = capital_frame.loc[:, ["symbol", "effective_date"]].copy()
+        capital_dates["effective_date"] = pd.to_datetime(capital_dates["effective_date"], errors="coerce").dt.normalize()
+        capital_min = capital_dates.dropna(subset=["effective_date"]).groupby("symbol", sort=False)["effective_date"].min()
+        listing_dates = listing_dates.fillna(frame["symbol"].map(capital_min))
+    return pd.to_datetime(listing_dates, errors="coerce").dt.normalize()
+
+
 def _resolve_price_value(*candidates: Any, default: float = 0.0) -> float:
     for candidate in candidates:
         try:
@@ -1003,6 +1031,8 @@ def _calendar_crash_locked_level(
     market_state = _calendar_crash_market_state(trade_date, benchmark_close, cfg)
     if profile_type == "full":
         return 0, market_state
+    if benchmark_close.empty or not isinstance(benchmark_close.index, pd.DatetimeIndex):
+        return 0, market_state
     month_start = trade_date.replace(day=1)
     locked_level = 0
     current_state = market_state
@@ -1207,21 +1237,61 @@ def _scaled_rank_limit(base_rank: int, target_count: int, total_target_count: in
     return max(target_count, scaled)
 
 
-def _select_from_ranked_symbols(ranked: list[str], holdings: list[str], target_count: int, cfg: MicrocapStrategyConfig) -> list[str]:
-    """硬截断：只在 keep_rank 范围内的持仓股才保留，排名滑出 keep_rank 的不保留。
+def _build_rising_hold_symbols(
+    ranked: list[str],
+    holdings: list[str],
+    target_count: int,
+    cfg: MicrocapStrategyConfig,
+    signal_frame: pd.DataFrame,
+) -> set[str]:
+    if target_count <= 0 or signal_frame.empty or "close" not in signal_frame.columns or "prev_close" not in signal_frame.columns:
+        return set()
+    keep_rank = min(len(ranked), _scaled_rank_limit(cfg.keep_rank, target_count, cfg.target_hold_num))
+    keep_rank_set = set(ranked[:keep_rank])
+    if "symbol" in signal_frame.columns:
+        price_frame = signal_frame.drop_duplicates("symbol", keep="last").set_index("symbol", drop=False)
+    else:
+        price_frame = signal_frame
+    rising_holds: set[str] = set()
+    for symbol in holdings:
+        normalized = str(symbol).strip()
+        if not normalized or normalized in keep_rank_set or normalized not in price_frame.index:
+            continue
+        row = price_frame.loc[normalized]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        close_price = _resolve_price_value(row.get("close"), default=0.0)
+        prev_close = _resolve_price_value(row.get("prev_close"), default=0.0)
+        if close_price > prev_close > 0.0:
+            rising_holds.add(normalized)
+    return rising_holds
+
+
+def _select_from_ranked_symbols(
+    ranked: list[str],
+    holdings: list[str],
+    target_count: int,
+    cfg: MicrocapStrategyConfig,
+    *,
+    rising_hold_symbols: set[str] | None = None,
+) -> list[str]:
+    """默认卖出逻辑：keep_rank 内保留；keep_rank 外若当日收涨则暂缓卖出，转跌后再卖。
 
     微盘策略按市值从小到大排序，排名下滑意味着市值涨大了，
-    应果断卖出换入更小标的，保持小盘纯度。
+    但微盘股常见一波快速拉升。为避免在上涨过程中过早卖飞，
+    排名滑出 keep_rank 的持仓若当日仍收涨，则继续持有；只有后续
+    仍在 keep_rank 外且信号日转跌时，才回到正常卖出流程。
     """
     if target_count <= 0 or not ranked:
         return []
     keep_rank = min(len(ranked), _scaled_rank_limit(cfg.keep_rank, target_count, cfg.target_hold_num))
     buy_rank = min(len(ranked), _scaled_rank_limit(cfg.buy_rank, target_count, cfg.target_hold_num))
     keep_rank_set = set(ranked[:keep_rank])
+    deferred_sell_symbols = set(rising_hold_symbols or set())
     target: list[str] = []
-    # keep_rank 范围内的持仓股保留
+    # keep_rank 范围内的持仓股保留；滑出 keep_rank 但信号日继续上涨的持仓暂缓卖出。
     for symbol in holdings:
-        if symbol in keep_rank_set and symbol not in target:
+        if (symbol in keep_rank_set or symbol in deferred_sell_symbols) and symbol not in target:
             target.append(symbol)
         if len(target) >= target_count:
             return target[:target_count]
@@ -1807,7 +1877,10 @@ def build_portfolio_selection(
     if working.empty:
         return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     working["price_cap"] = working["symbol"].map(lambda symbol: get_dynamic_price_cap(symbol, slot_value, cfg))
-    working = working[working["open"].le(working["price_cap"])].copy()
+    # Preview plans are priced off the signal-day close, so the target-universe
+    # affordability check should use the same close-based price reference.
+    affordability_price = working.get("close", working["open"]).fillna(working["open"])
+    working = working[affordability_price.le(working["price_cap"])].copy()
     if working.empty:
         return {"targets": [], "ranked_symbols": [], "ranked_count": 0, "industry_allocations": [], "layer_allocations": [], "zhuang_filtered_count": 0, "zhuang_replaced_count": 0, "st_risk_blocked_count": 0, "st_risk_blocked_symbols": []}
     if cfg.layer_rotation_enabled:
@@ -1847,7 +1920,14 @@ def build_portfolio_selection(
                 layer_rank_limit = max(slot_count * 3, local_keep_rank, local_buy_rank, slot_count + 5)
                 ranked = pool["symbol"].astype(str).head(layer_rank_limit).tolist()
                 held_layer = [symbol for symbol in holdings if symbol in set(pool["symbol"].astype(str))]
-                selected_symbols = _select_from_ranked_symbols(ranked, held_layer, slot_count, cfg)
+                rising_hold_symbols = _build_rising_hold_symbols(ranked, held_layer, slot_count, cfg, pool)
+                selected_symbols = _select_from_ranked_symbols(
+                    ranked,
+                    held_layer,
+                    slot_count,
+                    cfg,
+                    rising_hold_symbols=rising_hold_symbols,
+                )
                 for symbol in selected_symbols:
                     if symbol not in target:
                         target.append(symbol)
@@ -1904,7 +1984,14 @@ def build_portfolio_selection(
                 )
                 ranked = pool["symbol"].astype(str).head(industry_rank_limit).tolist()
                 held_industry = [symbol for symbol in holdings if symbol in set(pool["symbol"].astype(str))]
-                selected_symbols = _select_from_ranked_symbols(ranked, held_industry, slot_count, cfg)
+                rising_hold_symbols = _build_rising_hold_symbols(ranked, held_industry, slot_count, cfg, pool)
+                selected_symbols = _select_from_ranked_symbols(
+                    ranked,
+                    held_industry,
+                    slot_count,
+                    cfg,
+                    rising_hold_symbols=rising_hold_symbols,
+                )
                 for symbol in selected_symbols:
                     if symbol not in target:
                         target.append(symbol)
@@ -1938,7 +2025,14 @@ def build_portfolio_selection(
     if cfg.monster_prelude_enabled:
         ranked, ranked_count = _build_monster_prelude_ranked(working, holdings, cfg)
         if ranked:
-            targets = _select_from_ranked_symbols(ranked, holdings, cfg.target_hold_num, cfg)
+            rising_hold_symbols = _build_rising_hold_symbols(ranked, holdings, cfg.target_hold_num, cfg, working)
+            targets = _select_from_ranked_symbols(
+                ranked,
+                holdings,
+                cfg.target_hold_num,
+                cfg,
+                rising_hold_symbols=rising_hold_symbols,
+            )
             targets, zhuang_replaced_count = _apply_zhuang_final_replacements(targets, ranked, holdings, suspect_lookup, cfg)
             return {
                 "targets": targets,
@@ -1953,7 +2047,14 @@ def build_portfolio_selection(
             }
     working = working.sort_values(["market_cap_prev", "symbol"], ascending=[True, True]).head(cfg.query_limit).reset_index(drop=True)
     ranked = working["symbol"].astype(str).tolist()[:ranked_cap]
-    targets = _select_from_ranked_symbols(ranked, holdings, cfg.target_hold_num, cfg)
+    rising_hold_symbols = _build_rising_hold_symbols(ranked, holdings, cfg.target_hold_num, cfg, working)
+    targets = _select_from_ranked_symbols(
+        ranked,
+        holdings,
+        cfg.target_hold_num,
+        cfg,
+        rising_hold_symbols=rising_hold_symbols,
+    )
     targets, zhuang_replaced_count = _apply_zhuang_final_replacements(targets, ranked, holdings, suspect_lookup, cfg)
     return {
         "targets": targets,
@@ -2069,17 +2170,23 @@ class JoinQuantMicrocapBacktestEngine:
         frame["symbol"] = frame["symbol"].astype(str)
         return frame.loc[:, ["trading_date", "symbol", "open", "high", "low", "close", "volume", "amount"]].sort_values(["symbol", "trading_date"]).reset_index(drop=True)
 
-    def _load_instrument_frame(self, symbols: list[str]) -> pd.DataFrame:
+    def _load_instrument_frame(self, symbols: list[str], *, refresh_existing: bool = False) -> pd.DataFrame:
         cache_path = _resolve_path(self.cfg.instrument_cache_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cached = pd.DataFrame()
         if cache_path.exists():
             cached = pd.read_parquet(cache_path)
             cached["symbol"] = cached["symbol"].astype(str)
-        known = set(cached["symbol"].astype(str)) if not cached.empty else set()
-        missing = sorted(set(symbols) - known)
+        if "open_date" not in cached.columns:
+            cached["open_date"] = ""
+        invalid_open_date_symbols = set()
+        if not cached.empty:
+            invalid_open_date_mask = _normalize_open_date_series(cached["open_date"]).isna()
+            invalid_open_date_symbols = set(cached.loc[invalid_open_date_mask, "symbol"].astype(str))
+        known = set(cached["symbol"].astype(str)) - invalid_open_date_symbols if not cached.empty else set()
+        refresh_symbols = sorted(set(symbols)) if refresh_existing else sorted(set(symbols) - known)
         rows: list[dict[str, Any]] = []
-        for batch in _batched(missing, 200):
+        for batch in _batched(refresh_symbols, 200):
             details = self.bridge.get_instrument_details(batch)
             for symbol in batch:
                 payload = details.get(symbol) or {}
@@ -2094,13 +2201,15 @@ class JoinQuantMicrocapBacktestEngine:
                 )
         if rows:
             fresh = pd.DataFrame(rows)
+            if refresh_existing and not cached.empty:
+                cached = cached.loc[~cached["symbol"].astype(str).isin(set(refresh_symbols))].copy()
             combined = pd.concat([cached, fresh], ignore_index=True) if not cached.empty else fresh
             combined = combined.drop_duplicates("symbol", keep="last").sort_values("symbol").reset_index(drop=True)
             combined.to_parquet(cache_path, index=False)
             cached = combined
         if cached.empty:
             cached = pd.DataFrame(columns=["symbol", "instrument_name", "open_date", "total_capital_current", "float_capital_current"])
-        cached["open_date"] = pd.to_datetime(cached["open_date"], format="%Y%m%d", errors="coerce").dt.normalize()
+        cached["open_date"] = _normalize_open_date_series(cached["open_date"])
         cached["instrument_name"] = cached["instrument_name"].fillna("")
         cached = cached.drop_duplicates("symbol", keep="last").reset_index(drop=True)
         if self.cfg.industry_weighted_enabled:
@@ -2591,7 +2700,13 @@ class JoinQuantMicrocapBacktestEngine:
 
         return result.loc[:, ["symbol", "trading_date", "is_st_name", "is_star_st_name", "is_delisting_name"]].drop_duplicates(["symbol", "trading_date"], keep="last")
 
-    def _load_capital_frame(self, symbols: list[str]) -> pd.DataFrame:
+    def _load_capital_frame(
+        self,
+        symbols: list[str],
+        *,
+        refresh_existing: bool = False,
+        instrument_frame: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
         cache_path = _resolve_path(self.cfg.capital_cache_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cached = pd.DataFrame()
@@ -2624,6 +2739,37 @@ class JoinQuantMicrocapBacktestEngine:
                             "free_float_capital": float(item.get("freeFloatCapital") or 0.0),
                         }
                     )
+        if refresh_existing:
+            snapshot_source = instrument_frame
+            if snapshot_source is None or snapshot_source.empty:
+                snapshot_source = self._load_instrument_frame(symbols, refresh_existing=True)
+            if snapshot_source is not None and not snapshot_source.empty:
+                latest_history_date = pd.Timestamp(datetime.now().date())
+                history_parquet = str(getattr(self.app_settings, "history_parquet", "") or "").strip()
+                if history_parquet:
+                    history_path = _resolve_path(history_parquet)
+                    latest_history_frame = pd.read_parquet(history_path, columns=["trading_date"])
+                    latest_history_date = pd.to_datetime(latest_history_frame["trading_date"], errors="coerce").max()
+                if pd.notna(latest_history_date):
+                    latest_text = pd.Timestamp(latest_history_date).strftime("%Y%m%d")
+                    snapshot_rows = snapshot_source.copy()
+                    snapshot_rows["symbol"] = snapshot_rows["symbol"].astype(str)
+                    snapshot_rows = snapshot_rows[snapshot_rows["symbol"].isin(set(symbols))].copy()
+                    for item in snapshot_rows.to_dict(orient="records"):
+                        total_capital = float(item.get("total_capital_current") or 0.0)
+                        float_capital = float(item.get("float_capital_current") or 0.0)
+                        if total_capital <= 0.0:
+                            continue
+                        rows.append(
+                            {
+                                "symbol": str(item.get("symbol") or "").strip(),
+                                "announce_date": latest_text,
+                                "report_date": latest_text,
+                                "total_capital": total_capital,
+                                "circulating_capital": float_capital,
+                                "free_float_capital": float_capital,
+                            }
+                        )
         if rows:
             fresh = pd.DataFrame(rows)
             combined = pd.concat([cached, fresh], ignore_index=True) if not cached.empty else fresh
@@ -2653,9 +2799,7 @@ class JoinQuantMicrocapBacktestEngine:
         frame["avg_volume_20_prev"] = grouped["volume"].transform(lambda series: series.rolling(20, min_periods=20).mean().shift(1))
 
         instrument_base = instrument_frame.drop_duplicates("symbol", keep="last").set_index("symbol")
-        frame["open_date"] = frame["symbol"].map(instrument_base["open_date"])
-        first_seen = frame.groupby("symbol", sort=False)["trading_date"].transform("min")
-        frame["open_date"] = frame["open_date"].fillna(first_seen)
+        frame["open_date"] = _resolve_listing_reference_dates(frame, instrument_base, capital_frame)
         frame["listed_days"] = (frame["trading_date"] - frame["open_date"]).dt.days
         industry_codes = instrument_base["industry_code"].fillna("") if "industry_code" in instrument_base.columns else pd.Series(dtype=str)
         industry_names = instrument_base["industry_name"].fillna("") if "industry_name" in instrument_base.columns else pd.Series(dtype=str)
@@ -2710,7 +2854,9 @@ class JoinQuantMicrocapBacktestEngine:
         )
         frame["raw_vwap_prev"] = frame.groupby("symbol", sort=False)["raw_vwap"].shift(1)
         frame["ranking_price_prev"] = frame["raw_vwap_prev"].fillna(frame["prev_close"])
-        frame["market_cap_prev"] = frame["ranking_price_prev"].fillna(0.0) * frame["total_capital_prev"].fillna(0.0)
+        # Rank microcaps by the signal-day closing market cap so live previews
+        # match the end-of-day selection view used to plan next-session trades.
+        frame["market_cap_prev"] = pd.to_numeric(frame["close"], errors="coerce").fillna(0.0) * frame["total_capital"].fillna(0.0)
         historical_special_treatment = self._load_historical_special_treatment_frame(frame, instrument_frame)
         if not historical_special_treatment.empty:
             frame = frame.drop(columns=["is_st_name", "is_star_st_name", "is_delisting_name"]).merge(
@@ -3281,61 +3427,6 @@ class JoinQuantMicrocapBacktestEngine:
                     if remaining_shares > 0:
                         holdings[symbol]["shares"] = remaining_shares
                     else:
-                        holdings.pop(symbol, None)
-
-                for symbol in fitted_targets:
-                    row = day_rows.get(symbol)
-                    if symbol not in holdings or row is None:
-                        continue
-                    if not can_trade(symbol, trade_date, float(row.open), float(row.volume), float(row.prev_close or 0.0), is_buy=False):
-                        continue
-                    open_price = float(row.open)
-                    current_shares = int(holdings[symbol]["shares"])
-                    current_value = current_shares * open_price
-                    if current_value <= each_target_value * active_cfg.max_overweight_ratio:
-                        continue
-                    target_amount = calc_target_amount_by_value(symbol, each_target_value, open_price)
-                    adjusted_target = adjust_target_amount_for_rules(symbol, current_shares, target_amount)
-                    desired_sell = current_shares - adjusted_target
-                    sell_shares = available_trade_shares(
-                        symbol,
-                        desired_sell,
-                        remaining_trade_capacity.get(symbol, 0),
-                        current_shares,
-                        is_buy=False,
-                    )
-                    if sell_shares <= 0:
-                        continue
-                    sell_price = execution_price(
-                        symbol,
-                        trade_date,
-                        float(row.open),
-                        float(row.prev_close or 0.0),
-                        is_buy=False,
-                        slippage_bps=active_cfg.sell_slippage_bps,
-                    )
-                    amount = sell_shares * sell_price
-                    fee = sell_fee(amount)
-                    cash += amount - fee
-                    daily_turnover += amount
-                    daily_fees += fee
-                    cumulative_turnover += amount
-                    remaining_trade_capacity[symbol] = max(0, remaining_trade_capacity.get(symbol, 0) - sell_shares)
-                    holdings[symbol]["shares"] = current_shares - sell_shares
-                    trade_rows.append(
-                        {
-                            "trading_date": trade_date.date().isoformat(),
-                            "symbol": symbol,
-                            "instrument_name": name_map.get(symbol, symbol),
-                            "side": "SELL",
-                            "shares": sell_shares,
-                            "price": round(sell_price, 4),
-                            "amount": round(amount, 2),
-                            "fee": round(fee, 2),
-                            "reason": "overweight_trim",
-                        }
-                    )
-                    if holdings[symbol]["shares"] <= 0:
                         holdings.pop(symbol, None)
 
             overlay_row = day_rows.get(overlay_symbol) if overlay_symbol else None

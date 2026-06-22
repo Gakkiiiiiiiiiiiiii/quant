@@ -239,6 +239,56 @@ def _normalize_history_rows(pandas_module, symbol, frame):
     return rows
 
 
+def _fetch_history_dataset(xtdata_module, symbols, args):
+    if not symbols:
+        return {}
+    return xtdata_module.get_market_data_ex(
+        field_list=["time", "open", "high", "low", "close", "volume", "amount"],
+        stock_list=symbols,
+        period=args.period,
+        start_time=args.start_time,
+        end_time=args.end_time,
+        dividend_type=args.dividend_type,
+        fill_data=parse_bool(args.fill_data),
+    ) or {}
+
+
+def _normalize_history_dataset(pandas_module, symbols, dataset):
+    normalized = {}
+    for symbol in symbols:
+        normalized[symbol] = _normalize_history_rows(pandas_module, symbol, dataset.get(symbol))
+    return normalized
+
+
+def _select_missing_history_symbols(symbols, normalized_rows, start_time):
+    if not start_time:
+        return [symbol for symbol in symbols if not normalized_rows.get(symbol)]
+    try:
+        target_date = str(start_time).strip()
+        if len(target_date) == 8 and target_date.isdigit():
+            target_date = "{0}-{1}-{2}".format(target_date[0:4], target_date[4:6], target_date[6:8])
+    except Exception:
+        target_date = str(start_time).strip()
+    missing = []
+    for symbol in symbols:
+        rows = list(normalized_rows.get(symbol) or [])
+        if not rows:
+            missing.append(symbol)
+            continue
+        latest_date = max(str(item.get("trading_date") or "") for item in rows)
+        if latest_date < target_date:
+            missing.append(symbol)
+    return missing
+
+
+def _flatten_history_rows(symbols, normalized_rows):
+    rows = []
+    for symbol in symbols:
+        rows.extend(normalized_rows.get(symbol) or [])
+    rows.sort(key=lambda item: (item["trading_date"], item["symbol"]))
+    return rows
+
+
 def command_history(args):
     xtconstant, xtdata, XtQuantTrader, StockAccount = bootstrap_runtime(args.install_dir)
     try:
@@ -248,27 +298,26 @@ def command_history(args):
 
     try:
         symbols = split_symbols(args.symbols)
-        for symbol in symbols:
-            xtdata.download_history_data(symbol, args.period, args.start_time, args.end_time)
-        dataset = xtdata.get_market_data_ex(
-            field_list=["time", "open", "high", "low", "close", "volume", "amount"],
-            stock_list=symbols,
-            period=args.period,
-            start_time=args.start_time,
-            end_time=args.end_time,
-            dividend_type=args.dividend_type,
-            fill_data=parse_bool(args.fill_data),
-        ) or {}
-        rows = []
-        for symbol in symbols:
-            rows.extend(_normalize_history_rows(pd, symbol, dataset.get(symbol)))
-        rows.sort(key=lambda item: (item["trading_date"], item["symbol"]))
+        prefer_cache_first = parse_bool(getattr(args, "prefer_cache_first", "false"))
+        normalized_rows = {}
+        missing_symbols = list(symbols)
+        if prefer_cache_first:
+            normalized_rows = _normalize_history_dataset(pd, symbols, _fetch_history_dataset(xtdata, symbols, args))
+            missing_symbols = _select_missing_history_symbols(symbols, normalized_rows, args.start_time)
+        if missing_symbols:
+            for symbol in missing_symbols:
+                xtdata.download_history_data(symbol, args.period, args.start_time, args.end_time)
+            refreshed_rows = _normalize_history_dataset(pd, missing_symbols, _fetch_history_dataset(xtdata, missing_symbols, args))
+            normalized_rows.update(refreshed_rows)
+        rows = _flatten_history_rows(symbols, normalized_rows)
         return emit_ok(
             {
                 "period": args.period,
                 "dividend_type": args.dividend_type,
                 "start_time": args.start_time,
                 "end_time": args.end_time,
+                "prefer_cache_first": prefer_cache_first,
+                "downloaded_symbol_count": len(missing_symbols),
                 "symbol_count": len(symbols),
                 "row_count": len(rows),
                 "rows": rows,
@@ -491,6 +540,7 @@ def build_parser():
     history_parser.add_argument("--end-time", default="")
     history_parser.add_argument("--dividend-type", default="front")
     history_parser.add_argument("--fill-data", default="true")
+    history_parser.add_argument("--prefer-cache-first", default="false")
 
     financial_parser = subparsers.add_parser("financial-data")
     add_common(financial_parser)

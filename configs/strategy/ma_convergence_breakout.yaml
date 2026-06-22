@@ -1,0 +1,19 @@
+name: ma_convergence_breakout
+implementation: ma_convergence_breakout
+rebalance_frequency: daily
+lookback_days: 260
+top_n: 30
+lot_size: 100
+
+# 均线粘合放倍量突破策略参数
+convergence_limit: 2.5
+volume_multiple: 2.0
+max_hold_num: 10
+min_avg_amount_20: 30000000
+hold_days: 3
+stop_loss: -0.05
+min_list_days: 80
+buy_slippage_bps: 10
+sell_slippage_bps: 10
+filter_st: true
+filter_limit_up: true

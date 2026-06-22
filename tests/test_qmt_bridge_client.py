@@ -101,6 +101,27 @@ def test_bridge_client_parses_history_rows(tmp_path: Path, monkeypatch: pytest.M
     assert str(frame.iloc[0]["trading_date"]) == "2026-03-20"
 
 
+def test_bridge_client_passes_prefer_cache_first_for_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = load_app_settings(build_settings(tmp_path))
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        captured["cmd"] = cmd
+        return SimpleNamespace(
+            returncode=0,
+            stdout='{"ok": true, "data": {"rows": [{"trading_date": "2026-03-20", "symbol": "000001.SZ", "open": 10.1, "high": 10.5, "low": 9.9, "close": 10.3, "volume": 123456, "amount": 987654.0}]}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    client = QmtBridgeClient(settings)
+    client.get_history(["000001.SZ"], "1d", "20260320", "", "front", True, prefer_cache_first=True)
+
+    assert "--prefer-cache-first" in captured["cmd"]
+    assert "true" in captured["cmd"]
+
+
 def test_bridge_client_raises_on_bridge_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = load_app_settings(build_settings(tmp_path))
 

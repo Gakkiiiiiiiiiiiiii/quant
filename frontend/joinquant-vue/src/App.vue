@@ -5,7 +5,6 @@ import { apiGet, apiPost } from './api'
 import DataTable from './components/DataTable.vue'
 import LineChart from './components/LineChart.vue'
 import MetricStrip from './components/MetricStrip.vue'
-import PerformanceTriptych from './components/PerformanceTriptych.vue'
 
 const sections = ['收益概述', 'QMT 交易看板', '交易详情', '每日持仓&收益', '日志输出', '性能分析', '策略代码', 'Qlib 全市场', '形态实验室']
 const microcapStrategyKeys = ['joinquant_microcap_alpha', 'joinquant_microcap_alpha_zf', 'joinquant_microcap_alpha_zfe', 'joinquant_microcap_alpha_zr', 'joinquant_microcap_alpha_zro', 'joinquant_microcap_alpha_cc', 'monster_prelude_alpha', 'microcap_100b_layer_rot', 'microcap_50b_layer_rot', 'industry_weighted_microcap_alpha']
@@ -564,12 +563,19 @@ const recentTradePreview = computed(() => {
     .sort((left, right) => (parseDateValue(right.trading_date) || 0) - (parseDateValue(left.trading_date) || 0))
     .slice(0, 8)
 })
+const overviewTradeRows = computed(() => {
+  return [...genericTrades.value]
+    .sort((left, right) => (parseDateValue(right.trading_date) || 0) - (parseDateValue(left.trading_date) || 0))
+    .slice(0, 24)
+})
 const overviewTradeColumns = computed(() => ([
   { key: 'trading_date', label: '交易日', width: 104 },
   { key: 'symbol', label: '代码', width: 92, code: true },
   { key: 'side', label: '方向', width: 70, align: 'center' },
   { key: 'shares', label: '股数', width: 78, align: 'right', formatter: formatInteger },
+  { key: 'price', label: '价格', width: 82, align: 'right' },
   { key: 'amount', label: '成交额', width: 110, align: 'right', formatter: formatSignedMoney },
+  { key: 'reason', label: '原因', minWidth: 168, maxWidth: 240, wrap: true, code: true },
 ]))
 const overviewHeroFacts = computed(() => ([
   {
@@ -770,6 +776,54 @@ const microcapTriptych = computed(() => {
   })
 
   return { labels, strategy, benchmark, excess, drawdown }
+})
+const overviewReturnSeries = computed(() => {
+  if (!isMicrocapBacktest.value || microcapTriptych.value.labels.length === 0) {
+    return equitySeries.value
+  }
+  const { labels, strategy, benchmark, excess } = microcapTriptych.value
+  return [
+    {
+      name: currentStrategyLabel.value || '策略收益',
+      color: '#2e62ad',
+      points: labels.map((label, index) => ({ label, value: strategy[index] })),
+    },
+    {
+      name: 'Benchmark',
+      color: '#f59e0b',
+      points: labels.map((label, index) => ({ label, value: benchmark[index] })),
+    },
+    {
+      name: '超额收益',
+      color: '#0f766e',
+      points: labels.map((label, index) => ({ label, value: excess[index] })),
+    },
+  ]
+})
+const overviewDrawdownSeries = computed(() => {
+  if (isMicrocapBacktest.value && microcapTriptych.value.labels.length > 0) {
+    const { labels, drawdown } = microcapTriptych.value
+    return [
+      {
+        name: '回撤',
+        color: '#d03b2d',
+        points: labels.map((label, index) => ({ label, value: drawdown[index] })),
+      },
+    ]
+  }
+  const points = assets.value
+    .map((item) => ({
+      label: formatDatetime(item.snapshot_time || item.datetime).slice(0, 10),
+      value: Number(item.max_drawdown),
+    }))
+    .filter((item) => item.label && Number.isFinite(item.value))
+  return [
+    {
+      name: '回撤',
+      color: '#d03b2d',
+      points,
+    },
+  ]
 })
 
 const historyResultColumns = computed(() => ([
@@ -1090,29 +1144,54 @@ onBeforeUnmount(() => {
                   <strong>{{ item.value }}</strong>
                 </article>
               </div>
-              <div class="jq-chart-frame">
-                <PerformanceTriptych
-                  v-if="isMicrocapBacktest"
-                  :labels="microcapTriptych.labels"
-                  :strategy="microcapTriptych.strategy"
-                  :benchmark="microcapTriptych.benchmark"
-                  :excess="microcapTriptych.excess"
-                  :drawdown="microcapTriptych.drawdown"
-                  :height="760"
-                />
-                <LineChart v-else :series="equitySeries" :height="760" :as-percent="true" :fill-area="true" />
+              <div class="jq-overview-grid">
+                <section class="jq-chart-card">
+                  <div class="jq-chart-card__header">
+                    <div>
+                      <h3>收益率曲线</h3>
+                      <p>策略收益、Benchmark 与超额收益同屏展示。</p>
+                    </div>
+                  </div>
+                  <div class="jq-chart-frame jq-chart-frame--embedded">
+                    <LineChart :series="overviewReturnSeries" :height="420" :as-percent="true" :fill-area="true" />
+                  </div>
+                </section>
+                <section class="jq-chart-card">
+                  <div class="jq-chart-card__header">
+                    <div>
+                      <h3>回撤曲线</h3>
+                      <p>按回测时间轴单独展开回撤，不再埋在综合曲线里。</p>
+                    </div>
+                  </div>
+                  <div class="jq-chart-frame jq-chart-frame--embedded">
+                    <LineChart :series="overviewDrawdownSeries" :height="300" :as-percent="true" :fill-area="true" />
+                  </div>
+                </section>
+                <section class="jq-trade-card">
+                  <div class="jq-chart-card__header">
+                    <div>
+                      <h3>交易记录</h3>
+                      <p>默认首屏直接展示最近成交，不需要再切到“交易详情”。</p>
+                    </div>
+                    <div class="jq-trade-card__meta">
+                      <span>最近成交</span>
+                      <strong>{{ overviewTradeRows.length }}</strong>
+                    </div>
+                  </div>
+                  <DataTable :rows="overviewTradeRows" :columns="overviewTradeColumns" :max-height="420" empty-text="暂无成交记录" />
+                </section>
               </div>
             </div>
             <div class="panel-card panel-card--side panel-card--jq-side">
               <div v-if="isMicrocapBacktest">
                 <div class="panel-card__header">
                   <div>
-                    <h2>历史回测与近期成交</h2>
-                    <p>上方可切换不同策略的历史回测，下面保留最近调仓记录便于对照。</p>
+                    <h2>历史回测结果</h2>
+                    <p>支持切换不同策略版本；当前页面主区固定展示默认报表。</p>
                   </div>
                 </div>
                 <DataTable :rows="historyResultRows" :columns="historyResultColumns" :max-height="260" empty-text="暂无已保存回测结果" />
-                <DataTable :rows="recentTradePreview" :columns="overviewTradeColumns" :max-height="720" empty-text="暂无成交记录" />
+                <DataTable :rows="recentTradePreview" :columns="overviewTradeColumns" :max-height="420" empty-text="暂无成交记录" />
               </div>
               <div v-else>
                 <div class="panel-card__header">

@@ -89,11 +89,11 @@ class QmtBridgeClient:
         end_time: str,
         dividend_type: str,
         fill_data: bool,
+        prefer_cache_first: bool = False,
     ) -> pd.DataFrame:
         if not symbols:
             return pd.DataFrame(columns=["trading_date", "symbol", "open", "high", "low", "close", "volume", "amount"])
-        payload = self._run(
-            "history",
+        command_args = [
             "--symbols",
             ",".join(symbols),
             "--period",
@@ -106,6 +106,12 @@ class QmtBridgeClient:
             dividend_type,
             "--fill-data",
             str(fill_data).lower(),
+        ]
+        if prefer_cache_first:
+            command_args.extend(["--prefer-cache-first", "true"])
+        payload = self._run(
+            "history",
+            *command_args,
             timeout_seconds=HISTORY_TIMEOUT_SECONDS,
         )
         frame = pd.DataFrame(payload.get("rows", []))

@@ -3,12 +3,15 @@ from __future__ import annotations
 import pandas as pd
 
 from quant_demo.experiment.joinquant_microcap_engine import (
+    JoinQuantMicrocapBacktestEngine,
     MicrocapStrategyConfig,
     _apply_st_risk_announcement_flags,
     _build_segmented_special_treatment_for_symbol,
     _build_sz_special_treatment_for_symbol,
     _classify_st_risk_announcement_title,
     _monster_exit_reason,
+    _normalize_open_date_series,
+    _resolve_listing_reference_dates,
     _normalize_a_share_symbol,
     _special_treatment_flags_from_name,
     _surge_exit_reason,
@@ -30,6 +33,7 @@ def _base_day_frame() -> pd.DataFrame:
             {
                 "symbol": "000001.SZ",
                 "open": 10.0,
+                "close": 10.0,
                 "prev_close": 10.0,
                 "volume": 1_000_000,
                 "listed_days": 300,
@@ -42,6 +46,7 @@ def _base_day_frame() -> pd.DataFrame:
             {
                 "symbol": "000002.SZ",
                 "open": 9.0,
+                "close": 9.0,
                 "prev_close": 9.0,
                 "volume": 1_000_000,
                 "listed_days": 300,
@@ -54,6 +59,7 @@ def _base_day_frame() -> pd.DataFrame:
             {
                 "symbol": "000003.SZ",
                 "open": 8.0,
+                "close": 8.0,
                 "prev_close": 8.0,
                 "volume": 1_000_000,
                 "listed_days": 300,
@@ -87,6 +93,121 @@ def test_build_target_portfolio_keeps_existing_holding_inside_keep_rank() -> Non
     assert target == ["000002.SZ", "000001.SZ"]
 
 
+def test_build_target_portfolio_keeps_rising_holding_outside_keep_rank() -> None:
+    cfg = MicrocapStrategyConfig(target_hold_num=1, buy_rank=1, keep_rank=1, query_limit=10)
+    frame = _base_day_frame()
+    frame.loc[frame["symbol"] == "000002.SZ", "close"] = 9.3
+
+    target, ranked_count = build_target_portfolio(
+        frame,
+        holdings=["000002.SZ"],
+        total_value_open=100_000.0,
+        cfg=cfg,
+    )
+
+    assert ranked_count == 3
+    assert target == ["000002.SZ"]
+
+
+def test_build_target_portfolio_sells_holding_outside_keep_rank_after_down_day() -> None:
+    cfg = MicrocapStrategyConfig(target_hold_num=1, buy_rank=1, keep_rank=1, query_limit=10)
+    frame = _base_day_frame()
+    frame.loc[frame["symbol"] == "000002.SZ", "close"] = 8.7
+
+    target, ranked_count = build_target_portfolio(
+        frame,
+        holdings=["000002.SZ"],
+        total_value_open=100_000.0,
+        cfg=cfg,
+    )
+
+    assert ranked_count == 3
+    assert target == ["000001.SZ"]
+
+
+def test_build_target_portfolio_keeps_rising_holding_even_when_it_falls_outside_ranked_list() -> None:
+    cfg = MicrocapStrategyConfig(target_hold_num=1, buy_rank=1, keep_rank=1, query_limit=40)
+    rows = []
+    for index in range(35):
+        rows.append(
+            {
+                "symbol": f"{index + 1:06d}.SZ",
+                "open": 10.0,
+                "close": 10.0,
+                "prev_close": 10.0,
+                "volume": 1_000_000,
+                "listed_days": 300,
+                "avg_amount_20_prev": 20_000_000.0,
+                "market_cap_prev": float(index + 1),
+                "is_st_name": False,
+                "is_beijing_stock": False,
+                "is_b_share": False,
+            }
+        )
+    frame = pd.DataFrame(rows)
+    frame.loc[frame["symbol"] == "000032.SZ", "close"] = 10.3
+
+    target, ranked_count = build_target_portfolio(
+        frame,
+        holdings=["000032.SZ"],
+        total_value_open=100_000.0,
+        cfg=cfg,
+    )
+
+    assert ranked_count == 31
+    assert target == ["000032.SZ"]
+
+
+def test_normalize_open_date_series_treats_zero_as_missing() -> None:
+    values = pd.Series(["0", "20040329", "2026-05-21", None])
+
+    normalized = _normalize_open_date_series(values)
+
+    assert pd.isna(normalized.iloc[0])
+    assert normalized.iloc[1] == pd.Timestamp("2004-03-29")
+    assert normalized.iloc[2] == pd.Timestamp("2026-05-21")
+    assert pd.isna(normalized.iloc[3])
+
+
+def test_resolve_listing_reference_dates_uses_capital_history_when_open_date_missing() -> None:
+    frame = pd.DataFrame(
+        [
+            {"symbol": "AAA.SZ", "trading_date": pd.Timestamp("2026-03-23")},
+            {"symbol": "AAA.SZ", "trading_date": pd.Timestamp("2026-05-21")},
+        ]
+    )
+    instrument_base = pd.DataFrame(
+        [
+            {"symbol": "AAA.SZ", "open_date": pd.NaT},
+        ]
+    ).set_index("symbol")
+    capital_frame = pd.DataFrame(
+        [
+            {"symbol": "AAA.SZ", "effective_date": pd.Timestamp("2020-04-29")},
+            {"symbol": "AAA.SZ", "effective_date": pd.Timestamp("2020-08-15")},
+        ]
+    )
+
+    listing_dates = _resolve_listing_reference_dates(frame, instrument_base, capital_frame)
+
+    assert listing_dates.iloc[0] == pd.Timestamp("2020-04-29")
+    assert listing_dates.iloc[1] == pd.Timestamp("2020-04-29")
+
+
+def test_resolve_effective_microcap_config_handles_empty_benchmark_for_calendar_crash() -> None:
+    cfg = MicrocapStrategyConfig(calendar_crash_profile_enabled=True)
+
+    effective_cfg, meta = resolve_effective_microcap_config(
+        pd.Timestamp("2026-05-21"),
+        cfg,
+        pd.Series(dtype=float),
+    )
+
+    assert effective_cfg.keep_rank == cfg.keep_rank
+    assert meta["crash_add_level"] == 0
+    assert meta["instant_crash_level"] == 0
+
+
 def test_fit_target_count_by_cash_shrinks_when_star_board_is_too_expensive() -> None:
     cfg = MicrocapStrategyConfig(target_hold_num=2)
     selected = fit_target_count_by_cash(
@@ -103,12 +224,52 @@ def test_build_target_portfolio_filters_out_front_adjusted_tiny_prices() -> None
     cfg = MicrocapStrategyConfig(target_hold_num=1, min_price_floor=1.0)
     frame = _base_day_frame()
     frame.loc[0, "open"] = 0.04
+    frame.loc[0, "close"] = 0.04
     frame.loc[0, "prev_close"] = 0.04
     frame.loc[1, "prev_close"] = 9.0
     frame.loc[2, "prev_close"] = 8.0
     target, _ = build_target_portfolio(frame, holdings=[], total_value_open=100_000.0, cfg=cfg)
 
     assert target == ["000002.SZ"]
+
+
+def test_build_target_portfolio_price_cap_uses_close_for_affordability() -> None:
+    cfg = MicrocapStrategyConfig(target_hold_num=1, query_limit=10)
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "600455.SH",
+                "open": 30.0,
+                "close": 29.0,
+                "prev_close": 29.5,
+                "volume": 1_000_000,
+                "listed_days": 300,
+                "avg_amount_20_prev": 20_000_000.0,
+                "market_cap_prev": 100.0,
+                "is_st_name": False,
+                "is_beijing_stock": False,
+                "is_b_share": False,
+            },
+            {
+                "symbol": "000001.SZ",
+                "open": 40.0,
+                "close": 40.0,
+                "prev_close": 40.0,
+                "volume": 1_000_000,
+                "listed_days": 300,
+                "avg_amount_20_prev": 20_000_000.0,
+                "market_cap_prev": 200.0,
+                "is_st_name": False,
+                "is_beijing_stock": False,
+                "is_b_share": False,
+            },
+        ]
+    )
+
+    target, ranked_count = build_target_portfolio(frame, holdings=[], total_value_open=3_000.0, cfg=cfg)
+
+    assert ranked_count == 1
+    assert target == ["600455.SH"]
 
 
 def test_build_target_portfolio_allows_low_amount_when_threshold_disabled() -> None:
@@ -842,3 +1003,166 @@ def test_resolve_effective_microcap_config_uses_execution_month_for_profile() ->
     assert profile["cash_weight"] == 0.0
     assert profile["signal_trade_date"] == "2026-04-30"
     assert profile["profile_trade_date"] == "2026-05-01"
+
+
+def test_load_instrument_frame_refreshes_existing_cache_entries(tmp_path, monkeypatch) -> None:
+    cache_path = tmp_path / "instrument.parquet"
+    pd.DataFrame(
+        [
+            {
+                "symbol": "AAA.SZ",
+                "instrument_name": "Old",
+                "open_date": "20200101",
+                "total_capital_current": 100.0,
+                "float_capital_current": 50.0,
+            }
+        ]
+    ).to_parquet(cache_path, index=False)
+
+    engine = JoinQuantMicrocapBacktestEngine.__new__(JoinQuantMicrocapBacktestEngine)
+    engine.cfg = type("Cfg", (), {"instrument_cache_path": str(cache_path), "industry_weighted_enabled": False})()
+    engine.bridge = type(
+        "Bridge",
+        (),
+        {
+            "get_instrument_details": staticmethod(
+                lambda batch: {
+                    "AAA.SZ": {
+                        "InstrumentName": "New",
+                        "OpenDate": "20200102",
+                        "TotalVolume": 200.0,
+                        "FloatVolume": 80.0,
+                    }
+                }
+            )
+        },
+    )()
+
+    frame = engine._load_instrument_frame(["AAA.SZ"], refresh_existing=True)
+
+    assert frame.loc[frame["symbol"] == "AAA.SZ", "instrument_name"].iloc[0] == "New"
+    assert frame.loc[frame["symbol"] == "AAA.SZ", "total_capital_current"].iloc[0] == 200.0
+
+
+def test_load_capital_frame_refreshes_existing_cache_entries(tmp_path) -> None:
+    cache_path = tmp_path / "capital.parquet"
+    pd.DataFrame(
+        [
+            {
+                "symbol": "AAA.SZ",
+                "announce_date": "20240101",
+                "report_date": "20240101",
+                "total_capital": 100.0,
+                "circulating_capital": 60.0,
+                "free_float_capital": 40.0,
+            }
+        ]
+    ).to_parquet(cache_path, index=False)
+
+    engine = JoinQuantMicrocapBacktestEngine.__new__(JoinQuantMicrocapBacktestEngine)
+    engine.cfg = type("Cfg", (), {"capital_cache_path": str(cache_path)})()
+    engine.app_settings = type("AppSettings", (), {"history_start": "20200101", "history_end": ""})()
+    engine.bridge = type(
+        "Bridge",
+        (),
+        {
+            "get_financial_data": staticmethod(
+                lambda batch, tables, start_time, end_time, report_type="announce_time": {
+                    "AAA.SZ": {
+                        "Capital": [
+                            {
+                                "m_anntime": "20240101",
+                                "m_timetag": "20240101",
+                                "total_capital": 300.0,
+                                "circulating_capital": 200.0,
+                                "freeFloatCapital": 120.0,
+                            }
+                        ]
+                    }
+                }
+            )
+        },
+    )()
+
+    instrument_frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA.SZ",
+                "instrument_name": "Alpha",
+                "open_date": pd.Timestamp("2020-01-01"),
+                "total_capital_current": 300.0,
+                "float_capital_current": 200.0,
+            }
+        ]
+    )
+
+    frame = engine._load_capital_frame(["AAA.SZ"], refresh_existing=True, instrument_frame=instrument_frame)
+
+    row = frame.loc[frame["symbol"] == "AAA.SZ"].sort_values("effective_date").iloc[-1]
+    assert row["total_capital"] == 300.0
+    assert row["circulating_capital"] == 200.0
+
+
+def test_prepare_history_ranks_by_signal_day_close_times_effective_capital() -> None:
+    history = pd.DataFrame(
+        [
+            {
+                "trading_date": pd.Timestamp("2026-06-04"),
+                "symbol": "AAA.SZ",
+                "open": 10.0,
+                "high": 10.2,
+                "low": 9.8,
+                "close": 10.0,
+                "volume": 1000.0,
+                "amount": 1_000_000.0,
+            },
+            {
+                "trading_date": pd.Timestamp("2026-06-05"),
+                "symbol": "AAA.SZ",
+                "open": 20.0,
+                "high": 20.5,
+                "low": 19.5,
+                "close": 20.0,
+                "volume": 1000.0,
+                "amount": 2_000_000.0,
+            },
+        ]
+    )
+    instrument_frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA.SZ",
+                "instrument_name": "Alpha",
+                "open_date": pd.Timestamp("2020-01-01"),
+                "total_capital_current": 300.0,
+                "float_capital_current": 200.0,
+            }
+        ]
+    )
+    capital_frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA.SZ",
+                "effective_date": pd.Timestamp("2026-06-04"),
+                "total_capital": 100.0,
+                "circulating_capital": 80.0,
+                "free_float_capital": 70.0,
+            },
+            {
+                "symbol": "AAA.SZ",
+                "effective_date": pd.Timestamp("2026-06-05"),
+                "total_capital": 300.0,
+                "circulating_capital": 200.0,
+                "free_float_capital": 180.0,
+            },
+        ]
+    )
+
+    engine = JoinQuantMicrocapBacktestEngine.__new__(JoinQuantMicrocapBacktestEngine)
+    engine.cfg = MicrocapStrategyConfig()
+    engine._load_historical_special_treatment_frame = lambda frame, instrument_frame: pd.DataFrame()
+
+    prepared = engine._prepare_history(history, instrument_frame, capital_frame)
+    row = prepared.loc[prepared["trading_date"] == pd.Timestamp("2026-06-05")].iloc[0]
+
+    assert row["market_cap_prev"] == 6000.0

@@ -5,6 +5,7 @@ import json
 import sys
 
 from _bootstrap import ROOT, SRC
+from _backtest_summary import build_summary_payload, write_summary_files
 
 sys.path.insert(0, str(SRC))
 
@@ -24,12 +25,26 @@ def main() -> None:
     session_factory = create_session_factory(app_settings.database_url)
     result = ExperimentManager(session_factory, app_settings, strategy_settings).run()
 
+    payload = build_summary_payload(
+        strategy_name=strategy_settings.implementation,
+        config_path=str(args.config),
+        strategy_path=str(args.strategy),
+        report_path=str(result.report_path),
+        total_return=result.metrics.total_return,
+        annualized_return=result.metrics.annualized_return,
+        max_drawdown=result.metrics.max_drawdown,
+        turnover=result.metrics.turnover,
+        equity_curve=result.equity_curve,
+    )
+    summary_files = write_summary_files(payload)
+
     metrics = {
         "total_return": result.metrics.total_return,
         "annualized_return": result.metrics.annualized_return,
         "max_drawdown": result.metrics.max_drawdown,
         "turnover": result.metrics.turnover,
         "report_path": str(result.report_path),
+        **summary_files,
     }
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 

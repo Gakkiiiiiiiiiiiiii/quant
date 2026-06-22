@@ -649,8 +649,10 @@ class QmtMicrocapTradingEngine:
         loader = JoinQuantMicrocapBacktestEngine(self.session_factory, self.app_settings, self.strategy_settings)
         history = self._load_recent_history_window()
         symbols = history["symbol"].dropna().astype(str).unique().tolist()
-        instrument_frame = loader._load_instrument_frame(symbols)
-        capital_frame = loader._load_capital_frame(symbols)
+        # Live preview/execute must use up-to-date share-capital metadata; stale caches
+        # can invert relative market-cap ordering and produce wrong rebalance decisions.
+        instrument_frame = loader._load_instrument_frame(symbols, refresh_existing=True)
+        capital_frame = loader._load_capital_frame(symbols, refresh_existing=True, instrument_frame=instrument_frame)
         prepared = loader._prepare_history(history, instrument_frame, capital_frame)
         return prepared, instrument_frame, loader
 
@@ -833,7 +835,10 @@ class QmtMicrocapTradingEngine:
         target_stocks = list(selection["targets"])
         ranked_symbols = [str(symbol) for symbol in selection.get("ranked_symbols") or [] if str(symbol).strip()]
         ranked_count = int(selection["ranked_count"])
-        price_lookup = {str(symbol): float(row.get("open") or 0.0) for symbol, row in day_frame.iterrows()}
+        price_lookup = {
+            str(symbol): float(row.get("close") or row.get("open") or 0.0)
+            for symbol, row in day_frame.iterrows()
+        }
         risk_sell_watch: list[dict[str, Any]] = []
         if "st_preannounce_prompt_sell" in day_frame.columns:
             risk_rows = day_frame[
@@ -871,11 +876,16 @@ class QmtMicrocapTradingEngine:
         blocked_buy_symbols = set(execution_controls["execution_day_buy_blocked_symbols"])
         halted_buy_symbols = self._identify_halted_buy_symbols(execution_check_symbols)
         holding_set = set(stock_holdings)
-        eligible_targets: list[str] = []
-        for symbol in execution_check_symbols:
+        # Keep the backtest selection order intact so keep-rank-retained holdings
+        # are fitted first, then supplement with lower-ranked execution-day backups.
+        target_priority_symbols: list[str] = []
+        for symbol in target_stocks + execution_check_symbols:
             normalized = str(symbol).strip()
-            if not normalized or normalized in eligible_targets:
+            if not normalized or normalized in target_priority_symbols:
                 continue
+            target_priority_symbols.append(normalized)
+        eligible_targets: list[str] = []
+        for normalized in target_priority_symbols:
             if normalized in blocked_buy_symbols:
                 continue
             if normalized in halted_buy_symbols and normalized not in holding_set:
@@ -1648,41 +1658,6 @@ class QmtMicrocapTradingEngine:
             remaining_trade_capacity[symbol] = max(0, remaining_trade_capacity.get(symbol, 0) - sell_qty)
 
         target_meta["forced_exit_untradable_symbols"] = sorted(forced_exit_untradable_symbols)
-
-        for symbol in target_meta["targets"]:
-            if symbol in protected_sell_symbols or symbol in forced_exit_symbols or symbol not in planning_state.positions or symbol not in day_frame.index:
-                continue
-            position = planning_state.positions[symbol]
-            row = day_frame.loc[symbol]
-            sell_price = _plan_price(symbol, row)
-            current_value = float(position.qty) * float(sell_price)
-            if current_value <= each_target_value * self.cfg.max_overweight_ratio:
-                continue
-            target_amount = calc_target_amount_by_value(symbol, each_target_value, float(sell_price))
-            adjusted_target = adjust_target_amount_for_rules(symbol, position.qty, target_amount)
-            desired_sell = min(position.available_qty, max(position.qty - adjusted_target, 0))
-            sell_qty = available_trade_shares(
-                symbol,
-                desired_shares=desired_sell,
-                remaining_shares=remaining_trade_capacity.get(symbol, 0),
-                current_amount=position.qty,
-                is_buy=False,
-            )
-            if sell_qty <= 0:
-                continue
-            if not can_trade(symbol, latest_date, float(sell_price), volumes.get(symbol, 0.0), float(row.get("prev_close") or 0.0), is_buy=False):
-                continue
-            order = PlannedOrder(
-                symbol=symbol,
-                side=OrderSide.SELL,
-                qty=sell_qty,
-                price=sell_price,
-                reason="overweight_trim",
-                metadata={"target_value": round(each_target_value, 2)},
-            )
-            planned_orders.append(order)
-            self._apply_planned_order(planning_state, order)
-            remaining_trade_capacity[symbol] = max(0, remaining_trade_capacity.get(symbol, 0) - sell_qty)
 
         buy_plan: list[tuple[str, float]] = []
         for symbol in target_meta["targets"]:
