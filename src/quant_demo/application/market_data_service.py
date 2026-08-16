@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,10 @@ from sqlalchemy.orm import Session
 from quant_demo.core.exceptions import DataNotReadyError
 from quant_demo.db.models_market import (
     AdjustmentFactorRow,
+    ConceptMembershipRow,
+    CorporateActionRow,
+    IndexConstituentRow,
+    IndustryMembershipRow,
     MarketSnapshotRow,
     PriceLimitDailyRow,
     SecurityMasterRow,
@@ -31,6 +35,14 @@ from quant_demo.db.models_market import (
     TradingCalendarRow,
 )
 from quant_demo.marketdata.ingestion import load_history_dataframe
+from quant_demo.snapshot.manifest import build_manifest
+from quant_demo.snapshot.models import SNAPSHOT_SCHEMA_VERSION
+from quant_demo.snapshot.store import (
+    LocalParquetSnapshotStore,
+    MarketSnapshotStore,
+    SnapshotCorruptedError,
+    SnapshotNotFoundError,
+)
 
 MARKET_DATA_CONTRACT = "market-data.v1"
 BAR_FIELDS = ("open", "high", "low", "close", "volume", "amount", "turnover")
@@ -45,13 +57,27 @@ def _parse_date(value: str | date | None) -> date | None:
 
 
 class MarketDataService:
-    """以 Parquet 历史行情 + PostgreSQL PIT 元数据为事实源。"""
+    """以 Parquet 历史行情 + PostgreSQL PIT 元数据为事实源。
 
-    def __init__(self, history_path: str | Path, session_factory, source: str = "qmt") -> None:
+    收尾文档 §10：bars_batch 物化不可变快照（SnapshotStore.exists? 复用 :
+    写 immutable parquet + manifest + 登记 metadata）。
+    """
+
+    def __init__(
+        self,
+        history_path: str | Path,
+        session_factory,
+        source: str = "qmt",
+        snapshot_store: MarketSnapshotStore | None = None,
+    ) -> None:
         self._history_path = Path(history_path)
         self._session_factory = session_factory
         self._source = source
         self._frame_cache: pd.DataFrame | None = None
+        # 默认快照目录与历史行情同级（data/market_snapshots，§7）。
+        self._snapshot_store: MarketSnapshotStore = snapshot_store or LocalParquetSnapshotStore(
+            self._history_path.parent / "market_snapshots"
+        )
 
     # ------------------------------------------------------------------ bars
     def bars_batch(
@@ -106,19 +132,16 @@ class MarketDataService:
         ).hexdigest()
         # 与 stock_agent market-data.v1 语义一致：内容寻址的可重放快照 ID。
         data_snapshot_id = f"mds-{data_version}"
-        self._register_snapshot(
+        self._materialize_snapshot(
             data_snapshot_id,
             data_version,
             frequency=frequency,
             adjustment=adjust,
-            as_of=dates[-1] if dates else None,
-            summary={
-                "symbol_count": len(symbols),
-                "date_count": len(dates),
-                "start": str(start_d),
-                "end": str(end_d),
-                "symbols": symbols,
-            },
+            start_d=start_d,
+            end_d=end_d,
+            symbols=symbols,
+            dates=dates,
+            bars=bars,
         )
         return {
             "symbols": symbols,
@@ -128,6 +151,120 @@ class MarketDataService:
             "data_snapshot_id": data_snapshot_id,
             "source": self._source,
         }
+
+    # ------------------------------------------------------------ snapshots
+    def create_snapshot(
+        self,
+        symbols: list[str],
+        start: str | date,
+        end: str | date,
+        adjust: str = "qfq",
+        frequency: str = "1d",
+    ) -> dict[str, Any]:
+        """收尾文档 §11：显式创建不可变快照（Backtest 未指定 snapshot 时调用）。"""
+        data = self.bars_batch(symbols=symbols, start=start, end=end, frequency=frequency, adjust=adjust)
+        return {"snapshot_id": data["data_snapshot_id"], "data_version": data["data_version"]}
+
+    def load_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        """收尾文档 §11：从不可变 Dataset 读取快照，绝不重新访问 current source。
+
+        返回与 bars_batch 相同结构的 market-data.v1 payload。
+        """
+        try:
+            frame = self._snapshot_store.load(snapshot_id)
+            manifest = self._snapshot_store.read_manifest(snapshot_id)
+        except SnapshotNotFoundError:
+            raise
+        except SnapshotCorruptedError:
+            raise
+        symbols = list(manifest.get("symbols") or sorted(frame["symbol"].unique()))
+        dates = sorted({day.isoformat() for day in frame["trading_date"]})
+        bars: dict[str, list] = {field: [] for field in BAR_FIELDS}
+        by_symbol = {symbol: group.set_index("trading_date") for symbol, group in frame.groupby("symbol")}
+        for symbol in symbols:
+            group = by_symbol.get(symbol)
+            for field in BAR_FIELDS:
+                bars[field].append(
+                    [
+                        _jsonable(group.at[day, field]) if group is not None and day in group.index else None
+                        for day in [_parse_date(item) for item in dates]
+                    ]
+                )
+        return {
+            "symbols": symbols,
+            "dates": dates,
+            "bars": bars,
+            "data_version": manifest.get("data_version", ""),
+            "data_snapshot_id": snapshot_id,
+            "source": manifest.get("source", self._source),
+            "snapshot_manifest": manifest,
+        }
+
+    def _materialize_snapshot(
+        self,
+        snapshot_id: str,
+        data_version: str,
+        *,
+        frequency: str,
+        adjustment: str,
+        start_d: date,
+        end_d: date,
+        symbols: list[str],
+        dates: list[str],
+        bars: dict[str, list],
+    ) -> None:
+        """收尾文档 §6/§10：写不可变 parquet + manifest，再登记 metadata。"""
+        location = None
+        row_count = 0
+        if self._snapshot_store.exists(snapshot_id):
+            location = self._snapshot_store.save(snapshot_id, pd.DataFrame(), {})  # 复用，不覆盖
+            manifest = self._snapshot_store.read_manifest(snapshot_id)
+            row_count = sum(len(column) for column in bars.values()) // max(len(BAR_FIELDS), 1)
+        else:
+            records: list[dict] = []
+            for symbol_index, symbol in enumerate(symbols):
+                for date_index, day in enumerate(dates):
+                    record = {"symbol": symbol, "trading_date": _parse_date(day)}
+                    for field in BAR_FIELDS:
+                        record[field] = bars[field][symbol_index][date_index]
+                    records.append(record)
+            frame = pd.DataFrame.from_records(records)
+            manifest = build_manifest(
+                snapshot_id=snapshot_id,
+                data_version=data_version,
+                source=self._source,
+                frequency=frequency,
+                adjustment=adjustment,
+                start=str(start_d),
+                end=str(end_d),
+                as_of=dates[-1] if dates else None,
+                symbols=symbols,
+                fields=list(BAR_FIELDS),
+                dataset_path="bars.parquet",
+                dataset_sha256="",
+            )
+            location = self._snapshot_store.save(snapshot_id, frame, manifest)
+            manifest = self._snapshot_store.read_manifest(snapshot_id)
+            row_count = len(records)
+        self._register_snapshot(
+            snapshot_id,
+            data_version,
+            frequency=frequency,
+            adjustment=adjustment,
+            start_d=start_d,
+            end_d=end_d,
+            as_of=dates[-1] if dates else None,
+            location=location,
+            row_count=row_count,
+            summary={
+                "symbol_count": len(symbols),
+                "date_count": len(dates),
+                "start": str(start_d),
+                "end": str(end_d),
+                "symbols": symbols,
+                "manifest_hash": location.manifest_hash if location else None,
+            },
+        )
 
     # ------------------------------------------------------------ PIT status
     def upsert_security_status(self, rows: list[dict]) -> int:
@@ -258,6 +395,53 @@ class MarketDataService:
                 for row in rows
             ]
 
+    # ---------------------------------------------------- corporate actions
+    def upsert_corporate_actions(self, rows: list[dict]) -> int:
+        """收尾文档 §13：PIT 公司行动（available_at 约束可见性）。"""
+        with self._session_factory() as session:
+            for item in rows:
+                row = CorporateActionRow(
+                    symbol=item["symbol"],
+                    ex_date=_parse_date(item["ex_date"]),
+                    announcement_date=_parse_date(item.get("announcement_date")),
+                    action_type=item.get("action_type", "DIVIDEND"),
+                    cash_dividend=item.get("cash_dividend"),
+                    split_ratio=item.get("split_ratio"),
+                    rights_ratio=item.get("rights_ratio"),
+                    adjustment_factor=item.get("adjustment_factor"),
+                    available_at=_parse_datetime(item.get("available_at")) or datetime.utcnow(),
+                )
+                session.add(row)
+            session.commit()
+        return len(rows)
+
+    def get_corporate_actions(self, symbol: str, start: str | date, end: str | date) -> list[dict]:
+        start_d, end_d = _parse_date(start), _parse_date(end)
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(CorporateActionRow)
+                .where(
+                    CorporateActionRow.symbol == symbol,
+                    CorporateActionRow.ex_date >= start_d,
+                    CorporateActionRow.ex_date <= end_d,
+                )
+                .order_by(CorporateActionRow.ex_date)
+            ).all()
+            return [
+                {
+                    "symbol": row.symbol,
+                    "announcement_date": row.announcement_date.isoformat() if row.announcement_date else None,
+                    "ex_date": row.ex_date.isoformat(),
+                    "action_type": row.action_type,
+                    "cash_dividend": row.cash_dividend,
+                    "split_ratio": row.split_ratio,
+                    "rights_ratio": row.rights_ratio,
+                    "adjustment_factor": row.adjustment_factor,
+                    "available_at": row.available_at.isoformat() if row.available_at else None,
+                }
+                for row in rows
+            ]
+
     def upsert_calendar(self, trading_days: list[str]) -> int:
         with self._session_factory() as session:
             for value in trading_days:
@@ -266,6 +450,128 @@ class MarketDataService:
                     session.add(TradingCalendarRow(trading_date=day, is_trading_day=True))
             session.commit()
         return len(trading_days)
+
+    # ------------------------------------------- PIT memberships（收尾文档 §13）
+    def upsert_industry_memberships(self, rows: list[dict]) -> int:
+        """收尾文档 §13：PIT 行业归属（industry_membership_daily）。"""
+        with self._session_factory() as session:
+            for item in rows:
+                session.add(
+                    IndustryMembershipRow(
+                        symbol=item["symbol"],
+                        industry_standard=item.get("industry_standard", "SW"),
+                        industry_level=item.get("industry_level", "L1"),
+                        industry_code=item["industry_code"],
+                        valid_from=_parse_date(item["valid_from"]),
+                        valid_to=_parse_date(item.get("valid_to")),
+                        available_at=_parse_datetime(item.get("available_at")) or datetime.utcnow(),
+                    )
+                )
+            session.commit()
+        return len(rows)
+
+    def get_industry_memberships(self, symbol: str, as_of: str | date) -> list[dict]:
+        as_of_d = _parse_date(as_of)
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(IndustryMembershipRow)
+                .where(
+                    IndustryMembershipRow.symbol == symbol,
+                    IndustryMembershipRow.valid_from <= as_of_d,
+                    (IndustryMembershipRow.valid_to.is_(None)) | (IndustryMembershipRow.valid_to >= as_of_d),
+                )
+                .order_by(IndustryMembershipRow.industry_standard, IndustryMembershipRow.industry_level)
+            ).all()
+            return [
+                {
+                    "symbol": row.symbol,
+                    "industry_standard": row.industry_standard,
+                    "industry_level": row.industry_level,
+                    "industry_code": row.industry_code,
+                    "valid_from": row.valid_from.isoformat(),
+                    "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+                    "available_at": row.available_at.isoformat() if row.available_at else None,
+                }
+                for row in rows
+            ]
+
+    def upsert_index_constituents(self, rows: list[dict]) -> int:
+        """收尾文档 §13/§49：历史指数成分（防幸存者偏差）。"""
+        with self._session_factory() as session:
+            for item in rows:
+                session.add(
+                    IndexConstituentRow(
+                        index_code=item["index_code"],
+                        symbol=item["symbol"],
+                        valid_from=_parse_date(item["valid_from"]),
+                        valid_to=_parse_date(item.get("valid_to")),
+                        available_at=_parse_datetime(item.get("available_at")) or datetime.utcnow(),
+                    )
+                )
+            session.commit()
+        return len(rows)
+
+    def get_index_constituents(self, index_code: str, as_of: str | date) -> list[dict]:
+        as_of_d = _parse_date(as_of)
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(IndexConstituentRow)
+                .where(
+                    IndexConstituentRow.index_code == index_code,
+                    IndexConstituentRow.valid_from <= as_of_d,
+                    (IndexConstituentRow.valid_to.is_(None)) | (IndexConstituentRow.valid_to >= as_of_d),
+                )
+                .order_by(IndexConstituentRow.symbol)
+            ).all()
+            return [
+                {
+                    "index_code": row.index_code,
+                    "symbol": row.symbol,
+                    "valid_from": row.valid_from.isoformat(),
+                    "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+                    "available_at": row.available_at.isoformat() if row.available_at else None,
+                }
+                for row in rows
+            ]
+
+    def upsert_concept_memberships(self, rows: list[dict]) -> int:
+        """收尾文档 §13：PIT 概念板块归属（concept_membership_daily）。"""
+        with self._session_factory() as session:
+            for item in rows:
+                session.add(
+                    ConceptMembershipRow(
+                        symbol=item["symbol"],
+                        concept_code=item["concept_code"],
+                        valid_from=_parse_date(item["valid_from"]),
+                        valid_to=_parse_date(item.get("valid_to")),
+                        available_at=_parse_datetime(item.get("available_at")) or datetime.utcnow(),
+                    )
+                )
+            session.commit()
+        return len(rows)
+
+    def get_concept_memberships(self, symbol: str, as_of: str | date) -> list[dict]:
+        as_of_d = _parse_date(as_of)
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(ConceptMembershipRow)
+                .where(
+                    ConceptMembershipRow.symbol == symbol,
+                    ConceptMembershipRow.valid_from <= as_of_d,
+                    (ConceptMembershipRow.valid_to.is_(None)) | (ConceptMembershipRow.valid_to >= as_of_d),
+                )
+                .order_by(ConceptMembershipRow.concept_code)
+            ).all()
+            return [
+                {
+                    "symbol": row.symbol,
+                    "concept_code": row.concept_code,
+                    "valid_from": row.valid_from.isoformat(),
+                    "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+                    "available_at": row.available_at.isoformat() if row.available_at else None,
+                }
+                for row in rows
+            ]
 
     def trading_days(self, start: date, end: date) -> list[date]:
         with self._session_factory() as session:
@@ -288,7 +594,12 @@ class MarketDataService:
         data_version: str,
         frequency: str,
         adjustment: str,
+        *,
+        start_d: date | None = None,
+        end_d: date | None = None,
         as_of: str | None,
+        location=None,
+        row_count: int = 0,
         summary: dict,
     ) -> None:
         with self._session_factory() as session:
@@ -298,10 +609,20 @@ class MarketDataService:
                     MarketSnapshotRow(
                         snapshot_id=snapshot_id,
                         data_version=data_version,
+                        dataset_uri=location.dataset_uri if location else None,
+                        manifest_uri=location.manifest_uri if location else None,
+                        manifest_hash=location.manifest_hash if location else None,
                         source=self._source,
                         frequency=frequency,
                         adjustment=adjustment,
+                        start_date=start_d,
+                        end_date=end_d,
                         as_of=as_of,
+                        symbol_count=int(summary.get("symbol_count", 0)),
+                        date_count=int(summary.get("date_count", 0)),
+                        row_count=row_count,
+                        schema_version=SNAPSHOT_SCHEMA_VERSION,
+                        immutable=True,
                         payload_summary=summary,
                     )
                 )
@@ -315,11 +636,22 @@ class MarketDataService:
             return {
                 "snapshot_id": row.snapshot_id,
                 "data_version": row.data_version,
+                "dataset_uri": row.dataset_uri,
+                "manifest_uri": row.manifest_uri,
+                "manifest_hash": row.manifest_hash,
                 "source": row.source,
                 "frequency": row.frequency,
                 "adjustment": row.adjustment,
                 "universe": row.universe,
+                "start_date": row.start_date.isoformat() if row.start_date else None,
+                "end_date": row.end_date.isoformat() if row.end_date else None,
                 "as_of": row.as_of,
+                "symbol_count": row.symbol_count,
+                "date_count": row.date_count,
+                "row_count": row.row_count,
+                "schema_version": row.schema_version,
+                "immutable": row.immutable,
+                "quality_status": row.quality_status,
                 "created_at": row.created_at.isoformat(timespec="seconds"),
                 "payload_summary": row.payload_summary,
             }

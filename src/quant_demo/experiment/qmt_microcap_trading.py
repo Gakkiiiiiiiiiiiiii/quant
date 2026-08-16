@@ -13,7 +13,7 @@ import pandas as pd
 from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
 
-from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient
+from quant_demo.adapters.qmt.bridge_client import QmtBridgeClient  # noqa: F401 - 测试通过模块属性 monkeypatch 该类
 from quant_demo.adapters.qmt.gateway import QmtBrokerClient, create_bridge_client
 from quant_demo.audit.report_service import AuditReportService
 from quant_demo.core.config import AppSettings, StrategySettings
@@ -37,13 +37,10 @@ from quant_demo.experiment.joinquant_microcap_engine import (
     MicrocapStrategyConfig,
     _apply_st_risk_announcement_flags,
     _special_treatment_flags_from_name,
-    adjust_target_amount_for_rules,
     available_trade_shares,
     build_portfolio_selection,
     buy_fee,
-    calc_amount_by_cash,
     calc_target_amount_by_value,
-    calendar_hedge_ratio,
     can_trade,
     fit_target_count_by_cash,
     resolve_effective_microcap_config,

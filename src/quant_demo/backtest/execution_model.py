@@ -71,9 +71,9 @@ def resolve_fill_price(model: ExecutionModel, bar: dict) -> float | None:
     if model == ExecutionModel.CLOSE:
         return close_price
     if model == ExecutionModel.VWAP:
-        if None in (high, low, close):
+        if None in (high, low, close_price):
             return close_price
-        return round((high + low + close) / 3.0, 6)
+        return round((high + low + close_price) / 3.0, 6)
     return close_price
 
 

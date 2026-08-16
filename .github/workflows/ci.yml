@@ -18,9 +18,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[api,test]"
       - name: Ruff
+        # 收尾文档 §52：Ruff 必须强制失败，禁止 || true
         run: |
           pip install ruff
-          ruff check src tests || true
+          ruff check src tests
       - name: Pytest (coverage)
         run: |
           pip install pytest-cov
@@ -28,6 +29,12 @@ jobs:
       - name: Contract tests
         # §66/§67：market-data.v1 / backtest.v1 / trading.v1 provider 契约测试
         run: pytest -q tests/test_market_data_contract.py tests/test_backtest_api.py tests/test_paper_api.py
+      - name: Snapshot immutability tests
+        # 收尾文档 §12/§51：不可变快照回归
+        run: pytest -q tests/test_snapshot_immutability.py tests/test_snapshot_manifest.py tests/test_snapshot_corruption.py tests/test_backtest_snapshot_replay.py tests/test_backtest_no_live_reload.py
+      - name: Golden and no-lookahead tests
+        # 收尾文档 §51/§53/§54/§55：Golden Market/Backtest 与未来函数防护
+        run: pytest -q tests/test_golden_market_snapshot.py tests/test_backtest_api.py
 
   docker-build:
     runs-on: ubuntu-latest

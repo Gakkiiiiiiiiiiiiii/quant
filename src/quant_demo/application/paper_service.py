@@ -6,8 +6,7 @@ T+1、涨跌停/停牌阻断等执行语义（§53）。
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-from typing import Any
+from datetime import date, timedelta
 
 from sqlalchemy import select
 

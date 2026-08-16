@@ -35,3 +35,11 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q --basetemp=data/pytest_tmp"
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+# 收尾文档 §52：CI 强制 Ruff 失败；规则集显式锁定核心错误，避免默认规则集升级漂移。
+select = ["E4", "E7", "E9", "F"]

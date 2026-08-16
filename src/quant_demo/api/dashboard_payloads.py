@@ -1798,7 +1798,6 @@ def build_dashboard_payload(
         pattern_actions = _filter_pattern_frame(pattern_actions, "策略(B1 B2 B3)", {primary_mode})
         pattern_decisions = _filter_pattern_frame(pattern_decisions, "mode", {primary_mode})
         pattern_base = Path(pattern["base_dir"])
-        pattern_report = _load_pattern_csv(pattern_base, primary_record.get("report_path"), date_columns=["datetime"])
         pattern_risk_raw = _load_pattern_csv(pattern_base, primary_record.get("risk_path"))
         pattern_risk = _build_pattern_risk_frame(pattern_risk_raw, primary_mode)
         display_risk = pattern_risk

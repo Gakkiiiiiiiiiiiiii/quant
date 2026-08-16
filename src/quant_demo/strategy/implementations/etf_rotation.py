@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import pandas as pd
 
 from quant_demo.strategy.base import StrategyContext
 

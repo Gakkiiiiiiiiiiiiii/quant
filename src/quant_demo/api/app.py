@@ -2,6 +2,7 @@
 
 import json
 import mimetypes
+import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,6 +30,9 @@ from quant_demo.core.enums import Environment
 
 
 class DemoApiHandler(BaseHTTPRequestHandler):
+    """旧 BaseHTTPRequestHandler 栈（收尾文档 §46：已废弃，仅保留兼容；
+    生产入口统一为 FastAPI（quant_demo.api.v1_app:app））。"""
+
     config_path = str(ROOT / "configs" / "app.yaml")
     frontend_dist: str | None = None
 
@@ -268,6 +272,24 @@ class DemoApiHandler(BaseHTTPRequestHandler):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8011, config_path: str | None = None, frontend_dist: str | None = None) -> None:
+    """收尾文档 §46：部署入口收敛为单一 FastAPI 栈（uvicorn）。
+
+    旧 BaseHTTPRequestHandler 双栈不再作为生产入口；Dashboard 端点已以
+    legacy_router 形式挂载进 quant_demo.api.v1_app:app。
+    """
+    import uvicorn
+
+    from quant_demo.api.v1_app import app
+
+    if config_path:
+        DemoApiHandler.config_path = config_path
+    if frontend_dist:
+        os.environ["QUANT_FRONTEND_DIST"] = frontend_dist
+    uvicorn.run(app, host=host, port=port)
+
+
+def serve_legacy(host: str = "127.0.0.1", port: int = 8011, config_path: str | None = None, frontend_dist: str | None = None) -> None:
+    """仅调试用：旧 BaseHTTPRequestHandler 栈（§46 不再长期维护）。"""
     if config_path:
         DemoApiHandler.config_path = config_path
     DemoApiHandler.frontend_dist = frontend_dist

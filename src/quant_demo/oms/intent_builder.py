@@ -3,7 +3,7 @@
 from datetime import date
 
 from quant_demo.core.events import OrderIntent
-from quant_demo.core.enums import IntentSource, OrderSide
+from quant_demo.core.enums import IntentSource
 from quant_demo.portfolio.rebalancer import RebalanceInstruction
 
 

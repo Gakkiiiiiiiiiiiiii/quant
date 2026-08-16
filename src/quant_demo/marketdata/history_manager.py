@@ -5,12 +5,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 
 from quant_demo.adapters.qmt.gateway import create_gateway
 from quant_demo.adapters.qmt.quote_client import XtQuantQuoteClient
 from quant_demo.core.config import AppSettings
-from quant_demo.marketdata.ingestion import history_metadata_path, load_history_dataframe, load_history_metadata, merge_history_frames
+from quant_demo.marketdata.ingestion import history_metadata_path, load_history_dataframe, load_history_metadata
 
 
 LOGGER = logging.getLogger(__name__)

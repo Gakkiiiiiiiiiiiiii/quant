@@ -10,7 +10,7 @@ import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime
 from typing import Any
 
 from sqlalchemy import select
@@ -21,8 +21,15 @@ from quant_demo.backtest.metrics import compute_metrics
 from quant_demo.backtest.target_portfolio import TargetPortfolio, TargetWeight
 from quant_demo.backtest.time_contract import LookaheadViolation
 from quant_demo.backtest.transaction_cost import TransactionCostModel
-from quant_demo.core.error_codes import BACKTEST_FAILED, DATA_NOT_READY, LOOKAHEAD_VIOLATION, SNAPSHOT_NOT_FOUND
+from quant_demo.core.error_codes import (
+    BACKTEST_FAILED,
+    DATA_NOT_READY,
+    LOOKAHEAD_VIOLATION,
+    SNAPSHOT_CORRUPTED,
+    SNAPSHOT_NOT_FOUND,
+)
 from quant_demo.db.models_market import BacktestJobRow, BacktestResultRow
+from quant_demo.snapshot.store import SnapshotCorruptedError
 
 
 class BacktestService:
@@ -125,6 +132,9 @@ class BacktestService:
         except LookaheadViolation as exc:
             self._fail(backtest_id, LOOKAHEAD_VIOLATION, str(exc))
             return
+        except SnapshotCorruptedError as exc:
+            self._fail(backtest_id, SNAPSHOT_CORRUPTED, str(exc))
+            return
         except KeyError as exc:
             self._fail(backtest_id, SNAPSHOT_NOT_FOUND, f"missing input: {exc}")
             return
@@ -170,11 +180,20 @@ class BacktestService:
         end = payload.get("end")
         if not start or not end:
             raise KeyError("start/end")
-        symbols = payload.get("symbols") or self._symbols_from_snapshot(payload.get("market_snapshot_id"))
-        if not symbols:
-            raise KeyError("symbols or market_snapshot_id")
+        snapshot_id = payload.get("market_snapshot_id")
+        if snapshot_id:
+            # 收尾文档 §11：一旦指定 market_snapshot_id，必须 load_snapshot，
+            # 禁止重新访问 current source（即使原始行情后来修正）。
+            data = self._market.load_snapshot(snapshot_id)
+        else:
+            symbols = payload.get("symbols") or []
+            if not symbols:
+                raise KeyError("symbols or market_snapshot_id")
+            created = self._market.create_snapshot(symbols, start, end, adjust=payload.get("adjust", "qfq"))
+            snapshot_id = created["snapshot_id"]
+            data = self._market.load_snapshot(snapshot_id)
+        symbols = data["symbols"]
         self._set_progress(backtest_id, 5, "loading")
-        data = self._market.bars_batch(symbols=symbols, start=start, end=end, adjust=payload.get("adjust", "qfq"))
         dates = [date.fromisoformat(day) for day in data["dates"]]
         if not dates:
             raise RuntimeError(DATA_NOT_READY)
@@ -199,7 +218,7 @@ class BacktestService:
             price_limit=bool(execution.get("price_limit", True)),
             suspension=bool(execution.get("suspension", True)),
         )
-        portfolios = self._build_portfolios(payload, trading_days)
+        portfolios = self._build_portfolios(payload, trading_days, symbols)
         engine = EventDrivenBacktester(
             bars_by_day=bars_by_day,
             trading_days=[day for day in trading_days if dates[0] <= day <= dates[-1]],
@@ -228,6 +247,7 @@ class BacktestService:
             "daily_actions": result.daily_actions,
             "diagnostics": {
                 **result.diagnostics,
+                "market_snapshot_id": snapshot_id,
                 "data_snapshot_id": data["data_snapshot_id"],
                 "data_version": data["data_version"],
                 "portfolio_count": len(portfolios),
@@ -242,10 +262,10 @@ class BacktestService:
             return []
         return list(snapshot.get("payload_summary", {}).get("symbols", []))
 
-    def _build_portfolios(self, payload: dict[str, Any], trading_days: list[date]) -> list[TargetPortfolio]:
+    def _build_portfolios(self, payload: dict[str, Any], trading_days: list[date], snapshot_symbols: list[str]) -> list[TargetPortfolio]:
         strategy = payload.get("strategy") or {}
         strategy_type = strategy.get("type", "target_portfolio")
-        symbols = payload.get("symbols") or []
+        symbols = payload.get("symbols") or snapshot_symbols
         portfolios: list[TargetPortfolio] = []
         if strategy_type == "target_portfolio" and strategy.get("rebalance_targets"):
             for item in strategy["rebalance_targets"]:

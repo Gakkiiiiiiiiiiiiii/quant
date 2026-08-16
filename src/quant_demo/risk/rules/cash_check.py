@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-from decimal import Decimal
 
 from quant_demo.core.enums import OrderSide
 from quant_demo.core.events import AccountState, OrderIntent, RuleResult

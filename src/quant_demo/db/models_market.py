@@ -104,7 +104,7 @@ class IndexConstituentRow(Base):
 
 
 class IndustryMembershipRow(Base):
-    """PIT 行业归属（§8.5）。"""
+    """PIT 行业归属（§8.5；收尾文档 §13）。"""
 
     __tablename__ = "industry_membership"
     __table_args__ = (
@@ -121,18 +121,60 @@ class IndustryMembershipRow(Base):
     available_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class CorporateActionRow(Base):
+    """PIT 公司行动（收尾文档 §13）：分红/拆股/配股，available_at 约束 PIT 可见性。"""
+
+    __tablename__ = "corporate_action"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    announcement_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    ex_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False, default="DIVIDEND")
+    cash_dividend: Mapped[float | None] = mapped_column(Float, nullable=True)
+    split_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rights_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    adjustment_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    available_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ConceptMembershipRow(Base):
+    """PIT 概念板块归属（收尾文档 §13）。"""
+
+    __tablename__ = "concept_membership"
+    __table_args__ = (UniqueConstraint("symbol", "concept_code", "valid_from", name="uq_concept_membership"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    concept_code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    valid_from: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_to: Mapped[date | None] = mapped_column(Date, nullable=True)
+    available_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class MarketSnapshotRow(Base):
-    """不可变市场快照登记（§9 / §101）。"""
+    """不可变市场快照登记（§9 / §101；收尾文档 §9 字段扩展）。"""
 
     __tablename__ = "market_snapshots"
 
     snapshot_id: Mapped[str] = mapped_column(String(96), primary_key=True)
     data_version: Mapped[str] = mapped_column(String(96), nullable=False)
+    dataset_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    manifest_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    manifest_hash: Mapped[str | None] = mapped_column(String(96), nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="qmt")
     frequency: Mapped[str] = mapped_column(String(8), nullable=False, default="1d")
     adjustment: Mapped[str] = mapped_column(String(8), nullable=False, default="qfq")
     universe: Mapped[str] = mapped_column(String(32), nullable=False, default="A_SHARE")
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     as_of: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    symbol_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    date_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False, default="market-snapshot.v1")
+    immutable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    quality_status: Mapped[str] = mapped_column(String(32), nullable=False, default="OK")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     payload_summary: Mapped[dict] = mapped_column(JSON, default=dict)
 
