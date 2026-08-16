@@ -138,6 +138,11 @@ class OrderRecord:
     status: OrderStatus = OrderStatus.CREATED
     filled_qty: int = 0
     avg_price: Decimal | None = None
+    # 详细修改方案 §15：任何下单必须携带的身份字段。
+    client_order_id: str | None = None
+    idempotency_key: str | None = None
+    decision_id: str | None = None
+    portfolio_id: str | None = None
     order_id: str = field(default_factory=lambda: str(uuid4()))
 
 

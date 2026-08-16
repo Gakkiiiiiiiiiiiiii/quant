@@ -13,12 +13,19 @@ class OrderSide(str, Enum):
 
 
 class OrderStatus(str, Enum):
+    """详细修改方案 §15：OMS 全量订单状态。"""
+
     CREATED = "created"
+    RISK_REJECTED = "risk_rejected"
+    APPROVED = "approved"
     SUBMITTED = "submitted"
+    ACKNOWLEDGED = "acknowledged"
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
-    REJECTED = "rejected"
+    CANCEL_PENDING = "cancel_pending"
     CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
 
 
 class IntentSource(str, Enum):

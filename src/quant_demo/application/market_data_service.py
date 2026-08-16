@@ -35,6 +35,7 @@ from quant_demo.db.models_market import (
     TradingCalendarRow,
 )
 from quant_demo.marketdata.ingestion import load_history_dataframe
+from quant_demo.marketdata.quality import evaluate_frame_quality
 from quant_demo.snapshot.manifest import build_manifest
 from quant_demo.snapshot.models import SNAPSHOT_SCHEMA_VERSION
 from quant_demo.snapshot.store import (
@@ -132,6 +133,8 @@ class MarketDataService:
         ).hexdigest()
         # 与 stock_agent market-data.v1 语义一致：内容寻址的可重放快照 ID。
         data_snapshot_id = f"mds-{data_version}"
+        # 详细修改方案 §18：Market API 必须返回 quality_flags。
+        quality_flags = evaluate_frame_quality(window, symbols, end_d)
         self._materialize_snapshot(
             data_snapshot_id,
             data_version,
@@ -142,6 +145,7 @@ class MarketDataService:
             symbols=symbols,
             dates=dates,
             bars=bars,
+            quality_flags=quality_flags,
         )
         return {
             "symbols": symbols,
@@ -150,6 +154,7 @@ class MarketDataService:
             "data_version": data_version,
             "data_snapshot_id": data_snapshot_id,
             "source": self._source,
+            "quality_flags": quality_flags,
         }
 
     # ------------------------------------------------------------ snapshots
@@ -200,6 +205,38 @@ class MarketDataService:
             "snapshot_manifest": manifest,
         }
 
+    def verify_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        """详细修改方案 §20：POST /api/v1/market/snapshots/{id}/verify。
+
+        重新计算每个落盘文件的 sha256 并与 manifest 比对，确认可复算、未被篡改。
+        """
+        import hashlib
+        from pathlib import Path
+
+        manifest = self._snapshot_store.read_manifest(snapshot_id)  # 不存在时抛 SnapshotNotFoundError
+        directory = Path(self._snapshot_store._directory(snapshot_id))  # noqa: SLF001
+        manifest_hash = hashlib.sha256((directory / "manifest.json").read_bytes()).hexdigest()
+        checks: list[dict[str, Any]] = []
+        for item in manifest.get("files") or []:
+            path = directory / item["path"]
+            if not path.exists():
+                raise SnapshotCorruptedError(f"{snapshot_id}: 文件缺失 {item['path']}")
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            actual = digest.hexdigest()
+            if item.get("sha256") and actual != item["sha256"]:
+                raise SnapshotCorruptedError(f"{snapshot_id}: {item['path']} sha256 不一致")
+            checks.append({"path": item["path"], "sha256": actual})
+        return {
+            "snapshot_id": snapshot_id,
+            "verified": True,
+            "schema_version": manifest.get("schema_version"),
+            "manifest_hash": manifest_hash,
+            "files": checks,
+        }
+
     def _materialize_snapshot(
         self,
         snapshot_id: str,
@@ -212,6 +249,7 @@ class MarketDataService:
         symbols: list[str],
         dates: list[str],
         bars: dict[str, list],
+        quality_flags: list[str] | None = None,
     ) -> None:
         """收尾文档 §6/§10：写不可变 parquet + manifest，再登记 metadata。"""
         location = None
@@ -242,6 +280,9 @@ class MarketDataService:
                 fields=list(BAR_FIELDS),
                 dataset_path="bars.parquet",
                 dataset_sha256="",
+                dates=dates,
+                row_count=len(records),
+                quality_flags=quality_flags,
             )
             location = self._snapshot_store.save(snapshot_id, frame, manifest)
             manifest = self._snapshot_store.read_manifest(snapshot_id)

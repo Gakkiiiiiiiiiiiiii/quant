@@ -3,6 +3,12 @@
 .pytest_cache/
 .pytest_tmp/
 .tmp/
+# 详细修改方案 §7：IDE 文件与前端构建产物不作为源码提交
+.idea/
+.vscode/
+frontend/**/dist/
+.coverage
+.ruff_cache/
 tmp_pytest_bridge/
 tmp_api_err.log
 tmp_api_out.log

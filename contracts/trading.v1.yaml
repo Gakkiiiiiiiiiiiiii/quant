@@ -44,6 +44,46 @@ endpoints:
       - /api/v1/paper/accounts/{account_id}/orders
       - /api/v1/paper/accounts/{account_id}/trades
       - /api/v1/paper/accounts/{account_id}/equity
+  - name: reconciliation_run
+    method: POST
+    path: /api/v1/trading/reconciliation
+    description: "详细修改方案 §16：internal/broker 对账；CRITICAL 自动拉闸 global kill switch"
+    request:
+      internal: { type: object, required: true, description: "orders/trades/positions" }
+      broker: { type: object, required: true, description: "orders/trades/positions" }
+  - name: reconciliation_get
+    method: GET
+    path: /api/v1/trading/reconciliation
+  - name: kill_switch
+    method: POST
+    path: /api/v1/trading/kill-switch
+    description: "详细修改方案 §17：三级熔断 global / account:{id} / strategy:{id}"
+    request:
+      action: { type: string, enum: [engage, release, state], default: state }
+      scope: { type: string, required: false }
+      reason:
+        type: string
+        enum: [POSITION_MISMATCH, DAILY_LOSS, BROKER_DISCONNECTED, MARKET_DATA_STALE,
+               ORDER_REJECTION_STORM, RECONCILIATION_CRITICAL, MANUAL]
+oms_order_states:
+  # 详细修改方案 §15：全量状态机
+  - CREATED
+  - RISK_REJECTED
+  - APPROVED
+  - SUBMITTED
+  - ACKNOWLEDGED
+  - PARTIALLY_FILLED
+  - FILLED
+  - CANCEL_PENDING
+  - CANCELLED
+  - REJECTED
+  - UNKNOWN
+required_order_identity:
+  # §15：任何下单必须携带
+  - client_order_id
+  - idempotency_key
+  - decision_id
+  - portfolio_id
 execution_semantics:
   # 与 backtest.v1 保持一致（§53 Backtest / Paper / Live 共用核心）
   - T+1：当日买入不可卖出

@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dtime
 from enum import Enum
 
+# 详细修改方案 §14：执行语义版本必须写进 BacktestResult 与 backtest_spec_hash。
+EXECUTION_MODEL_VERSION = "execution-model.v1"
+
 
 class ExecutionModel(str, Enum):
     NEXT_OPEN = "next_open"
@@ -77,4 +80,4 @@ def resolve_fill_price(model: ExecutionModel, bar: dict) -> float | None:
     return close_price
 
 
-__all__ = ["ExecutionModel", "ExecutionSchedule", "resolve_fill_price", "schedule_for"]
+__all__ = ["EXECUTION_MODEL_VERSION", "ExecutionModel", "ExecutionSchedule", "resolve_fill_price", "schedule_for"]

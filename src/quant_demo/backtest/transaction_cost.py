@@ -7,6 +7,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+# 详细修改方案 §12：成本模型版本参与 backtest_spec_hash。
+TRANSACTION_COST_VERSION = "transaction-cost.v1"
+
 
 class TransactionCostModel(BaseModel):
     """A 股成本模型：佣金（含最低佣金）+ 印花税 + 过户费 + 滑点。"""
@@ -44,4 +47,4 @@ class TransactionCostModel(BaseModel):
         return round(sum(cost.values()), 2)
 
 
-__all__ = ["TransactionCostModel"]
+__all__ = ["TRANSACTION_COST_VERSION", "TransactionCostModel"]

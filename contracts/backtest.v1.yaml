@@ -47,6 +47,14 @@ endpoints:
       - /api/v1/backtests/{backtest_id}/positions
       - /api/v1/backtests/{backtest_id}/daily-actions
       - /api/v1/backtests/{backtest_id}/diagnostics
+  - name: get_backtest_lineage
+    method: GET
+    path: /api/v1/backtests/{backtest_id}/lineage
+    description: "详细修改方案 §20：回测血缘（spec hash/快照身份/执行与成本模型版本/代码版本）"
+  - name: replay_backtest
+    method: POST
+    path: /api/v1/backtests/{backtest_id}/replay
+    description: "详细修改方案 §3.4：确定性重放，比对结果内容哈希"
 job_schema:
   # §43 backtest_jobs
   fields: [backtest_id, status, strategy_id, strategy_version, market_snapshot_id, config_hash,
@@ -75,6 +83,18 @@ quality_flags:
   - PIT_SECURITY_STATUS_MISSING
   - LOOKAHEAD_CHECK_BYPASSED
   - SURVIVORSHIP_RISK
+backtest_spec_hash:
+  # 详细修改方案 §12：BacktestRequest 内容寻址身份，写入结果 diagnostics
+  fields:
+    - strategy_id
+    - strategy_version
+    - strategy_config_hash
+    - market_snapshot_id
+    - execution_model_version   # 当前 execution-model.v1
+    - transaction_cost_version  # 当前 transaction-cost.v1
+    - initial_cash
+    - benchmark
+    - code_sha
 rules:
   - Backtest 必须异步执行，创建立即返回 QUEUED
   - 相同 config_hash 的已完成回测必须复用（§44）

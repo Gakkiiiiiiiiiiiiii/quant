@@ -8,28 +8,37 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time as dtime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 
 from quant_demo.backtest.engine import BacktestExecutionConfig, EventDrivenBacktester
-from quant_demo.backtest.execution_model import ExecutionModel
+from quant_demo.backtest.execution_model import EXECUTION_MODEL_VERSION, ExecutionModel
 from quant_demo.backtest.metrics import compute_metrics
 from quant_demo.backtest.target_portfolio import TargetPortfolio, TargetWeight
 from quant_demo.backtest.time_contract import LookaheadViolation
-from quant_demo.backtest.transaction_cost import TransactionCostModel
+from quant_demo.backtest.transaction_cost import TRANSACTION_COST_VERSION, TransactionCostModel
 from quant_demo.core.error_codes import (
     BACKTEST_FAILED,
     DATA_NOT_READY,
+    DATA_QUALITY_REJECTED,
     LOOKAHEAD_VIOLATION,
     SNAPSHOT_CORRUPTED,
     SNAPSHOT_NOT_FOUND,
 )
 from quant_demo.db.models_market import BacktestJobRow, BacktestResultRow
+from quant_demo.marketdata.quality import critical_flags
 from quant_demo.snapshot.store import SnapshotCorruptedError
+
+
+class DataQualityRejectedError(RuntimeError):
+    """详细修改方案 §18：critical quality flag 默认拒绝生产回测。"""
 
 
 class BacktestService:
@@ -135,6 +144,9 @@ class BacktestService:
         except SnapshotCorruptedError as exc:
             self._fail(backtest_id, SNAPSHOT_CORRUPTED, str(exc))
             return
+        except DataQualityRejectedError as exc:
+            self._fail(backtest_id, DATA_QUALITY_REJECTED, str(exc))
+            return
         except KeyError as exc:
             self._fail(backtest_id, SNAPSHOT_NOT_FOUND, f"missing input: {exc}")
             return
@@ -180,6 +192,18 @@ class BacktestService:
         end = payload.get("end")
         if not start or not end:
             raise KeyError("start/end")
+        strategy = payload.get("strategy") or {}
+        strategy_id = str(strategy.get("type", "target_portfolio"))
+        strategy_version = str(strategy.get("version", "v1"))
+        strategy_config_hash = hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in strategy.items() if key not in ("type", "version")},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
         snapshot_id = payload.get("market_snapshot_id")
         if snapshot_id:
             # 收尾文档 §11：一旦指定 market_snapshot_id，必须 load_snapshot，
@@ -193,6 +217,13 @@ class BacktestService:
             snapshot_id = created["snapshot_id"]
             data = self._market.load_snapshot(snapshot_id)
         symbols = data["symbols"]
+        # 详细修改方案 §18：生产 Backtest 对 critical quality flag 默认拒绝。
+        data_quality_flags = list(
+            data.get("quality_flags") or (data.get("snapshot_manifest") or {}).get("quality_flags") or []
+        )
+        blocked = critical_flags(data_quality_flags)
+        if blocked and not payload.get("allow_critical_quality", False):
+            raise DataQualityRejectedError(f"critical quality flags: {', '.join(blocked)}")
         self._set_progress(backtest_id, 5, "loading")
         dates = [date.fromisoformat(day) for day in data["dates"]]
         if not dates:
@@ -238,6 +269,19 @@ class BacktestService:
         quality_flags = list(result.quality_flags)
         if benchmark_equity is None and payload.get("benchmark"):
             quality_flags.append("BENCHMARK_DATA_MISSING")
+        # 详细修改方案 §12：BacktestRequest 身份；§14：execution_model_version 必须写进结果。
+        code_sha = _code_sha()
+        spec_hash = spec_hash_of(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            strategy_config_hash=strategy_config_hash,
+            market_snapshot_id=snapshot_id,
+            execution_model_version=EXECUTION_MODEL_VERSION,
+            transaction_cost_version=TRANSACTION_COST_VERSION,
+            initial_cash=float(payload.get("initial_cash", 1_000_000)),
+            benchmark=payload.get("benchmark"),
+            code_sha=code_sha,
+        )
         return {
             "metrics": metrics,
             "quality_flags": quality_flags,
@@ -251,6 +295,12 @@ class BacktestService:
                 "data_snapshot_id": data["data_snapshot_id"],
                 "data_version": data["data_version"],
                 "portfolio_count": len(portfolios),
+                "data_quality_flags": data_quality_flags,
+                "backtest_spec_hash": spec_hash,
+                "execution_model": config.execution_model.value,
+                "execution_model_version": EXECUTION_MODEL_VERSION,
+                "transaction_cost_version": TRANSACTION_COST_VERSION,
+                "code_sha": code_sha,
             },
         }
 
@@ -311,6 +361,146 @@ class BacktestService:
     def _set_progress(self, backtest_id: str, progress: int, phase: str) -> None:
         with self._lock:
             self._progress[backtest_id] = (min(progress, 99), phase)
+
+    # ------------------------------------------------------------- lineage
+    def lineage(self, backtest_id: str) -> dict[str, Any] | None:
+        """详细修改方案 §20：GET /api/v1/backtests/{id}/lineage。
+
+        回测血缘 = 请求身份(spec hash) + 市场快照身份 + 执行/成本模型版本 + 代码版本。
+        """
+        with self._session_factory() as session:
+            job = session.get(BacktestJobRow, backtest_id)
+            if job is None:
+                return None
+            result = session.get(BacktestResultRow, backtest_id)
+            request_payload = dict(job.request_payload or {})
+            diagnostics = dict((result.diagnostics if result else None) or {})
+        strategy = request_payload.get("strategy") or {}
+        snapshot_id = job.market_snapshot_id or diagnostics.get("market_snapshot_id")
+        manifest = None
+        if snapshot_id:
+            snapshot = self._market.get_snapshot(snapshot_id)
+            if snapshot:
+                manifest = {
+                    "data_version": snapshot.get("data_version"),
+                    "manifest_hash": snapshot.get("manifest_hash"),
+                    "schema_version": snapshot.get("schema_version"),
+                    "source": snapshot.get("source"),
+                }
+        return {
+            "backtest_id": backtest_id,
+            "status": job.status,
+            "strategy": {"type": job.strategy_id, "version": job.strategy_version, "config": strategy},
+            "market_snapshot": {"snapshot_id": snapshot_id, "manifest": manifest},
+            "execution_model": diagnostics.get("execution_model"),
+            "execution_model_version": diagnostics.get("execution_model_version", EXECUTION_MODEL_VERSION),
+            "transaction_cost_version": diagnostics.get("transaction_cost_version", TRANSACTION_COST_VERSION),
+            "initial_cash": job.initial_cash,
+            "benchmark": job.benchmark,
+            "config_hash": job.config_hash,
+            "backtest_spec_hash": diagnostics.get("backtest_spec_hash"),
+            "code_sha": diagnostics.get("code_sha"),
+        }
+
+    # -------------------------------------------------------------- replay
+    def replay(self, backtest_id: str) -> dict[str, Any] | None:
+        """详细修改方案 §3.4/§20：POST /api/v1/backtests/{id}/replay。
+
+        用原始 request_payload 重新执行（快照不可变），比对结果内容哈希。
+        """
+        with self._session_factory() as session:
+            job = session.get(BacktestJobRow, backtest_id)
+            if job is None:
+                return None
+            payload = dict(job.request_payload or {})
+            stored_row = session.get(BacktestResultRow, backtest_id)
+            stored_fields = _replay_fields(stored_row) if stored_row else None
+        try:
+            replayed = self._execute(payload, f"{backtest_id}:replay")
+        except Exception as exc:  # noqa: BLE001
+            return {"original_backtest_id": backtest_id, "match": False, "error": str(exc)[:500]}
+        replay_hash = _result_hash({key: replayed[key] for key in _REPLAY_FIELDS})
+        stored_hash = _result_hash(stored_fields) if stored_fields else None
+        return {
+            "original_backtest_id": backtest_id,
+            "match": bool(stored_fields) and stored_hash == replay_hash,
+            "stored_result_hash": stored_hash,
+            "replay_result_hash": replay_hash,
+            "replayed": {
+                "market_snapshot_id": replayed["diagnostics"].get("market_snapshot_id"),
+                "backtest_spec_hash": replayed["diagnostics"].get("backtest_spec_hash"),
+                "execution_model_version": replayed["diagnostics"].get("execution_model_version"),
+                "metrics": replayed["metrics"],
+                "quality_flags": replayed["quality_flags"],
+            },
+        }
+
+
+_REPLAY_FIELDS = ("metrics", "quality_flags", "equity", "trades", "positions", "daily_actions")
+
+
+def _replay_fields(row: BacktestResultRow) -> dict[str, Any]:
+    return {
+        "metrics": row.metrics,
+        "quality_flags": row.quality_flags,
+        "equity": row.equity,
+        "trades": row.trades,
+        "positions": row.positions,
+        "daily_actions": row.daily_actions,
+    }
+
+
+def _result_hash(fields: dict[str, Any] | None) -> str | None:
+    """BacktestResult 内容寻址哈希（§12）：metrics/equity/trades/positions/daily_actions。"""
+    if fields is None:
+        return None
+    return hashlib.sha256(
+        json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def spec_hash_of(
+    *,
+    strategy_id: str,
+    strategy_version: str,
+    strategy_config_hash: str,
+    market_snapshot_id: str | None,
+    execution_model_version: str,
+    transaction_cost_version: str,
+    initial_cash: float,
+    benchmark: str | None,
+    code_sha: str,
+) -> str:
+    """详细修改方案 §12：backtest_spec_hash 内容寻址身份。"""
+    material = {
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "strategy_config_hash": strategy_config_hash,
+        "market_snapshot_id": market_snapshot_id,
+        "execution_model_version": execution_model_version,
+        "transaction_cost_version": transaction_cost_version,
+        "initial_cash": initial_cash,
+        "benchmark": benchmark,
+        "code_sha": code_sha,
+    }
+    return hashlib.sha256(
+        json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _code_sha() -> str:
+    """当前代码版本：优先环境变量，其次 git HEAD。"""
+    cached = os.getenv("QUANT_GIT_COMMIT")
+    if cached:
+        return cached
+    try:
+        root = Path(__file__).resolve().parents[3]
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, timeout=2, check=False
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def reproducibility_hash(payload: dict[str, Any]) -> str:
@@ -421,4 +611,4 @@ def _benchmark_equity(benchmark: str | None, bars_by_day: dict, dates: list[date
     return series or None
 
 
-__all__ = ["BacktestService", "reproducibility_hash"]
+__all__ = ["BacktestService", "reproducibility_hash", "spec_hash_of"]

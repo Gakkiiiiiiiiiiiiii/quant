@@ -26,6 +26,8 @@ from typing import Any, Callable
 from quant_demo.application.backtest_service import BacktestService
 from quant_demo.application.market_data_service import MARKET_DATA_CONTRACT, MarketDataService
 from quant_demo.application.paper_service import PaperService
+from quant_demo.oms.kill_switch import TRIGGER_REASONS
+from quant_demo.oms.trading_ops import TradingOpsService
 
 try:  # FastAPI 为可选依赖（[api] extra）；模块级导入供端点注解解析。
     from fastapi import Request
@@ -35,11 +37,12 @@ from quant_demo.core.error_codes import (
     BACKTEST_FAILED,
     CONTRACT_VERSION_UNSUPPORTED,
     DATA_NOT_READY,
+    SNAPSHOT_CORRUPTED,
     SNAPSHOT_NOT_FOUND,
 )
 from quant_demo.core.exceptions import DataNotReadyError
 from quant_demo.db.session import create_session_factory
-from quant_demo.snapshot.store import LocalParquetSnapshotStore
+from quant_demo.snapshot.store import LocalParquetSnapshotStore, SnapshotCorruptedError, SnapshotNotFoundError
 
 SERVICE_NAME = "quant"
 SERVICE_VERSION = "1.0.0"
@@ -72,6 +75,8 @@ class V1State:
         self.market = MarketDataService(history_path, session_factory, source=source, snapshot_store=snapshot_store)
         self.backtests = BacktestService(session_factory, self.market)
         self.paper = PaperService(session_factory, self.market)
+        # 详细修改方案 §16/§17：Reconciliation + Kill Switch 运行态。
+        self.trading_ops = TradingOpsService()
 
 
 _state: V1State | None = None
@@ -188,6 +193,18 @@ def handle_snapshot_create(headers: dict, query: dict, body: dict) -> tuple[int,
         return _error(503, DATA_NOT_READY, str(exc), trace_id)
     snapshot = get_state().market.get_snapshot(data["snapshot_id"])
     return 201, {"contract_version": MARKET_DATA_CONTRACT, "meta": _meta(trace_id, MARKET_DATA_CONTRACT), "data": snapshot or data}
+
+
+def handle_snapshot_verify(headers: dict, query: dict, body: dict, snapshot_id: str = "") -> tuple[int, dict]:
+    """详细修改方案 §20：POST /api/v1/market/snapshots/{id}/verify。"""
+    trace_id = _trace_id(headers, body)
+    try:
+        report = get_state().market.verify_snapshot(snapshot_id)
+    except SnapshotNotFoundError:
+        return _error(404, SNAPSHOT_NOT_FOUND, f"snapshot {snapshot_id} not found", trace_id)
+    except SnapshotCorruptedError as exc:
+        return _error(409, SNAPSHOT_CORRUPTED, str(exc), trace_id)
+    return 200, {"contract_version": MARKET_DATA_CONTRACT, "meta": _meta(trace_id, MARKET_DATA_CONTRACT), "data": report}
 
 
 def handle_security_master_upsert(headers: dict, query: dict, body: dict) -> tuple[int, dict]:
@@ -327,6 +344,65 @@ def _backtest_field_handler(field: str) -> Handler:
     return handler
 
 
+def handle_backtest_lineage(headers: dict, query: dict, body: dict, backtest_id: str = "") -> tuple[int, dict]:
+    """详细修改方案 §20：GET /api/v1/backtests/{id}/lineage。"""
+    trace_id = _trace_id(headers, body)
+    payload = get_state().backtests.lineage(backtest_id)
+    if payload is None:
+        return _error(404, SNAPSHOT_NOT_FOUND, f"backtest {backtest_id} not found", trace_id)
+    return 200, {"contract_version": "backtest.v1", "meta": _meta(trace_id, "backtest.v1"), "data": payload}
+
+
+def handle_backtest_replay(headers: dict, query: dict, body: dict, backtest_id: str = "") -> tuple[int, dict]:
+    """详细修改方案 §20：POST /api/v1/backtests/{id}/replay（确定性重放比对）。"""
+    trace_id = _trace_id(headers, body)
+    payload = get_state().backtests.replay(backtest_id)
+    if payload is None:
+        return _error(404, SNAPSHOT_NOT_FOUND, f"backtest {backtest_id} not found", trace_id)
+    return 200, {"contract_version": "backtest.v1", "meta": _meta(trace_id, "backtest.v1"), "data": payload}
+
+
+def handle_trading_reconciliation_post(headers: dict, query: dict, body: dict) -> tuple[int, dict]:
+    """详细修改方案 §16/§20：提交 internal/broker 数据并执行对账。"""
+    trace_id = _trace_id(headers, body)
+    internal = body.get("internal")
+    broker = body.get("broker")
+    if internal is None or broker is None:
+        return _error(422, DATA_NOT_READY, "internal/broker are required", trace_id)
+    report = get_state().trading_ops.run_reconciliation(internal, broker)
+    return 200, {"contract_version": "trading.v1", "meta": _meta(trace_id, "trading.v1"), "data": report}
+
+
+def handle_trading_reconciliation_get(headers: dict, query: dict, body: dict) -> tuple[int, dict]:
+    trace_id = _trace_id(headers, body)
+    report = get_state().trading_ops.last_report()
+    return 200, {"contract_version": "trading.v1", "meta": _meta(trace_id, "trading.v1"), "data": {"report": report}}
+
+
+def handle_trading_kill_switch(headers: dict, query: dict, body: dict) -> tuple[int, dict]:
+    """详细修改方案 §17/§20：engage / release / state。"""
+    trace_id = _trace_id(headers, body)
+    ops = get_state().trading_ops
+    action = str(body.get("action", "state")).lower()
+    if action == "state":
+        return 200, {"contract_version": "trading.v1", "meta": _meta(trace_id, "trading.v1"), "data": {"switches": ops.kill_switch_state()}}
+    scope = str(body.get("scope") or "").strip()
+    if not scope:
+        return _error(422, DATA_NOT_READY, "scope is required (global / account:{id} / strategy:{id})", trace_id)
+    if action == "engage":
+        reason = str(body.get("reason") or "").strip()
+        if not ops.validate_reason(reason):
+            return _error(422, DATA_NOT_READY, f"unknown reason, expected one of {sorted(TRIGGER_REASONS)}", trace_id)
+        entry = ops.engage_kill_switch(scope, reason, str(body.get("detail") or ""))
+        return 200, {"contract_version": "trading.v1", "meta": _meta(trace_id, "trading.v1"), "data": entry}
+    if action == "release":
+        released = ops.release_kill_switch(scope)
+        if not released:
+            return _error(404, DATA_NOT_READY, f"kill switch not found: {scope}", trace_id)
+        return 200, {"contract_version": "trading.v1", "meta": _meta(trace_id, "trading.v1"), "data": {"scope": scope, "engaged": False}}
+    return _error(422, DATA_NOT_READY, f"unknown action: {action}", trace_id)
+
+
 def handle_paper_create_account(headers: dict, query: dict, body: dict) -> tuple[int, dict]:
     trace_id = _trace_id(headers, body)
     account = get_state().paper.create_account(body.get("name", "paper"), float(body.get("initial_cash", 1_000_000)))
@@ -404,6 +480,7 @@ _ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("POST", "/v1/bars/batch", handle_bars_batch, False),  # 迁移期兼容旧路径（§12）
     ("POST", "/api/v1/market/snapshots", handle_snapshot_create, False),
     ("GET", "/api/v1/market/snapshots/{snapshot_id}", handle_snapshot_get, True),
+    ("POST", "/api/v1/market/snapshots/{snapshot_id}/verify", handle_snapshot_verify, True),
     ("POST", "/api/v1/market/security-master", handle_security_master_upsert, False),
     ("GET", "/api/v1/market/securities", handle_securities, False),
     ("POST", "/api/v1/market/security-status", handle_security_status_upsert, False),
@@ -426,6 +503,11 @@ _ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("GET", "/api/v1/backtests/{backtest_id}/positions", _backtest_field_handler("positions"), True),
     ("GET", "/api/v1/backtests/{backtest_id}/daily-actions", _backtest_field_handler("daily_actions"), True),
     ("GET", "/api/v1/backtests/{backtest_id}/diagnostics", _backtest_field_handler("diagnostics"), True),
+    ("GET", "/api/v1/backtests/{backtest_id}/lineage", handle_backtest_lineage, True),
+    ("POST", "/api/v1/backtests/{backtest_id}/replay", handle_backtest_replay, True),
+    ("POST", "/api/v1/trading/reconciliation", handle_trading_reconciliation_post, False),
+    ("GET", "/api/v1/trading/reconciliation", handle_trading_reconciliation_get, False),
+    ("POST", "/api/v1/trading/kill-switch", handle_trading_kill_switch, False),
     ("POST", "/api/v1/paper/accounts", handle_paper_create_account, False),
     ("POST", "/api/v1/paper/plans", handle_paper_create_plan, False),
     ("POST", "/api/v1/paper/orders/generate", handle_paper_generate_orders, False),

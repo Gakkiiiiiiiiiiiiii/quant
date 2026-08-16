@@ -44,6 +44,10 @@ class OrdersRepository:
             qty=order.qty,
             filled_qty=order.filled_qty,
             avg_price=order.avg_price,
+            client_order_id=order.client_order_id,
+            idempotency_key=order.idempotency_key,
+            decision_id=order.decision_id,
+            portfolio_id=order.portfolio_id,
             updated_at=datetime.utcnow(),
         )
         self.session.add(model)

@@ -40,6 +40,10 @@ endpoints:
   - name: snapshot_get
     method: GET
     path: /api/v1/market/snapshots/{snapshot_id}
+  - name: snapshot_verify
+    method: POST
+    path: /api/v1/market/snapshots/{snapshot_id}/verify
+    description: "详细修改方案 §20：重算落盘文件 sha256 与 manifest 比对；不一致返回 SNAPSHOT_CORRUPTED"
   - name: security_master_upsert
     method: POST
     path: /api/v1/market/security-master

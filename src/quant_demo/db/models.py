@@ -81,6 +81,11 @@ class OrderModel(Base):
     qty: Mapped[int] = mapped_column(Integer, nullable=False)
     filled_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     avg_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    # 详细修改方案 §15：下单必备身份字段（幂等去重 + 决策/组合审计链）。
+    client_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    decision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    portfolio_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
