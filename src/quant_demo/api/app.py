@@ -23,6 +23,8 @@ from quant_demo.api.dashboard_payloads import (
     run_qlib_action,
     run_strategy_action,
 )
+from quant_demo.api.v1_app import dispatch as v1_dispatch
+from quant_demo.api.v1_app import is_v1_path
 from quant_demo.core.enums import Environment
 
 
@@ -178,9 +180,18 @@ class DemoApiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
 
+    def _dispatch_v1(self, method: str, parsed) -> None:
+        query = parse_qs(parsed.query)
+        body = self._read_json_body() if method == "POST" else {}
+        status, payload = v1_dispatch(method, parsed.path, query, body, dict(self.headers))
+        self._json(payload, status=status)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        if is_v1_path(parsed.path):
+            self._dispatch_v1("GET", parsed)
+            return
         if parsed.path in {"/health", "/api/health"}:
             self._json({"status": "ok"})
             return
@@ -231,6 +242,9 @@ class DemoApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if is_v1_path(parsed.path):
+            self._dispatch_v1("POST", parsed)
+            return
         payload = self._read_json_body()
         try:
             if parsed.path == "/api/actions/strategy":

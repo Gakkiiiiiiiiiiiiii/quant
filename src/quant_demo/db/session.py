@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from quant_demo.db import models  # noqa: F401
+from quant_demo.db import models_market  # noqa: F401
 from quant_demo.db.base import Base
 
 

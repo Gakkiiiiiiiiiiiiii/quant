@@ -1,0 +1,73 @@
+# market-data.v1 Contract（设计文档 §7 / §8 / §9）
+# Producer: quant   Consumers: stock_factor / stock_agent / stock_content
+contract_version: market-data.v1
+service: quant
+endpoints:
+  - name: bars_batch
+    method: POST
+    path: /api/v1/market/bars/batch
+    legacy_path: /v1/bars/batch   # 迁移期兼容（§12）
+    request:
+      symbols: { type: array, items: string, required: true, max_length: 500 }
+      start: { type: date, required: true }
+      end: { type: date, required: true }
+      frequency: { type: string, default: "1d" }
+      adjust: { type: string, enum: [qfq, hfq, none], default: qfq }
+      trace_id: { type: string, required: false }
+    response:
+      contract_version: { const: market-data.v1 }
+      meta:
+        trace_id: string
+        contract_version: string
+        service_version: string
+        generated_at: string
+        as_of: string
+      data:
+        symbols: { type: array, items: string }
+        dates: { type: array, items: date, sorted: true }
+        bars:
+          # 每个字段为 symbol x date 二维数组，缺失值为 null
+          open: array
+          high: array
+          low: array
+          close: array
+          volume: array
+          amount: array
+          turnover: array
+        data_version: { type: string, description: "sha256(symbols+dates+bars+adjust+source)" }
+        data_snapshot_id: { type: string, pattern: "mds-{data_version}" }
+        source: { type: string, default: qmt }
+  - name: snapshot_get
+    method: GET
+    path: /api/v1/market/snapshots/{snapshot_id}
+  - name: security_master_upsert
+    method: POST
+    path: /api/v1/market/security-master
+  - name: securities_list
+    method: GET
+    path: /api/v1/market/securities
+  - name: security_status_upsert
+    method: POST
+    path: /api/v1/market/security-status
+  - name: security_status_query
+    method: GET
+    path: /api/v1/market/security-status
+    params: [symbol, start, end]
+  - name: price_limits_upsert
+    method: POST
+    path: /api/v1/market/price-limits
+  - name: calendar_upsert
+    method: POST
+    path: /api/v1/market/calendar
+pit_metadata:
+  # §8 Point-In-Time 元数据必须带 available_at
+  security_master: [symbol, exchange, security_type, name, list_date, delist_date, board, currency, lot_size, tick_size]
+  security_status_daily: [trading_date, symbol, is_st, is_star_st, is_suspended, is_delisting, listing_days, risk_warning, available_at, source]
+  price_limit_daily: [trading_date, symbol, limit_rate, upper_limit_price, lower_limit_price, rule_version, available_at]
+  adjustment_factor: [trading_date, symbol, factor, adjustment_type, available_at]
+  industry_membership: [symbol, industry_standard, industry_level, industry_code, valid_from, valid_to, available_at]
+rules:
+  - 快照 ID 为内容寻址（content-addressed），相同请求必须返回相同 data_snapshot_id（§101 不可变）
+  - Factor 使用内容信号时必须按 available_from <= feature_time 连接（§47）
+  - 历史数据必须保留退市/ST 标的，防止幸存者偏差（§49）
+error_codes: [DATA_NOT_READY, SNAPSHOT_NOT_FOUND, CONTRACT_VERSION_UNSUPPORTED]

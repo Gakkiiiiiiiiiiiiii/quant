@@ -1,0 +1,84 @@
+# backtest.v1 Contract（设计文档 §18 / §19 / §43 / §44）
+# Producer: quant   Consumers: stock_agent
+contract_version: backtest.v1
+service: quant
+endpoints:
+  - name: create_backtest
+    method: POST
+    path: /api/v1/backtests
+    idempotency: Idempotency-Key header（§33）
+    request:
+      strategy:
+        type: { type: string, enum: [target_portfolio, equal_weight] }
+        version: { type: string }
+        rebalance_targets: { type: array, required: false }
+        rebalance_every_days: { type: integer, required: false }
+      market_snapshot_id: { type: string, required: false }
+      symbols: { type: array, required: false, description: "与 market_snapshot_id 二选一" }
+      start: { type: date, required: true }
+      end: { type: date, required: true }
+      initial_cash: { type: number, default: 1000000 }
+      benchmark: { type: string, required: false }
+      execution_config:
+        execution_model: { type: string, enum: [next_open, close, vwap, limit_price], default: next_open }
+        commission_rate: { type: number, default: 0.0003 }
+        min_commission: { type: number, default: 5 }
+        stamp_duty_rate: { type: number, default: 0.001 }
+        slippage: { type: number, default: 0.001 }
+        t1: { type: boolean, default: true }
+        price_limit: { type: boolean, default: true }
+        suspension: { type: boolean, default: true }
+    response:
+      status_code: 202
+      data:
+        backtest_id: string
+        status: { enum: [QUEUED, RUNNING, COMPLETED, FAILED] }
+        config_hash: { type: string, description: "§44 Reproducibility Hash" }
+        reused: { type: boolean, required: false }
+  - name: get_backtest
+    method: GET
+    path: /api/v1/backtests/{backtest_id}
+  - name: result_sections
+    method: GET
+    paths:
+      - /api/v1/backtests/{backtest_id}/metrics
+      - /api/v1/backtests/{backtest_id}/equity
+      - /api/v1/backtests/{backtest_id}/trades
+      - /api/v1/backtests/{backtest_id}/positions
+      - /api/v1/backtests/{backtest_id}/daily-actions
+      - /api/v1/backtests/{backtest_id}/diagnostics
+job_schema:
+  # §43 backtest_jobs
+  fields: [backtest_id, status, strategy_id, strategy_version, market_snapshot_id, config_hash,
+           start_date, end_date, initial_cash, benchmark, created_at, started_at, completed_at,
+           error_code, error_message]
+metrics:
+  # §19 标准指标
+  - total_return
+  - annualized_return
+  - benchmark_return
+  - excess_return
+  - max_drawdown
+  - sharpe
+  - sortino
+  - calmar
+  - volatility
+  - win_rate
+  - turnover
+  - trading_cost
+  - average_holding_period
+  - exposure
+  - cash_ratio
+quality_flags:
+  - VWAP_APPROXIMATED
+  - PRICE_LIMIT_METADATA_MISSING
+  - PIT_SECURITY_STATUS_MISSING
+  - LOOKAHEAD_CHECK_BYPASSED
+  - SURVIVORSHIP_RISK
+rules:
+  - Backtest 必须异步执行，创建立即返回 QUEUED
+  - 相同 config_hash 的已完成回测必须复用（§44）
+  - 出现严重 quality_flags 时，Agent 不得把结果描述为"严格历史回测"（§19）
+  - T+1 / 停牌 / 涨跌停 / 统一成本模型必须生效（§51/§52/§53）
+  - available_at 晚于调仓决策时间立即 LOOKAHEAD_VIOLATION（§48）
+error_codes: [BACKTEST_FAILED, LOOKAHEAD_VIOLATION, SNAPSHOT_NOT_FOUND, DATA_NOT_READY]

@@ -1,0 +1,53 @@
+# trading.v1 Contract（设计文档 §21 / §53 / §95 / §97）
+# Producer: quant   Consumers: stock_factor（Alpha 输入）/ stock_agent（Target Portfolio 输入）
+contract_version: trading.v1
+service: quant
+endpoints:
+  - name: create_account
+    method: POST
+    path: /api/v1/paper/accounts
+    request:
+      name: { type: string, default: paper }
+      initial_cash: { type: number, default: 1000000 }
+  - name: create_plan
+    method: POST
+    path: /api/v1/paper/plans
+    request:
+      account_id: { type: string, required: true }
+      targets: { type: array, items: { symbol: string, target_weight: number } }
+      time_contract:
+        signal_time: string
+        available_at: string
+        executable_from: string
+  - name: generate_orders
+    method: POST
+    path: /api/v1/paper/orders/generate
+    idempotency: Idempotency-Key header（§33）
+    request:
+      account_id: { type: string, required: true }
+      as_of: { type: date, required: true }
+      scores: { type: array, items: { symbol: string, score: number, reference_price: number }, required: false }
+      plan_id: { type: string, required: false }
+      top_k: { type: integer, default: 10 }
+  - name: run
+    method: POST
+    path: /api/v1/paper/run
+    request:
+      account_id: { type: string, required: true }
+      as_of: { type: date, required: true }
+      market_prices: { type: object, description: "symbol -> {open, close, high, low}" }
+  - name: account_queries
+    method: GET
+    paths:
+      - /api/v1/paper/accounts/{account_id}
+      - /api/v1/paper/accounts/{account_id}/positions
+      - /api/v1/paper/accounts/{account_id}/orders
+      - /api/v1/paper/accounts/{account_id}/trades
+      - /api/v1/paper/accounts/{account_id}/equity
+execution_semantics:
+  # 与 backtest.v1 保持一致（§53 Backtest / Paper / Live 共用核心）
+  - T+1：当日买入不可卖出
+  - 停牌 / 涨跌停阻断
+  - 统一 TransactionCostModel（§51）
+  - 订单状态：PENDING / FILLED / REJECTED
+error_codes: [EXECUTION_REJECTED, RISK_VETO, QMT_UNAVAILABLE]

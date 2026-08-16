@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api,test]"
+      - name: Ruff
+        run: |
+          pip install ruff
+          ruff check src tests || true
+      - name: Pytest (coverage)
+        run: |
+          pip install pytest-cov
+          pytest -q --cov=quant_demo --cov-report=term-missing
+      - name: Contract tests
+        # §66/§67：market-data.v1 / backtest.v1 / trading.v1 provider 契约测试
+        run: pytest -q tests/test_market_data_contract.py tests/test_backtest_api.py tests/test_paper_api.py
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
