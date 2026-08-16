@@ -124,7 +124,7 @@ def test_fastapi_app_exposes_openapi(tmp_path):
     from quant_demo.api.v1_app import create_v1_app
 
     app = create_v1_app()
-    paths = {route.path for route in app.routes}
+    paths = set(app.openapi()["paths"].keys())
     assert "/api/v1/market/bars/batch" in paths
     assert "/api/v1/backtests" in paths
     assert "/api/v1/paper/accounts" in paths

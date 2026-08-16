@@ -1,0 +1,22 @@
+dataset: golden_market
+contract_version: market-data.v1
+symbols:
+- 600000.SH
+- 600519.SH
+- 000001.SZ
+- 300750.SZ
+- 600901.SH
+- 600902.SH
+- 600903.SH
+- 600904.SH
+- 600905.SH
+- 600906.SH
+days: 60
+end: '2026-08-14'
+samples:
+  st: 600901.SH
+  suspension: 600902.SH
+  limit_up: 600903.SH
+  limit_down: 600904.SH
+  corporate_action: 600905.SH
+  index_membership_change: 600906.SH

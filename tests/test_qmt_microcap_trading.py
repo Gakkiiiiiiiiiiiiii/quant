@@ -16,7 +16,7 @@ from quant_demo.db.models import AssetSnapshotModel, AuditLogModel, OrderModel
 from quant_demo.db.session import create_session_factory, session_scope
 from quant_demo.experiment.evaluator import EvaluationResult
 from quant_demo.experiment.manager import ExperimentManager
-from quant_demo.experiment.qmt_microcap_trading import PendingRetryOrder, PlannedOrder, QmtMicrocapTradingEngine
+from quant_demo.experiment.qmt_microcap_trading import PendingRetryOrder, QmtMicrocapTradingEngine
 
 
 def _build_app_settings(tmp_path: Path, *, environment: str = "paper", trade_enabled: bool = True) -> AppSettings:
@@ -167,11 +167,11 @@ def test_qmt_microcap_trading_engine_submits_orders_and_persists_plan(tmp_path: 
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -185,7 +185,7 @@ def test_qmt_microcap_trading_engine_submits_orders_and_persists_plan(tmp_path: 
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000, "ask_price": [10.12, 10.13], "bid_price": [10.08, 10.07]},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000, "ask_price": [20.12, 20.13], "bid_price": [20.08, 20.07]},
         },
@@ -958,11 +958,11 @@ def test_qmt_microcap_trading_engine_caps_paper_strategy_asset_to_initial_cash(t
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -976,7 +976,7 @@ def test_qmt_microcap_trading_engine_caps_paper_strategy_asset_to_initial_cash(t
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
         },
@@ -1016,11 +1016,11 @@ def test_qmt_microcap_trading_engine_caps_live_strategy_asset_when_capital_is_ex
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1034,7 +1034,7 @@ def test_qmt_microcap_trading_engine_caps_live_strategy_asset_when_capital_is_ex
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
         },
@@ -1081,11 +1081,11 @@ def test_qmt_microcap_trading_engine_preview_uses_signal_close_as_plan_price(tmp
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1099,7 +1099,7 @@ def test_qmt_microcap_trading_engine_preview_uses_signal_close_as_plan_price(tmp
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 11.5, "volume": 2_000_000},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
         },
@@ -1283,11 +1283,11 @@ def test_qmt_microcap_trading_engine_preview_writes_t1_plan_without_submitting(t
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1301,7 +1301,7 @@ def test_qmt_microcap_trading_engine_preview_writes_t1_plan_without_submitting(t
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
         },
@@ -1353,11 +1353,11 @@ def test_qmt_microcap_trading_engine_preview_replaces_halted_buy_targets(tmp_pat
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1371,14 +1371,14 @@ def test_qmt_microcap_trading_engine_preview_replaces_halted_buy_targets(tmp_pat
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_instrument_details",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"status": "停牌"},
             "BBB.SZ": {"status": "交易中"},
         },
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000, "status": "停牌"},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000, "status": "交易中"},
         },
@@ -1413,11 +1413,11 @@ def test_qmt_microcap_trading_engine_execute_plan_uses_saved_targets(tmp_path: P
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1431,7 +1431,7 @@ def test_qmt_microcap_trading_engine_execute_plan_uses_saved_targets(tmp_path: P
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
         },
@@ -1521,11 +1521,11 @@ def test_qmt_microcap_trading_engine_execute_plan_survives_post_submit_snapshot_
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
 
     def _fake_snapshot(self):  # type: ignore[no-untyped-def]
@@ -1546,7 +1546,7 @@ def test_qmt_microcap_trading_engine_execute_plan_survives_post_submit_snapshot_
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {
+        lambda self, symbols, **kwargs: {
             "AAA.SZ": {"last_price": 10.0, "volume": 2_000_000},
             "BBB.SZ": {"last_price": 20.0, "volume": 2_000_000},
         },
@@ -1589,11 +1589,11 @@ def test_qmt_microcap_trading_engine_preview_requires_qmt_realtime_positions(tmp
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
 
     with session_scope(session_factory) as session:
@@ -1616,7 +1616,7 @@ def test_qmt_microcap_trading_engine_preview_requires_qmt_realtime_positions(tmp
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: (_ for _ in ()).throw(QmtUnavailableError("quote timeout")),
+        lambda self, symbols, **kwargs: (_ for _ in ()).throw(QmtUnavailableError("quote timeout")),
     )
 
     engine = QmtMicrocapTradingEngine(session_factory, app_settings, strategy_settings)
@@ -1643,11 +1643,11 @@ def test_qmt_microcap_trading_engine_preview_errors_when_positions_field_missing
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1683,11 +1683,11 @@ def test_qmt_microcap_trading_engine_execute_plan_skips_when_today_activity_matc
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     snapshot_payload = {
         "account_id": "paper-account",
@@ -1702,7 +1702,7 @@ def test_qmt_microcap_trading_engine_execute_plan_skips_when_today_activity_matc
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
+        lambda self, symbols, **kwargs: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.submit_order",
@@ -1752,11 +1752,11 @@ def test_qmt_microcap_trading_engine_execute_plan_submits_only_delta_qty(tmp_pat
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     snapshot_payload = {
         "account_id": "paper-account",
@@ -1771,7 +1771,7 @@ def test_qmt_microcap_trading_engine_execute_plan_submits_only_delta_qty(tmp_pat
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
+        lambda self, symbols, **kwargs: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
     )
 
     def _fake_submit(self, symbol, side, qty, price, **kwargs):  # type: ignore[no-untyped-def]
@@ -1830,11 +1830,11 @@ def test_qmt_microcap_trading_engine_retries_unfilled_order_after_timeout(tmp_pa
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1848,7 +1848,7 @@ def test_qmt_microcap_trading_engine_retries_unfilled_order_after_timeout(tmp_pa
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
+        lambda self, symbols, **kwargs: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
     )
 
     def _fake_submit(self, symbol, side, qty, price, **kwargs):  # type: ignore[no-untyped-def]
@@ -1909,11 +1909,11 @@ def test_qmt_microcap_trading_engine_cancels_stale_snapshot_orders_before_resubm
     monkeypatch.setattr(QmtMicrocapTradingEngine, "_refresh_history", lambda self: None)
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_instrument_frame",
-        lambda self, symbols: instrument_frame.copy(),
+        lambda self, symbols, **kwargs: instrument_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.joinquant_microcap_engine.JoinQuantMicrocapBacktestEngine._load_capital_frame",
-        lambda self, symbols: capital_frame.copy(),
+        lambda self, symbols, **kwargs: capital_frame.copy(),
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_account_snapshot",
@@ -1921,7 +1921,7 @@ def test_qmt_microcap_trading_engine_cancels_stale_snapshot_orders_before_resubm
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.get_quotes",
-        lambda self, symbols: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
+        lambda self, symbols, **kwargs: {"AAA.SZ": {"last_price": 10.0, "volume": 2_000_000}},
     )
     monkeypatch.setattr(
         "quant_demo.experiment.qmt_microcap_trading.QmtBridgeClient.submit_order",

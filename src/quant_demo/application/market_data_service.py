@@ -255,7 +255,7 @@ class MarketDataService:
         location = None
         row_count = 0
         if self._snapshot_store.exists(snapshot_id):
-            location = self._snapshot_store.save(snapshot_id, pd.DataFrame(), {})  # 复用，不覆盖
+            location = self._snapshot_store.location(snapshot_id)  # 幂等复用，不覆盖
             manifest = self._snapshot_store.read_manifest(snapshot_id)
             row_count = sum(len(column) for column in bars.values()) // max(len(BAR_FIELDS), 1)
         else:
@@ -438,21 +438,33 @@ class MarketDataService:
 
     # ---------------------------------------------------- corporate actions
     def upsert_corporate_actions(self, rows: list[dict]) -> int:
-        """收尾文档 §13：PIT 公司行动（available_at 约束可见性）。"""
+        """收尾文档 §13：PIT 公司行动（available_at 约束可见性）。幂等：重复注入不得产生 double adjustment。"""
         with self._session_factory() as session:
             for item in rows:
-                row = CorporateActionRow(
-                    symbol=item["symbol"],
-                    ex_date=_parse_date(item["ex_date"]),
+                ex_date = _parse_date(item["ex_date"])
+                action_type = item.get("action_type", "DIVIDEND")
+                existing = session.scalars(
+                    select(CorporateActionRow).where(
+                        CorporateActionRow.symbol == item["symbol"],
+                        CorporateActionRow.ex_date == ex_date,
+                        CorporateActionRow.action_type == action_type,
+                    )
+                ).first()
+                payload = dict(
                     announcement_date=_parse_date(item.get("announcement_date")),
-                    action_type=item.get("action_type", "DIVIDEND"),
                     cash_dividend=item.get("cash_dividend"),
                     split_ratio=item.get("split_ratio"),
                     rights_ratio=item.get("rights_ratio"),
                     adjustment_factor=item.get("adjustment_factor"),
                     available_at=_parse_datetime(item.get("available_at")) or datetime.utcnow(),
                 )
-                session.add(row)
+                if existing is None:
+                    session.add(
+                        CorporateActionRow(symbol=item["symbol"], ex_date=ex_date, action_type=action_type, **payload)
+                    )
+                else:
+                    for key, value in payload.items():
+                        setattr(existing, key, value)
             session.commit()
         return len(rows)
 
@@ -537,18 +549,30 @@ class MarketDataService:
             ]
 
     def upsert_index_constituents(self, rows: list[dict]) -> int:
-        """收尾文档 §13/§49：历史指数成分（防幸存者偏差）。"""
+        """收尾文档 §13/§49：历史指数成分（防幸存者偏差）。幂等：同窗口重复注入不产生重复成分。"""
         with self._session_factory() as session:
             for item in rows:
-                session.add(
-                    IndexConstituentRow(
-                        index_code=item["index_code"],
-                        symbol=item["symbol"],
-                        valid_from=_parse_date(item["valid_from"]),
-                        valid_to=_parse_date(item.get("valid_to")),
-                        available_at=_parse_datetime(item.get("available_at")) or datetime.utcnow(),
+                valid_from = _parse_date(item["valid_from"])
+                existing = session.scalars(
+                    select(IndexConstituentRow).where(
+                        IndexConstituentRow.index_code == item["index_code"],
+                        IndexConstituentRow.symbol == item["symbol"],
+                        IndexConstituentRow.valid_from == valid_from,
                     )
+                ).first()
+                payload = dict(
+                    valid_to=_parse_date(item.get("valid_to")),
+                    available_at=_parse_datetime(item.get("available_at")) or datetime.utcnow(),
                 )
+                if existing is None:
+                    session.add(
+                        IndexConstituentRow(
+                            index_code=item["index_code"], symbol=item["symbol"], valid_from=valid_from, **payload
+                        )
+                    )
+                else:
+                    for key, value in payload.items():
+                        setattr(existing, key, value)
             session.commit()
         return len(rows)
 
